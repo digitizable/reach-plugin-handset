@@ -1,7 +1,7 @@
 # Hogwarts
 
 <p align="center">
-  <img src="icon.svg" alt="Hogwarts" width="128" height="128"/>
+  <img src="icon.png" alt="Hogwarts" width="128" height="128"/>
 </p>
 
 <p align="center">
