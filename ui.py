@@ -240,7 +240,7 @@ def _apply_css(widget: Gtk.Widget) -> None:
 
 
 class HandsetPage(Gtk.Box):
-    """Two-pane operator desk: Channel · Listener · Egress · Ops · Log."""
+    """Two-pane C2 desk: Channel · Listener · Egress · Ops · Log."""
 
     def __init__(self, ctx) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
