@@ -15,8 +15,8 @@ from hogwarts.banner import banner, banner_short
 
 _HELP = """Commands:
   help              Show this help
-  banner            Show Hogwarts ASCII splash
-  clear             Clear the console (reprints short mark)
+  banner            Show Hogwarts status line
+  clear             Clear the console (reprints short status)
   echo <text>       Print text
   time              Local + UTC time
   status            Path + plane summary
@@ -71,17 +71,13 @@ class ConsolePanel(Gtk.Box):
         self.view.set_editable(False)
         self.view.set_cursor_visible(False)
         self.view.set_monospace(True)
-        # NONE: ASCII castle lines must not wrap — wrap detaches |>>> flags from towers
-        self.view.set_wrap_mode(Gtk.WrapMode.NONE)
+        self.view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.view.set_top_margin(10)
         self.view.set_bottom_margin(10)
         self.view.set_left_margin(12)
         self.view.set_right_margin(12)
         self.view.add_css_class("hogwarts-log")
-        self.view.add_css_class("hogwarts-console-art")
         scroll.set_child(self.view)
-        # Horizontal scroll so wide art stays intact on narrow panes
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.append(scroll)
 
         entry_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)

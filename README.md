@@ -49,7 +49,7 @@ Restart Reach after changes. Remove old `com.digitizable.malbork` / `handset` in
 | **Agents** | Fleet roster from `GET /api/v1/agents` |
 | **Listener** | Accept host/port, transport, cover face, ops notes |
 | **Egress** | TCP matrix direct vs path SOCKS |
-| **Console** | Ops shell + ASCII keep splash |
+| **Console** | Ops shell (status, plane, pull, notes) |
 | **Plane** | Control-plane URL + token + health |
 | **Ops kit** | Reverse export, playbook JSON, data dir |
 | **Session log** | Local activity trail |

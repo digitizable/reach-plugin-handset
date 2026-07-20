@@ -3,18 +3,23 @@
 | File | Notes |
 |------|--------|
 | `icon.png` | Marketplace & README — from operator art (`hogwarts-app-icon.jpg`): white bg removed, 512×512 full-bleed RGBA |
-| `icon-symbolic.svg` | **Left rail only** — white multi-tower keep + pennants on transparent (matches Reach monochrome rail marks such as `globe.svg`) |
+| `icon-symbolic.svg` | **Left rail only** — solid white castle silhouette on transparent, traced from `for-grok/hogwarts-ascii.txt` braille art (not glyph-look) |
 | `icon.svg` | Legacy vector (unused when `icon.png` is the marketplace file) |
 
 ## Rail mark lineage
 
-Symbolic castle silhouette for the sidebar: original monochrome mark (white fill, transparent plate) in the same spirit as free castle/keep iconography used on open icon sets. Not a licensed Harry Potter franchise asset.
+`icon-symbolic.svg` is a **solid silhouette** converted from the braille castle in `~/Downloads/for-grok/hogwarts-ascii.txt`:
 
-## Console art (`hogwarts/banner.py`)
+1. Decode Unicode braille cells → bitmap (2×4 dots per character).
+2. Morphological close so towers read as continuous mass, not dots.
+3. Run-length rects → single filled path, scaled into a 24×24 viewBox (`fill="#ffffff"`).
 
-| Piece | Source |
-|-------|--------|
-| **High-detail keep** | Pure ASCII multi-tower splash; flags as `\|>>>` on the **same lines** as towers (so they cannot detach). Expanded from classic pure-ASCII castle patterns in the [asciiart.eu castles gallery](https://www.asciiart.eu/buildings-and-places/castles) (community / unknown artists). |
-| **Why not braille** | Braille/block art + `WORD_CHAR` wrap and mixed glyph widths made pennants appear to “float” off the roof. Pure ASCII + `wrap_mode=NONE` keeps flags attached. |
+Matches Reach monochrome rail marks such as `globe.svg`. Not a licensed Harry Potter franchise asset.
+
+**GdkPixbuf note:** Keep long XML comments *inside* the root `<svg>` element. Comments (or other preamble) longer than ~200 bytes *before* `<svg` cause `Couldn't recognize the image file format` — the loader only sniffs a short prefix for the root tag.
+
+## Console (`hogwarts/banner.py`)
+
+Short status lines only (no ASCII splash). Boot and `banner` / `clear` print a one-line ready message.
 
 **Name:** Hogwarts — castle keep metaphor. Unofficial fan naming; not affiliated with Warner Bros. or the Harry Potter franchise.
