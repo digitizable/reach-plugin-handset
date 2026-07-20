@@ -12,7 +12,7 @@ Reach → **Plugins** → install:
 digitizable/reach-plugin-handset
 ```
 
-## Features (v0.2)
+## Features (v0.2.1)
 
 | Panel | What |
 |-------|------|
