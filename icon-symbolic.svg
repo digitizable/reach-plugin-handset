@@ -1,5 +1,36 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Hogwarts rail mark — white four-tower keep (themed monochrome). -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" fill="#ffffff">
-  <path d="M1.5 13V8L3 6.2V5L4.2 3.5 5.4 5v1.2L6.2 5.5 8 3.2 9.8 5.5 10.6 6.2V5L11.8 3.5 13 5v1.2L14.5 8v5H1.5zm2.2-1.2h2V8.2H3.7v3.6zm3.3 0h2.6V7.2L8 5.4 7 7.2v4.6zm3.5 0h2V8.2h-2v3.6z"/>
+<!--
+  Hogwarts rail mark — multi-tower keep with pennants (white on transparent).
+  Silhouette style matches Reach rail assets (globe.svg, etc.): fill #ffffff.
+  Castle form inspired by public domain / free castle iconography (European
+  keep + towers); not a licensed franchise asset.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="#ffffff">
+  <!-- flying pennants (attached to poles on towers) -->
+  <path d="M4.2 2.2v3.2l2.4-1.1-2.4-1.1zm7.8 0v3.6l2.8-1.2L12 2.2zm7.8 0.4v3.2l2.4-1.1-2.4-1.1z"/>
+  <!-- flag poles -->
+  <rect x="3.85" y="2" width="0.7" height="5.5"/>
+  <rect x="11.65" y="2" width="0.7" height="4.2"/>
+  <rect x="19.45" y="2.2" width="0.7" height="5.3"/>
+  <!-- left tower -->
+  <path d="M2 8h5v13H2V8zm0.8-1.2h3.4L5 4.8 2.8 6.8z"/>
+  <rect x="3.4" y="10" width="1.4" height="1.8"/>
+  <rect x="3.4" y="13.2" width="1.4" height="1.8"/>
+  <!-- right tower -->
+  <path d="M17 8h5v13h-5V8zm0.8-1.2h3.4L19.5 4.8 17.8 6.8z"/>
+  <rect x="19.2" y="10" width="1.4" height="1.8"/>
+  <rect x="19.2" y="13.2" width="1.4" height="1.8"/>
+  <!-- central keep + great hall -->
+  <path d="M7.2 9.5h9.6V21H7.2V9.5z"/>
+  <path d="M6.5 9.5L12 3.8l5.5 5.7H6.5z"/>
+  <!-- keep windows -->
+  <rect x="9" y="11.2" width="1.5" height="2.2"/>
+  <rect x="11.25" y="11.2" width="1.5" height="2.2"/>
+  <rect x="13.5" y="11.2" width="1.5" height="2.2"/>
+  <!-- gate -->
+  <path d="M10.6 16.2h2.8V21h-2.8v-4.8z"/>
+  <!-- curtain wall base between towers -->
+  <rect x="2" y="19.5" width="20" height="1.8"/>
+  <!-- battlement nicks on wall top (visual teeth) -->
+  <path d="M7.5 8.2h1.2v1.3H7.5zm2.4 0h1.2v1.3H9.9zm2.4 0h1.2v1.3h-1.2zm2.4 0h1.2v1.3h-1.2z"/>
 </svg>

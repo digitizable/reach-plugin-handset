@@ -188,13 +188,19 @@ HOGWARTS_CSS = b"""
   font-size: 0.8rem;
 }
 .hogwarts-log {
-  font-family: monospace;
-  font-size: 0.8rem;
+  /* Prefer fonts with solid mono metrics so ASCII flags stay on-tower */
+  font-family: "DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono",
+    "Ubuntu Mono", monospace;
+  font-size: 0.78rem;
   color: #b0b8c8;
   background-color: #0c0c0c;
   border: 1px solid #222;
   border-radius: 10px;
   padding: 10px 12px;
+}
+.hogwarts-console-art {
+  font-variant-ligatures: none;
+  -gtk-font-features: "liga" 0, "calt" 0;
 }
 .hogwarts-chip {
   font-size: 0.7rem;
