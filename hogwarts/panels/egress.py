@@ -9,7 +9,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk  # noqa: E402
 
-from malbork.widgets import scroll_panel, section_label
+from hogwarts.widgets import scroll_panel, section_label
 
 
 class EgressPanel(Gtk.Box):
@@ -26,7 +26,7 @@ class EgressPanel(Gtk.Box):
         self.set_vexpand(True)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        body.add_css_class("malbork-panel")
+        body.add_css_class("hogwarts-panel")
 
         intro = Gtk.Label(
             label=(
@@ -36,7 +36,7 @@ class EgressPanel(Gtk.Box):
             wrap=True,
             xalign=0,
         )
-        intro.add_css_class("malbork-muted")
+        intro.add_css_class("hogwarts-muted")
         body.append(intro)
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -45,19 +45,19 @@ class EgressPanel(Gtk.Box):
         self.probe_btn.connect("clicked", lambda *_: on_run())
         bar.append(self.probe_btn)
         self.probe_status = Gtk.Label(label="", xalign=0)
-        self.probe_status.add_css_class("malbork-muted")
+        self.probe_status.add_css_class("hogwarts-muted")
         self.probe_status.set_hexpand(True)
         bar.append(self.probe_status)
         body.append(bar)
 
         self.probe_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.probe_box.add_css_class("malbork-card")
+        self.probe_box.add_css_class("hogwarts-card")
         self._empty = Gtk.Label(
             label="No results yet — run the matrix to compare direct vs path.",
             xalign=0,
             wrap=True,
         )
-        self._empty.add_css_class("malbork-muted")
+        self._empty.add_css_class("hogwarts-muted")
         self._empty.set_margin_top(4)
         self._empty.set_margin_bottom(4)
         self.probe_box.append(self._empty)
@@ -103,17 +103,17 @@ class EgressPanel(Gtk.Box):
     @staticmethod
     def _row_widget(row: dict[str, Any]) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.add_css_class("malbork-probe-row")
+        box.add_css_class("hogwarts-probe-row")
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         lab = Gtk.Label(label=str(row.get("label") or "Probe"), xalign=0)
-        lab.add_css_class("malbork-probe-label")
+        lab.add_css_class("hogwarts-probe-label")
         lab.set_hexpand(True)
         top.append(lab)
         tgt = Gtk.Label(
             label=f"{row.get('host')}:{row.get('port')}",
             xalign=1,
         )
-        tgt.add_css_class("malbork-probe-target")
+        tgt.add_css_class("hogwarts-probe-target")
         top.append(tgt)
         box.append(top)
 
@@ -123,7 +123,7 @@ class EgressPanel(Gtk.Box):
             label=f"direct  {'OK' if d_ok else 'FAIL'}  {row.get('direct_ms', 0):.0f}ms",
             xalign=0,
         )
-        d_lab.add_css_class("malbork-ok" if d_ok else "malbork-fail")
+        d_lab.add_css_class("hogwarts-ok" if d_ok else "hogwarts-fail")
         stats.append(d_lab)
         if "path_ok" in row:
             p_ok = bool(row.get("path_ok"))
@@ -131,11 +131,11 @@ class EgressPanel(Gtk.Box):
                 label=f"path  {'OK' if p_ok else 'FAIL'}  {row.get('path_ms', 0):.0f}ms",
                 xalign=0,
             )
-            p_lab.add_css_class("malbork-ok" if p_ok else "malbork-fail")
+            p_lab.add_css_class("hogwarts-ok" if p_ok else "hogwarts-fail")
             stats.append(p_lab)
         else:
             n = Gtk.Label(label="path  —  (no SOCKS)", xalign=0)
-            n.add_css_class("malbork-muted")
+            n.add_css_class("hogwarts-muted")
             stats.append(n)
         box.append(stats)
         return box

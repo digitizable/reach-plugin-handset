@@ -11,11 +11,11 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk  # noqa: E402
 
-from malbork.banner import banner, banner_short
+from hogwarts.banner import banner, banner_short
 
 _HELP = """Commands:
   help              Show this help
-  banner            Show Malbork ASCII splash
+  banner            Show Hogwarts ASCII splash
   clear             Clear the console (reprints short mark)
   echo <text>       Print text
   time              Local + UTC time
@@ -35,7 +35,7 @@ class ConsolePanel(Gtk.Box):
         on_command: Callable[[str], str | None],
     ) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.add_css_class("malbork-panel")
+        self.add_css_class("hogwarts-panel")
         self.set_hexpand(True)
         self.set_vexpand(True)
         self._on_command = on_command
@@ -43,7 +43,7 @@ class ConsolePanel(Gtk.Box):
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         lab = Gtk.Label(label="Console", xalign=0)
-        lab.add_css_class("malbork-section")
+        lab.add_css_class("hogwarts-section")
         lab.set_hexpand(True)
         bar.append(lab)
         help_b = Gtk.Button(label="Help")
@@ -76,17 +76,17 @@ class ConsolePanel(Gtk.Box):
         self.view.set_bottom_margin(10)
         self.view.set_left_margin(12)
         self.view.set_right_margin(12)
-        self.view.add_css_class("malbork-log")
+        self.view.add_css_class("hogwarts-log")
         scroll.set_child(self.view)
         self.append(scroll)
 
         entry_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         entry_row.set_margin_top(8)
         prompt = Gtk.Label(label="›")
-        prompt.add_css_class("malbork-ok")
+        prompt.add_css_class("hogwarts-ok")
         entry_row.append(prompt)
         self.entry = Gtk.Entry()
-        self.entry.add_css_class("malbork-console-input")
+        self.entry.add_css_class("hogwarts-console-input")
         self.entry.set_hexpand(True)
         self.entry.set_placeholder_text("help · status · pull · agents…")
         self.entry.connect("activate", self._on_activate)

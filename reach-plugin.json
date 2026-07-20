@@ -1,11 +1,11 @@
 {
   "schema": 1,
-  "id": "com.digitizable.malbork",
-  "name": "Malbork",
-  "version": "0.4.0",
-  "description": "C2 for Reach — Malbork Castle namesake: agents, channel, reverse listener, egress, control plane, console, playbooks. Purple desk: operate and defend the keep.",
+  "id": "com.digitizable.hogwarts",
+  "name": "Hogwarts",
+  "version": "0.4.1",
+  "description": "C2 for Reach — Hogwarts keep: agents, channel, reverse listener, egress, control plane, console, playbooks. Purple desk: operate and defend the castle.",
   "author": "digitizable",
-  "homepage": "https://github.com/digitizable/reach-plugin-malbork",
+  "homepage": "https://github.com/digitizable/reach-plugin-hogwarts",
   "license": "GPL-3.0-or-later",
   "category": "operator",
   "official": false,
@@ -15,9 +15,9 @@
     "create": "create_page"
   },
   "nav": {
-    "title": "Malbork",
+    "title": "Hogwarts",
     "icon": "network-wireless-symbolic",
-    "tooltip": "Malbork — C2 keep for Reach",
+    "tooltip": "Hogwarts — C2 keep for Reach",
     "icon_file": "icon.svg",
     "icon_symbolic": "icon-symbolic.svg"
   },

@@ -1,1 +1,0 @@
-"""Malbork desk panels."""

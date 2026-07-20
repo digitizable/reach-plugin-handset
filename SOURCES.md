@@ -2,7 +2,7 @@
 
 | File | Notes |
 |------|--------|
-| `icon.svg` | Official Malbork mark (concentric brick keep) — marketplace & README |
-| `icon-symbolic.svg` | Rail mark (white castle; Reach themes monochrome) |
+| `icon.svg` | Official Hogwarts mark (four-tower keep, night plate) — marketplace & README |
+| `icon-symbolic.svg` | Rail mark (white towers; Reach themes monochrome) |
 
-**Name:** [Malbork Castle](https://en.wikipedia.org/wiki/Malbork_Castle) (Marienburg) — Teutonic Order headquarters, largest brick castle complex in Europe (UNESCO). Chosen as the product metaphor for a **well-defended C2 keep**.
+**Name:** Hogwarts — castle keep as product metaphor for a **well-defended C2 desk** (operate the halls, defend the walls). Unofficial fan naming; not affiliated with Warner Bros. or the Harry Potter franchise.

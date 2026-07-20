@@ -13,13 +13,13 @@ from gi.repository import Gtk  # noqa: E402
 class LogPanel(Gtk.Box):
     def __init__(self, *, on_clear: Callable) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        self.add_css_class("malbork-panel")
+        self.add_css_class("hogwarts-panel")
         self.set_hexpand(True)
         self.set_vexpand(True)
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         lab = Gtk.Label(label="Session log", xalign=0)
-        lab.add_css_class("malbork-section")
+        lab.add_css_class("hogwarts-section")
         lab.set_hexpand(True)
         bar.append(lab)
         clr = Gtk.Button(label="Clear")
@@ -47,7 +47,7 @@ class LogPanel(Gtk.Box):
         self.view.set_bottom_margin(10)
         self.view.set_left_margin(12)
         self.view.set_right_margin(12)
-        self.view.add_css_class("malbork-log")
+        self.view.add_css_class("hogwarts-log")
         scroll.set_child(self.view)
         self.append(scroll)
 

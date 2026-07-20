@@ -1,4 +1,4 @@
-"""Malbork main page — two-pane C2 desk shell."""
+"""Hogwarts main page — two-pane C2 desk shell."""
 
 from __future__ import annotations
 
@@ -15,61 +15,61 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gtk  # noqa: E402
 
-from malbork import __version__
-from malbork.backend.client import C2Client
-from malbork.backend.config import PlaneConfig, load_plane_config, save_plane_config
-from malbork.net import socks_tcp_probe, tcp_probe
-from malbork.panels.agents import AgentsPanel
-from malbork.panels.channel import ChannelPanel
-from malbork.panels.console import ConsolePanel
-from malbork.panels.egress import EgressPanel
-from malbork.panels.listener import ListenerPanel
-from malbork.panels.log import LogPanel
-from malbork.panels.ops import OpsPanel
-from malbork.panels.plane import PlanePanel
-from malbork.store import MetaStore
-from malbork.theme import apply_css
+from hogwarts import __version__
+from hogwarts.backend.client import C2Client
+from hogwarts.backend.config import PlaneConfig, load_plane_config, save_plane_config
+from hogwarts.net import socks_tcp_probe, tcp_probe
+from hogwarts.panels.agents import AgentsPanel
+from hogwarts.panels.channel import ChannelPanel
+from hogwarts.panels.console import ConsolePanel
+from hogwarts.panels.egress import EgressPanel
+from hogwarts.panels.listener import ListenerPanel
+from hogwarts.panels.log import LogPanel
+from hogwarts.panels.ops import OpsPanel
+from hogwarts.panels.plane import PlanePanel
+from hogwarts.store import MetaStore
+from hogwarts.theme import apply_css
 
 
-class MalborkPage(Gtk.Box):
+class HogwartsPage(Gtk.Box):
     """Two-pane C2 desk: Channel · Agents · Listener · Egress · Console · Plane · Ops · Log."""
 
     def __init__(self, ctx) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.add_css_class("page")
-        self.add_css_class("malbork-page")
+        self.add_css_class("hogwarts-page")
         self.set_hexpand(True)
         self.set_vexpand(True)
         self._ctx = ctx
         self._probe_busy = False
         self._log_lines: list[str] = []
-        self._store = MetaStore(ctx.data_path("malbork.json"))
+        self._store = MetaStore(ctx.data_path("hogwarts.json"))
         self._plane_path = ctx.data_path("plane.json")
         self._plane = load_plane_config(self._plane_path)
         apply_css(self)
 
         # Header
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        header.add_css_class("malbork-header")
+        header.add_css_class("hogwarts-header")
         header.set_hexpand(True)
         titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         titles.set_hexpand(True)
         titles.set_valign(Gtk.Align.CENTER)
-        t = Gtk.Label(label="Malbork", xalign=0)
-        t.add_css_class("malbork-title")
+        t = Gtk.Label(label="Hogwarts", xalign=0)
+        t.add_css_class("hogwarts-title")
         titles.append(t)
         s = Gtk.Label(label="C2 keep · channel · agents · plane", xalign=0)
-        s.add_css_class("malbork-sub")
+        s.add_css_class("hogwarts-sub")
         titles.append(s)
         header.append(titles)
 
         self._chip = Gtk.Label(label="—")
-        self._chip.add_css_class("malbork-chip")
+        self._chip.add_css_class("hogwarts-chip")
         self._chip.set_valign(Gtk.Align.CENTER)
         header.append(self._chip)
 
         self._plane_chip = Gtk.Label(label="PLANE OFF")
-        self._plane_chip.add_css_class("malbork-chip")
+        self._plane_chip.add_css_class("hogwarts-chip")
         self._plane_chip.set_valign(Gtk.Align.CENTER)
         header.append(self._plane_chip)
 
@@ -84,24 +84,24 @@ class MalborkPage(Gtk.Box):
 
         # Split body
         split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
-        split.add_css_class("malbork-split")
+        split.add_css_class("hogwarts-split")
         split.set_hexpand(True)
         split.set_vexpand(True)
 
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        side.add_css_class("malbork-sidebar")
+        side.add_css_class("hogwarts-sidebar")
         side.set_vexpand(True)
         side.set_hexpand(False)
         side.set_size_request(210, -1)
 
         side_lab = Gtk.Label(label="Desk", xalign=0)
-        side_lab.add_css_class("malbork-section")
+        side_lab.add_css_class("hogwarts-section")
         side_lab.set_margin_start(8)
         side_lab.set_margin_bottom(6)
         side.append(side_lab)
 
         self._stack = Gtk.Stack()
-        self._stack.add_css_class("malbork-stack")
+        self._stack.add_css_class("hogwarts-stack")
         self._stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self._stack.set_transition_duration(160)
         self._stack.set_hexpand(True)
@@ -164,7 +164,7 @@ class MalborkPage(Gtk.Box):
             widget.set_valign(Gtk.Align.FILL)
             self._stack.add_named(widget, key)
             btn = Gtk.ToggleButton()
-            btn.add_css_class("malbork-nav-btn")
+            btn.add_css_class("hogwarts-nav-btn")
             btn.set_hexpand(True)
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
             row.set_margin_start(4)
@@ -187,13 +187,13 @@ class MalborkPage(Gtk.Box):
         spacer.set_vexpand(True)
         side.append(spacer)
         ver = Gtk.Label(label=f"v{__version__}", xalign=0.5)
-        ver.add_css_class("malbork-muted")
+        ver.add_css_class("hogwarts-muted")
         ver.set_margin_bottom(4)
         side.append(ver)
 
         split.append(side)
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        main.add_css_class("malbork-main")
+        main.add_css_class("hogwarts-main")
         main.set_hexpand(True)
         main.set_vexpand(True)
         main.append(self._stack)
@@ -202,7 +202,7 @@ class MalborkPage(Gtk.Box):
 
         self._stack.set_visible_child_name("channel")
         self._refresh_all()
-        self._log_msg("Malbork ready")
+        self._log_msg("Hogwarts ready")
 
     def _on_nav(self, btn: Gtk.ToggleButton, key: str) -> None:
         if btn.get_active():
@@ -252,10 +252,10 @@ class MalborkPage(Gtk.Box):
         if self._plane.is_configured:
             plane_txt = self._plane.base_url
             self._plane_chip.set_text("PLANE")
-            self._plane_chip.add_css_class("malbork-chip-plane")
+            self._plane_chip.add_css_class("hogwarts-chip-plane")
         else:
             self._plane_chip.set_text("PLANE OFF")
-            self._plane_chip.remove_css_class("malbork-chip-plane")
+            self._plane_chip.remove_css_class("hogwarts-chip-plane")
 
         self._channel.set_path_status(
             state=state,
@@ -267,9 +267,9 @@ class MalborkPage(Gtk.Box):
             plane=plane_txt,
         )
         self._chip.set_text(state_label.upper())
-        self._chip.remove_css_class("malbork-chip-live")
+        self._chip.remove_css_class("hogwarts-chip-live")
         if state == "live":
-            self._chip.add_css_class("malbork-chip-live")
+            self._chip.add_css_class("hogwarts-chip-live")
 
     def _save_plane(self) -> None:
         cfg = self._plane_panel.read_config()
@@ -304,7 +304,7 @@ class MalborkPage(Gtk.Box):
 
             GLib.idle_add(done)
 
-        threading.Thread(target=work, name="malbork-health", daemon=True).start()
+        threading.Thread(target=work, name="hogwarts-health", daemon=True).start()
         self._plane_panel.set_result("Testing…")
 
     def _refresh_agents(self, quiet: bool = False) -> None:
@@ -336,7 +336,7 @@ class MalborkPage(Gtk.Box):
 
             GLib.idle_add(done)
 
-        threading.Thread(target=work, name="malbork-agents", daemon=True).start()
+        threading.Thread(target=work, name="hogwarts-agents", daemon=True).start()
         if not quiet:
             self._agents.status_lab.set_text("Loading…")
 
@@ -435,7 +435,7 @@ class MalborkPage(Gtk.Box):
 
             GLib.idle_add(done)
 
-        threading.Thread(target=work, name="malbork-probe", daemon=True).start()
+        threading.Thread(target=work, name="hogwarts-probe", daemon=True).start()
 
     def _probe_custom(self) -> None:
         host = self._egress.custom_host.get_text().strip()
@@ -495,7 +495,7 @@ class MalborkPage(Gtk.Box):
 
             GLib.idle_add(done)
 
-        threading.Thread(target=work, name="malbork-custom", daemon=True).start()
+        threading.Thread(target=work, name="hogwarts-custom", daemon=True).start()
 
     def _clipboard_set(self, text: str) -> None:
         try:
@@ -572,7 +572,7 @@ class MalborkPage(Gtk.Box):
             path_info = {"error": str(exc)}
 
         playbook = {
-            "malbork_version": __version__,
+            "hogwarts_version": __version__,
             "exported": datetime.now(timezone.utc).isoformat(),
             "listener": {
                 "accept_host": meta.get("accept_host"),

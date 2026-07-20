@@ -1,11 +1,11 @@
-# Malbork — Control plane contract
+# Hogwarts — Control plane contract
 
-Malbork is the **operator desk** inside Reach. Live fleet data comes from a C2
+Hogwarts is the **operator desk** inside Reach. Live fleet data comes from a C2
 **control-plane API** you host. Until that API is configured, Agents stays empty
 and local tools (channel, egress, listener notes, playbooks) still work.
 
 Config is stored under Reach plugin data:
-`~/.local/share/reach/plugin-data/com__digitizable__malbork/plane.json`
+`~/.local/share/reach/plugin-data/com__digitizable__hogwarts/plane.json`
 
 ---
 

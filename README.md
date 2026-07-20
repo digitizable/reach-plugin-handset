@@ -1,43 +1,45 @@
-# Malbork
+# Hogwarts
 
 <p align="center">
-  <img src="icon.svg" alt="Malbork" width="128" height="128"/>
+  <img src="icon.svg" alt="Hogwarts" width="128" height="128"/>
 </p>
 
 <p align="center">
   <strong>C2 for Reach</strong> — a well-defended operator desk.<br/>
-  Named for <a href="https://en.wikipedia.org/wiki/Malbork_Castle">Malbork Castle</a> (Marienburg), the Teutonic Order’s brick fortress — largest of its kind in Europe.
+  Named for the castle: halls for ops, walls for the keep.
 </p>
 
 <p align="center">
   channel · agents · plane · reverse · egress · playbooks
 </p>
 
-**Malbork** is the command-and-control plugin for [Reach](https://github.com/digitizable/reach): path-aware channel status, implant roster against your control plane, reverse listener notes, egress probing (direct vs SOCKS path), interactive console, and session playbooks.
+**Hogwarts** is the command-and-control plugin for [Reach](https://github.com/digitizable/reach): path-aware channel status, implant roster against your control plane, reverse listener notes, egress probing (direct vs SOCKS path), interactive console, and session playbooks.
 
-Formerly **Handset** — same role, castle-grade name and mark.
+Formerly **Handset** / **Malbork** — same role, castle name and mark.
+
+> Unofficial name. Not affiliated with Warner Bros., J.K. Rowling, or the Harry Potter franchise.
 
 ## Install
 
 In Reach → **Plugins** marketplace:
 
 ```text
-digitizable/reach-plugin-malbork
+digitizable/reach-plugin-hogwarts
 ```
 
-If the GitHub repo still uses the old path, `digitizable/reach-plugin-malbork` may redirect until renamed.
+If GitHub still uses an older repo path, try `digitizable/reach-plugin-malbork` or `digitizable/reach-plugin-handset` until redirects settle.
 
-Requires Reach ≥ 0.5 (plugin host, `reach-plugin.json` schema 1).
+Requires Reach ≥ 0.5.
 
 ### Local dev
 
 ```bash
 rsync -a --delete \
   --exclude .git --exclude __pycache__ \
-  ./ ~/.local/share/reach/plugins/com__digitizable__malbork/
+  ./ ~/.local/share/reach/plugins/com__digitizable__hogwarts/
 ```
 
-Restart Reach (or re-open the Malbork page) after changes. Disable/remove the old `com.digitizable.handset` install if both appear.
+Restart Reach after changes. Remove old `com.digitizable.malbork` / `handset` installs if both appear.
 
 ## Features
 
@@ -54,38 +56,25 @@ Restart Reach (or re-open the Malbork page) after changes. Disable/remove the ol
 
 ## Control plane
 
-Malbork does **not** host implants. Point **Plane** at your API:
-
-| Endpoint | Role |
-|----------|------|
-| `GET /api/v1/health` | Connectivity |
-| `GET /api/v1/agents` | Fleet roster |
-| `GET /api/v1/events` | Console `pull` |
-| `POST /api/v1/agents/{id}/tasks` | Tasking |
-
-Full contract: [malbork/backend/CONTRACT.md](malbork/backend/CONTRACT.md).
-
-Config:
+Hogwarts does **not** host implants. Point **Plane** at your API — see [hogwarts/backend/CONTRACT.md](hogwarts/backend/CONTRACT.md).
 
 ```text
-~/.local/share/reach/plugin-data/com__digitizable__malbork/plane.json
+~/.local/share/reach/plugin-data/com__digitizable__hogwarts/plane.json
 ```
 
 ## Layout
 
 ```
-ui.py                 # Reach entry (create_page)
-malbork/
-  page.py             # shell + wiring
-  banner.py           # console ASCII
-  theme.py / net.py / store.py / widgets.py
-  backend/            # control-plane client + contract
-  panels/             # Channel · Agents · Listener · …
+ui.py
+hogwarts/
+  page.py · banner.py · theme.py · net.py · store.py · widgets.py
+  backend/   # control-plane client + contract
+  panels/    # Channel · Agents · Listener · …
 ```
 
 ## Purple stance
 
-Operate the tasking loop **and** defend the keep — separate operator tokens from agent auth, honest listener state, path-aware egress. See research notes on [anguish.sh](https://anguish.sh/studies/malbork/notes) (corpus may still list as Handset until site deploy).
+Operate the tasking loop **and** defend the keep. Research: [anguish.sh — Hogwarts / C2](https://anguish.sh/studies/hogwarts/notes).
 
 ## License
 

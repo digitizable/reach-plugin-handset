@@ -9,7 +9,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk  # noqa: E402
 
-from malbork.widgets import field, scroll_panel, section_label
+from hogwarts.widgets import field, scroll_panel, section_label
 
 _PROTOS = ["TCP", "TLS / 443 face", "PRR / Mirage", "Other"]
 
@@ -27,7 +27,7 @@ class ListenerPanel(Gtk.Box):
         self.set_vexpand(True)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        body.add_css_class("malbork-panel")
+        body.add_css_class("hogwarts-panel")
 
         intro = Gtk.Label(
             label=(
@@ -37,11 +37,11 @@ class ListenerPanel(Gtk.Box):
             wrap=True,
             xalign=0,
         )
-        intro.add_css_class("malbork-muted")
+        intro.add_css_class("hogwarts-muted")
         body.append(intro)
 
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        card.add_css_class("malbork-card")
+        card.add_css_class("hogwarts-card")
 
         self.accept_host = Gtk.Entry()
         self.accept_host.set_placeholder_text("accept.example.net or IP")

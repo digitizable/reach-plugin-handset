@@ -1,4 +1,4 @@
-"""HTTP client for the Malbork control plane (stdlib only)."""
+"""HTTP client for the Hogwarts control plane (stdlib only)."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import quote, urljoin
 
-from malbork.backend.config import PlaneConfig
+from hogwarts.backend.config import PlaneConfig
 
 
 @dataclass
@@ -62,7 +62,7 @@ class C2Client:
         data = None
         headers = {
             "Accept": "application/json",
-            "User-Agent": "malbork/0.3",
+            "User-Agent": "hogwarts/0.3",
         }
         if self.config.api_token:
             headers["Authorization"] = f"Bearer {self.config.api_token}"

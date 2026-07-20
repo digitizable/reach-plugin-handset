@@ -9,8 +9,8 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk  # noqa: E402
 
-from malbork.backend.client import AgentDTO
-from malbork.widgets import scroll_panel, section_label
+from hogwarts.backend.client import AgentDTO
+from hogwarts.widgets import scroll_panel, section_label
 
 _STATUS_FILTERS = ["All", "online", "idle", "offline"]
 
@@ -25,7 +25,7 @@ class AgentsPanel(Gtk.Box):
         self._selected: AgentDTO | None = None
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        body.add_css_class("malbork-panel")
+        body.add_css_class("hogwarts-panel")
 
         intro = Gtk.Label(
             label=(
@@ -35,7 +35,7 @@ class AgentsPanel(Gtk.Box):
             wrap=True,
             xalign=0,
         )
-        intro.add_css_class("malbork-muted")
+        intro.add_css_class("hogwarts-muted")
         body.append(intro)
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -56,7 +56,7 @@ class AgentsPanel(Gtk.Box):
         body.append(bar)
 
         self.status_lab = Gtk.Label(label="", xalign=0)
-        self.status_lab.add_css_class("malbork-muted")
+        self.status_lab.add_css_class("hogwarts-muted")
         body.append(self.status_lab)
 
         split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -76,12 +76,12 @@ class AgentsPanel(Gtk.Box):
         right.set_size_request(260, -1)
         right.append(section_label("Detail"))
         detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        detail.add_css_class("malbork-card")
+        detail.add_css_class("hogwarts-card")
         self.detail_host = Gtk.Label(label="Select an agent", xalign=0)
-        self.detail_host.add_css_class("malbork-agent-host")
+        self.detail_host.add_css_class("hogwarts-agent-host")
         detail.append(self.detail_host)
         self.detail_body = Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
-        self.detail_body.add_css_class("malbork-agent-meta")
+        self.detail_body.add_css_class("hogwarts-agent-meta")
         detail.append(self.detail_body)
         right.append(detail)
         split.append(right)
@@ -103,14 +103,14 @@ class AgentsPanel(Gtk.Box):
         self.status_lab.set_text(msg)
         self._clear_list()
         empty = Gtk.Label(label=msg, xalign=0, wrap=True)
-        empty.add_css_class("malbork-fail")
+        empty.add_css_class("hogwarts-fail")
         self.list_box.append(empty)
 
     def show_empty(self, msg: str) -> None:
         self.status_lab.set_text(msg)
         self._clear_list()
         empty = Gtk.Label(label=msg, xalign=0, wrap=True)
-        empty.add_css_class("malbork-muted")
+        empty.add_css_class("hogwarts-muted")
         self.list_box.append(empty)
         self._selected = None
         self.detail_host.set_text("No agent selected")
@@ -150,30 +150,30 @@ class AgentsPanel(Gtk.Box):
         btn.add_css_class("flat")
         btn.set_hexpand(True)
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        outer.add_css_class("malbork-agent-row")
+        outer.add_css_class("hogwarts-agent-row")
 
         top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         dot = Gtk.Box()
-        dot.add_css_class("malbork-dot")
+        dot.add_css_class("hogwarts-dot")
         status = (agent.status or "unknown").lower()
         if status == "online":
-            dot.add_css_class("malbork-dot-live")
+            dot.add_css_class("hogwarts-dot-live")
         elif status == "idle":
-            dot.add_css_class("malbork-dot-busy")
+            dot.add_css_class("hogwarts-dot-busy")
         elif status == "offline":
-            dot.add_css_class("malbork-dot-off")
+            dot.add_css_class("hogwarts-dot-off")
         else:
-            dot.add_css_class("malbork-dot-idle")
+            dot.add_css_class("hogwarts-dot-idle")
         dot.set_valign(Gtk.Align.CENTER)
         top.append(dot)
 
         host = Gtk.Label(label=agent.hostname or agent.id or "?", xalign=0)
-        host.add_css_class("malbork-agent-host")
+        host.add_css_class("hogwarts-agent-host")
         host.set_hexpand(True)
         top.append(host)
 
         st = Gtk.Label(label=status.upper(), xalign=1)
-        st.add_css_class(f"malbork-status-{status if status in ('online','idle','offline') else 'unknown'}")
+        st.add_css_class(f"hogwarts-status-{status if status in ('online','idle','offline') else 'unknown'}")
         top.append(st)
         outer.append(top)
 
@@ -185,7 +185,7 @@ class AgentsPanel(Gtk.Box):
         ]
         meta = " · ".join(b for b in meta_bits if b) or agent.id
         mlab = Gtk.Label(label=meta, xalign=0)
-        mlab.add_css_class("malbork-agent-meta")
+        mlab.add_css_class("hogwarts-agent-meta")
         outer.append(mlab)
 
         btn.set_child(outer)

@@ -9,7 +9,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk  # noqa: E402
 
-from malbork.widgets import scroll_panel, section_label
+from hogwarts.widgets import scroll_panel, section_label
 
 
 class OpsPanel(Gtk.Box):
@@ -26,11 +26,11 @@ class OpsPanel(Gtk.Box):
         self.set_vexpand(True)
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        body.add_css_class("malbork-panel")
+        body.add_css_class("hogwarts-panel")
 
         body.append(section_label("Agent package"))
         card1 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        card1.add_css_class("malbork-card")
+        card1.add_css_class("hogwarts-card")
         c1t = Gtk.Label(
             label=(
                 "Open Reach’s reverse export folder for Inverse Snowflake / "
@@ -39,7 +39,7 @@ class OpsPanel(Gtk.Box):
             wrap=True,
             xalign=0,
         )
-        c1t.add_css_class("malbork-muted")
+        c1t.add_css_class("hogwarts-muted")
         card1.append(c1t)
         open_exp = Gtk.Button(label="Open export folder")
         open_exp.add_css_class("suggested-action")
@@ -50,7 +50,7 @@ class OpsPanel(Gtk.Box):
 
         body.append(section_label("Playbook"))
         card2 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        card2.add_css_class("malbork-card")
+        card2.add_css_class("hogwarts-card")
         c2t = Gtk.Label(
             label=(
                 "Export a JSON snapshot: listener notes, path state, plane "
@@ -59,7 +59,7 @@ class OpsPanel(Gtk.Box):
             wrap=True,
             xalign=0,
         )
-        c2t.add_css_class("malbork-muted")
+        c2t.add_css_class("hogwarts-muted")
         card2.append(c2t)
         exp = Gtk.Button(label="Export playbook JSON")
         exp.add_css_class("suggested-action")
@@ -67,15 +67,15 @@ class OpsPanel(Gtk.Box):
         exp.connect("clicked", on_export_playbook)
         card2.append(exp)
         self.playbook_path = Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
-        self.playbook_path.add_css_class("malbork-kv-val")
+        self.playbook_path.add_css_class("hogwarts-kv-val")
         card2.append(self.playbook_path)
         body.append(card2)
 
         body.append(section_label("Data"))
         card3 = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        card3.add_css_class("malbork-card")
+        card3.add_css_class("hogwarts-card")
         self.data_lab = Gtk.Label(xalign=0, wrap=True, selectable=True)
-        self.data_lab.add_css_class("malbork-kv-val")
+        self.data_lab.add_css_class("hogwarts-kv-val")
         self.data_lab.set_text(data_dir)
         card3.append(self.data_lab)
         open_data = Gtk.Button(label="Open plugin data folder")
