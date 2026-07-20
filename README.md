@@ -22,10 +22,10 @@ Formerly **Handset** — same role, castle-grade name and mark.
 In Reach → **Plugins** marketplace:
 
 ```text
-digitizable/reach-plugin-handset
+digitizable/reach-plugin-malbork
 ```
 
-If the GitHub repo still uses the old path, `digitizable/reach-plugin-handset` may redirect until renamed.
+If the GitHub repo still uses the old path, `digitizable/reach-plugin-malbork` may redirect until renamed.
 
 Requires Reach ≥ 0.5 (plugin host, `reach-plugin.json` schema 1).
 

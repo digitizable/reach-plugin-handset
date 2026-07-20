@@ -5,7 +5,7 @@
   "version": "0.4.0",
   "description": "C2 for Reach — Malbork Castle namesake: agents, channel, reverse listener, egress, control plane, console, playbooks. Purple desk: operate and defend the keep.",
   "author": "digitizable",
-  "homepage": "https://github.com/digitizable/reach-plugin-handset",
+  "homepage": "https://github.com/digitizable/reach-plugin-malbork",
   "license": "GPL-3.0-or-later",
   "category": "operator",
   "official": false,
