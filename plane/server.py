@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 # Max JSON body (operator + agent). Aligns with RESULT_CAP / upload chunks.
 MAX_BODY_BYTES = 4_000_000
 
-VERSION = "0.5.22-lab"
+VERSION = "0.5.23-lab"
 DEFAULT_ADDR = "127.0.0.1:8080"
 DEFAULT_SLEEP = 1.0  # lab default — snappier task round-trips
 DEFAULT_JITTER = 0.1
@@ -46,6 +46,23 @@ AGENT_DEDUPE = os.environ.get("PLANE_AGENT_DEDUPE", "1").strip().lower() not in 
     "no",
     "off",
 )
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+# After this many seconds offline, soft-archive (keep history, hide from default fleet).
+# 0 = disable auto-archive. Default 1 hour.
+AGENT_ARCHIVE_AFTER_SEC = max(0.0, _env_float("PLANE_AGENT_ARCHIVE_AFTER_SEC", 3600.0))
+# Throttle archive sweeps on hot paths (list/check-in).
+AGENT_ARCHIVE_SWEEP_INTERVAL = max(5.0, _env_float("PLANE_AGENT_ARCHIVE_SWEEP_SEC", 30.0))
 # v1 + P3/P4 task types
 TASK_TYPES = frozenset(
     {
@@ -133,6 +150,7 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        self._last_archive_sweep = 0.0
         self._init_schema()
         # One-shot: clear offline host duplicates left by older planes that
         # always INSERT on enroll (no operator prompt required).
@@ -146,6 +164,16 @@ class Store:
                     )
             except Exception as exc:
                 print(f"[plane] startup prune skipped: {exc}", flush=True)
+        try:
+            # Always run archive sweep (also collapses inactive dups)
+            archived = self.archive_stale_agents()
+            if archived:
+                print(
+                    f"[plane] archived {archived} long-offline agent(s) on startup",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[plane] startup archive skipped: {exc}", flush=True)
 
     def _init_schema(self) -> None:
         with self._lock:
@@ -534,21 +562,42 @@ class Store:
             )
             self._conn.commit()
 
+    def _row_is_archived(self, r: sqlite3.Row) -> bool:
+        return str(r["status"] or "").lower() == "archived"
+
+    def _row_last_age_sec(self, r: sqlite3.Row) -> float | None:
+        last = r["last_seen"]
+        if not last:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - ts).total_seconds()
+        except ValueError:
+            return None
+
     def _row_is_offline(self, r: sqlite3.Row) -> bool:
-        """Same last_seen thresholds as _agent_dict (offline band)."""
+        """True when derived presence would be offline (archived counts as inactive)."""
+        if self._row_is_archived(r):
+            return True
         last = r["last_seen"]
         sleep = float(r["sleep"] or DEFAULT_SLEEP)
         if not last:
             return True
-        try:
-            ts = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
-            age = (datetime.now(timezone.utc) - ts).total_seconds()
-            return age > max(45.0, sleep * 6)
-        except ValueError:
+        age = self._row_last_age_sec(r)
+        if age is None:
             return True
+        return age > max(45.0, sleep * 6)
+
+    def _row_is_inactive(self, r: sqlite3.Row) -> bool:
+        """Offline or archived — eligible for rebind / supersede prune."""
+        return self._row_is_offline(r)
 
     def _row_host_key(self, r: sqlite3.Row) -> tuple[str, str, str]:
         return _host_fingerprint(r["hostname"], r["arch"], r["username"])
+
+    @staticmethod
+    def _row_recency_key(row: sqlite3.Row) -> str:
+        return str(row["last_seen"] or row["created"] or "")
 
     def _delete_agent_rows(
         self, agent_ids: list[str], *, reason: str = "pruned"
@@ -586,6 +635,110 @@ class Store:
         """Operator hard-delete of one agent (tasks + row)."""
         return bool(self._delete_agent_rows([agent_id], reason=reason))
 
+    def _set_agents_archived(self, agent_ids: list[str]) -> list[str]:
+        """Soft-archive rows (keep tasks/history). Returns ids actually archived."""
+        if not agent_ids:
+            return []
+        changed: list[str] = []
+        with self._lock:
+            for aid in agent_ids:
+                row = self._conn.execute(
+                    "SELECT id, status FROM agents WHERE id=?", (aid,)
+                ).fetchone()
+                if not row:
+                    continue
+                if str(row["status"] or "").lower() == "archived":
+                    continue
+                self._conn.execute(
+                    "UPDATE agents SET status='archived' WHERE id=?", (aid,)
+                )
+                # Cancel open work — implant is long gone
+                self._conn.execute(
+                    "UPDATE tasks SET status='cancelled', updated=? "
+                    "WHERE agent_id=? AND status IN ('queued','assigned')",
+                    (_utc_now(), aid),
+                )
+                changed.append(aid)
+            if changed:
+                self._conn.commit()
+        for aid in changed:
+            self.add_event(
+                level="info",
+                channel="agent",
+                message=f"agent {aid} archived (offline too long)",
+                agent_id=aid,
+            )
+        return changed
+
+    def dedupe_inactive_by_host(self) -> int:
+        """At most one inactive (offline/archived) row per host fingerprint.
+
+        Prefer: newest non-archived offline over older archived; else newest
+        by last_seen. Live agents are never removed here.
+        """
+        if not AGENT_DEDUPE:
+            return 0
+        with self._lock:
+            rows = list(self._conn.execute("SELECT * FROM agents").fetchall())
+        groups: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+        for r in rows:
+            key = self._row_host_key(r)
+            if not key[0]:
+                continue
+            groups.setdefault(key, []).append(r)
+        victims: list[str] = []
+        for _key, members in groups.items():
+            inactive = [r for r in members if self._row_is_inactive(r)]
+            if len(inactive) < 2:
+                continue
+            # Prefer keeping a recent offline (not yet archived) over archived
+            def _keep_score(row: sqlite3.Row) -> tuple[int, str]:
+                # higher is better: non-archived first, then recency
+                not_arch = 0 if self._row_is_archived(row) else 1
+                return (not_arch, self._row_recency_key(row))
+
+            ordered = sorted(inactive, key=_keep_score, reverse=True)
+            for r in ordered[1:]:
+                victims.append(str(r["id"]))
+        return len(self._delete_agent_rows(victims, reason="inactive_dedupe"))
+
+    def archive_stale_agents(self) -> int:
+        """Soft-archive agents offline longer than AGENT_ARCHIVE_AFTER_SEC.
+
+        Does not create archive duplicates: after archive, collapses inactive
+        host groups to a single row (prefer newest).
+        """
+        if AGENT_ARCHIVE_AFTER_SEC <= 0:
+            # Still collapse inactive dups even when auto-archive is off
+            return self.dedupe_inactive_by_host()
+        to_archive: list[str] = []
+        with self._lock:
+            rows = list(self._conn.execute("SELECT * FROM agents").fetchall())
+        for r in rows:
+            if self._row_is_archived(r):
+                continue
+            if not self._row_is_offline(r):
+                continue
+            age = self._row_last_age_sec(r)
+            # No last_seen → treat as old enough once status says offline
+            if age is None or age >= AGENT_ARCHIVE_AFTER_SEC:
+                to_archive.append(str(r["id"]))
+        self._set_agents_archived(to_archive)
+        # Drop extra archived/offline twins so archive is 1 per host key
+        self.dedupe_inactive_by_host()
+        return len(to_archive)
+
+    def maybe_archive_stale(self, *, force: bool = False) -> int:
+        """Throttled archive sweep for hot paths (list / check-in)."""
+        now = time.time()
+        if not force and (now - self._last_archive_sweep) < AGENT_ARCHIVE_SWEEP_INTERVAL:
+            return 0
+        self._last_archive_sweep = now
+        try:
+            return self.archive_stale_agents()
+        except Exception:
+            return 0
+
     def prune_superseded_agents(
         self,
         keep_id: str,
@@ -595,11 +748,12 @@ class Store:
         username: str | None,
         package_id: str | None = None,
     ) -> list[str]:
-        """Drop offline agents that look like the same implant as keep_id.
+        """Drop inactive agents that look like the same implant as keep_id.
 
         Match: same host fingerprint (hostname · arch · user), or same
         package_id on the same hostname. Never removes online/idle peers —
-        concurrent multi-agent on one host stays valid.
+        concurrent multi-agent on one host stays valid. Hard-deletes
+        offline/archived zombies when a live twin is present (not archive).
         """
         if not AGENT_DEDUPE or not keep_id:
             return []
@@ -615,7 +769,7 @@ class Store:
                 aid = str(r["id"] or "")
                 if not aid or aid == keep_id:
                     continue
-                if not self._row_is_offline(r):
+                if not self._row_is_inactive(r):
                     continue
                 same_host = self._row_host_key(r) == key
                 same_pkg_host = False
@@ -630,10 +784,10 @@ class Store:
                     )
                 if same_host or same_pkg_host:
                     victims.append(aid)
-        return self._delete_agent_rows(victims, reason="superseded_offline")
+        return self._delete_agent_rows(victims, reason="superseded_inactive")
 
     def prune_fleet_duplicates(self) -> int:
-        """Startup / ops: per host fingerprint keep newest live (or newest offline)."""
+        """Startup / ops: per host fingerprint keep live peers; collapse inactive."""
         if not AGENT_DEDUPE:
             return 0
         with self._lock:
@@ -649,19 +803,20 @@ class Store:
         for _key, members in groups.items():
             if len(members) < 2:
                 continue
-            live = [r for r in members if not self._row_is_offline(r)]
-            offline = [r for r in members if self._row_is_offline(r)]
+            live = [r for r in members if not self._row_is_inactive(r)]
+            inactive = [r for r in members if self._row_is_inactive(r)]
             if live:
-                # Keep all live; drop every offline sibling
-                for r in offline:
+                # Keep all live; drop every offline/archived sibling
+                for r in inactive:
                     victims.append(str(r["id"]))
             else:
-                # All offline: keep most recently seen, drop rest
-                def _last_key(row: sqlite3.Row) -> str:
-                    return str(row["last_seen"] or row["created"] or "")
+                # All inactive: keep best one (prefer non-archived, then newest)
+                def _keep_score(row: sqlite3.Row) -> tuple[int, str]:
+                    not_arch = 0 if self._row_is_archived(row) else 1
+                    return (not_arch, self._row_recency_key(row))
 
-                offline_sorted = sorted(offline, key=_last_key, reverse=True)
-                for r in offline_sorted[1:]:
+                ordered = sorted(inactive, key=_keep_score, reverse=True)
+                for r in ordered[1:]:
                     victims.append(str(r["id"]))
         return len(self._delete_agent_rows(victims, reason="fleet_dedupe"))
 
@@ -683,7 +838,7 @@ class Store:
         pkg = (package_id or "").strip() or None
         with self._lock:
             rows = list(self._conn.execute("SELECT * FROM agents").fetchall())
-        # 1) Same package_id + same hostname (any presence) — preferred
+        # 1) Same package_id + same hostname (any presence, incl. archived)
         if pkg:
             pkg_hits = [
                 r
@@ -692,24 +847,22 @@ class Store:
                 and _normalize_hostname(r["hostname"]) == host_n
             ]
             if pkg_hits:
-                # Prefer most recently seen
-                pkg_hits.sort(
-                    key=lambda r: str(r["last_seen"] or r["created"] or ""),
-                    reverse=True,
-                )
+                # Prefer live, then recent offline/archived
+                def _pkg_score(row: sqlite3.Row) -> tuple[int, str]:
+                    live = 0 if self._row_is_inactive(row) else 1
+                    return (live, self._row_recency_key(row))
+
+                pkg_hits.sort(key=_pkg_score, reverse=True)
                 return pkg_hits[0]
-        # 2) Offline host-fingerprint match (Windows / no package_id re-enroll)
-        offline_hits = [
+        # 2) Inactive host-fingerprint match (offline / archived re-enroll)
+        inactive_hits = [
             r
             for r in rows
-            if self._row_is_offline(r) and self._row_host_key(r) == key
+            if self._row_is_inactive(r) and self._row_host_key(r) == key
         ]
-        if offline_hits:
-            offline_hits.sort(
-                key=lambda r: str(r["last_seen"] or r["created"] or ""),
-                reverse=True,
-            )
-            return offline_hits[0]
+        if inactive_hits:
+            inactive_hits.sort(key=self._row_recency_key, reverse=True)
+            return inactive_hits[0]
         return None
 
     def enroll_agent(
@@ -916,7 +1069,7 @@ class Store:
             row = self._conn.execute(
                 "SELECT * FROM agents WHERE id=?", (agent_id,)
             ).fetchone()
-        # Live agent check-in clears offline host zombies without operator action
+        # Live agent check-in clears offline/archived host zombies; sweep archive
         if AGENT_DEDUPE and row is not None:
             try:
                 pkg = ""
@@ -933,10 +1086,16 @@ class Store:
                 )
             except Exception:
                 pass
+        try:
+            self.maybe_archive_stale()
+        except Exception:
+            pass
 
     def list_agents(
         self, *, status: str | None = None, q: str | None = None, limit: int = 200
     ) -> list[dict[str, Any]]:
+        # Opportunistic archive of long-offline agents (throttled)
+        self.maybe_archive_stale()
         with self._lock:
             rows = self._conn.execute(
                 "SELECT * FROM agents ORDER BY "
@@ -948,17 +1107,28 @@ class Store:
         st_filter = (status or "").lower().strip()
         for r in rows:
             d = self._agent_dict(r)
-            if st_filter:
-                cur = str(d.get("status") or "").lower()
-                # live = online|idle so desk filter does not thrash membership
-                if st_filter in ("live", "online"):
-                    if cur not in ("online", "idle"):
-                        continue
-                elif st_filter == "idle":
-                    if cur != "idle":
-                        continue
-                elif cur != st_filter:
+            cur = str(d.get("status") or "").lower()
+            # Default fleet omits archived; status=all includes everything;
+            # status=archived is archive-only.
+            if not st_filter or st_filter == "active":
+                if cur == "archived":
                     continue
+            elif st_filter == "all":
+                pass
+            elif st_filter in ("live", "online"):
+                if cur not in ("online", "idle"):
+                    continue
+            elif st_filter == "idle":
+                if cur != "idle":
+                    continue
+            elif st_filter == "offline":
+                if cur != "offline":
+                    continue
+            elif st_filter == "archived":
+                if cur != "archived":
+                    continue
+            elif cur != st_filter:
+                continue
             if qn:
                 hay = " ".join(
                     [
@@ -984,24 +1154,29 @@ class Store:
             tags = json.loads(tags_raw) if tags_raw else []
         except json.JSONDecodeError:
             tags = []
-        # Derive presence from last_seen. Thresholds are intentionally loose so
-        # lab agents (sleep ~1.5s) do not thrash online↔idle every desk poll —
-        # that thrash rewrote Hogwarts fleet CSS and killed row hover/highlight.
-        status = str(r["status"] or "unknown")
-        last = r["last_seen"]
-        sleep = float(r["sleep"] or DEFAULT_SLEEP)
-        if last:
-            try:
-                ts = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
-                age = (datetime.now(timezone.utc) - ts).total_seconds()
-                if age > max(45.0, sleep * 6):
-                    status = "offline"
-                elif age > max(20.0, sleep * 4):
-                    status = "idle"
-                else:
-                    status = "online"
-            except ValueError:
-                pass
+        stored = str(r["status"] or "unknown").lower()
+        # Soft-archive is sticky until re-enroll / check-in brings them back.
+        if stored == "archived":
+            status = "archived"
+        else:
+            # Derive presence from last_seen. Thresholds are intentionally loose so
+            # lab agents (sleep ~1.5s) do not thrash online↔idle every desk poll —
+            # that thrash rewrote Hogwarts fleet CSS and killed row hover/highlight.
+            status = stored or "unknown"
+            last = r["last_seen"]
+            sleep = float(r["sleep"] or DEFAULT_SLEEP)
+            if last:
+                try:
+                    ts = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                    age = (datetime.now(timezone.utc) - ts).total_seconds()
+                    if age > max(45.0, sleep * 6):
+                        status = "offline"
+                    elif age > max(20.0, sleep * 4):
+                        status = "idle"
+                    else:
+                        status = "online"
+                except ValueError:
+                    pass
         # package_id column may be missing on very old rows / partial migrations
         try:
             package_id = r["package_id"] or ""
@@ -1011,7 +1186,7 @@ class Store:
         # Presence mode (Sliver beacon vs session · Havoc sleep vs interact):
         # interactive when sleep is in turbo band OR queued desktop/screenshot work.
         presence = "async"
-        if status != "offline":
+        if status not in ("offline", "archived"):
             interactive_pending = False
             try:
                 with self._lock:
@@ -1994,8 +2169,17 @@ class Handler(BaseHTTPRequestHandler):
 
                 if method == "POST" and path == "/api/v1/operator/agents/prune":
                     n = store.prune_fleet_duplicates()
+                    archived = store.archive_stale_agents()
                     _json_response(
-                        self, 200, {"ok": True, "pruned": n, "dedupe": AGENT_DEDUPE}
+                        self,
+                        200,
+                        {
+                            "ok": True,
+                            "pruned": n,
+                            "archived": archived,
+                            "dedupe": AGENT_DEDUPE,
+                            "archive_after_sec": AGENT_ARCHIVE_AFTER_SEC,
+                        },
                     )
                     return
 

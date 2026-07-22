@@ -417,6 +417,7 @@ HOGWARTS_CSS = """
 .hogwarts-status-online { color: #8fd19e; font-weight: 700; font-size: 0.78rem; }
 .hogwarts-status-idle { color: #c9b27a; font-weight: 700; font-size: 0.78rem; }
 .hogwarts-status-offline { color: #e89a9a; font-weight: 700; font-size: 0.78rem; }
+.hogwarts-status-archived { color: #7a7a88; font-weight: 700; font-size: 0.78rem; }
 .hogwarts-status-unknown { color: #8a8a8a; font-weight: 700; font-size: 0.78rem; }
 .hogwarts-console-input {
   font-family: monospace;

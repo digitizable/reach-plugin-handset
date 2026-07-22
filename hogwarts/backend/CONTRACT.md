@@ -44,7 +44,7 @@ GET /api/v1/health
 ## Operator — agents
 
 ```
-GET /api/v1/agents?status=online|idle|offline&q=<search>&limit=200
+GET /api/v1/agents?status=online|idle|offline|archived|live|active|all&q=<search>&limit=200
 → 200 {
   "agents": [
     {
@@ -53,7 +53,7 @@ GET /api/v1/agents?status=online|idle|offline&q=<search>&limit=200
       "username": "jdoe",
       "os": "Linux 6.x",
       "arch": "x86_64",
-      "status": "online",
+      "status": "online|idle|offline|archived",
       "presence": "async|interactive",
       "package_id": "pkg_…?",
       "last_seen": "…Z",
@@ -70,6 +70,9 @@ GET /api/v1/agents?status=online|idle|offline&q=<search>&limit=200
 
 `presence`: **async** = beacon-class check-in (default sleep); **interactive** =
 turbo sleep band and/or pending screenshot/desktop/session tasks (session-class).
+
+Default / `status=active`: fleet **excludes archived**. `status=all` includes them.
+`status=archived` is archive-only. `live` = online|idle.
 ```
 
 ```
@@ -84,22 +87,35 @@ DELETE /api/v1/agents/{id}
 
 Hard-delete agent row + tasks (listeners lose `agent_id` binding). Events are kept.
 
-### Identity lifecycle (dedupe)
+### Identity lifecycle (dedupe + archive)
 
 Re-enroll used to always `INSERT` a new `agt_*`, leaving offline zombies on the desk
-when an implant restarts without a persisted token. Plane now (0.5.22+):
+when an implant restarts without a persisted token. Plane now (0.5.23+):
 
 1. **Rebind** on enroll when the same `package_id` + hostname already exists, or when
-   an **offline** agent matches host fingerprint (`hostname` · normalized `arch` ·
-   `username`). Issues a fresh `agent_token`; keeps the same `agt_*`.
-2. **Prune** offline siblings for that host after enroll and on each check-in.
-3. **Startup / ops prune** collapses offline-only host groups (keeps newest).
+   an **inactive** (offline/archived) agent matches host fingerprint
+   (`hostname` · normalized `arch` · `username`). Fresh `agent_token`; same `agt_*`.
+2. **Prune** inactive siblings for that host after enroll and on each check-in
+   (hard-delete true supersedes when a live twin exists — not “archive the dup”).
+3. **Archive** agents offline longer than `PLANE_AGENT_ARCHIVE_AFTER_SEC` (default
+   **3600**). Soft status `archived`; tasks history kept; open tasks cancelled.
+   Hidden from default fleet. Re-enroll / check-in revives them.
+4. **No archive duplicates**: at most **one** inactive row per host fingerprint
+   (prefer recent offline over older archived; else newest).
+5. **Startup / ops prune** collapses inactive host groups + runs archive sweep.
 
-Disable with `PLANE_AGENT_DEDUPE=0`. Manual force:
+Disable dedupe with `PLANE_AGENT_DEDUPE=0`. Disable auto-archive with
+`PLANE_AGENT_ARCHIVE_AFTER_SEC=0`. Manual force:
 
 ```
 POST /api/v1/operator/agents/prune
-→ 200 { "ok": true, "pruned": N, "dedupe": true|false }
+→ 200 {
+  "ok": true,
+  "pruned": N,
+  "archived": M,
+  "dedupe": true|false,
+  "archive_after_sec": 3600
+}
 ```
 
 `POST /api/v1/agent/enroll` may include `"rebound": true` when the agent id was reused.

@@ -20,7 +20,7 @@ from hogwarts.panels.file_explorer import RemoteFileExplorer
 from hogwarts.widgets import scroll_panel, section_label
 
 # "Live" = online + idle (plane thrash between them must not empty the fleet)
-_STATUS_FILTERS = ["All", "live", "offline"]
+_STATUS_FILTERS = ["All", "live", "offline", "archived"]
 
 # (id, label) — ids match agent _resolve_shell_argv
 _SHELLS: list[tuple[str, str]] = [
@@ -90,6 +90,8 @@ def fleet_status_key(status: str | None) -> str:
         return "online"
     if st == "offline":
         return "offline"
+    if st == "archived":
+        return "archived"
     return st or "unknown"
 
 
@@ -704,10 +706,14 @@ class AgentsPanel(Gtk.Box):
         self.show_empty("Configure the control plane under Plane, then Refresh.")
 
     def filter_status(self) -> str | None:
-        """Plane status filter. ``live`` matches online|idle on the plane."""
+        """Plane status filter.
+
+        ``All`` → active (excludes archived). ``live`` → online|idle.
+        ``archived`` → archive-only.
+        """
         i = int(self.status_filter.get_selected())
         if i <= 0:
-            return None
+            return None  # plane default = active (no archived)
         return _STATUS_FILTERS[i]
 
     def query(self) -> str:
@@ -923,10 +929,15 @@ class AgentsPanel(Gtk.Box):
                     "hogwarts-status-online",
                     "hogwarts-status-idle",
                     "hogwarts-status-offline",
+                    "hogwarts-status-archived",
                     "hogwarts-status-unknown",
                 ):
                     st_lab.remove_css_class(c)
-                paint = status if status in ("online", "offline") else "unknown"
+                paint = (
+                    status
+                    if status in ("online", "offline", "archived")
+                    else "unknown"
+                )
                 st_lab.add_css_class(f"hogwarts-status-{paint}")
             # Presence chip (ASYNC / INTER) — only when live
             mode_lab: Gtk.Label | None = widgets.get("presence")
@@ -966,9 +977,9 @@ class AgentsPanel(Gtk.Box):
             # Skip set_text when unchanged — critical for stable hover
             if meta_lab.get_text() != want_meta:
                 meta_lab.set_text(want_meta)
-            # Dot class: interactive → busy (blue), else live/off
+            # Dot class: interactive → busy (blue), else live/off/archived
             dot: Gtk.Widget = widgets["dot"]
-            if status == "offline":
+            if status in ("offline", "archived"):
                 want_dot = "hogwarts-dot-off"
             elif mode == "interactive":
                 want_dot = "hogwarts-dot-busy"
@@ -1876,7 +1887,7 @@ class AgentsPanel(Gtk.Box):
         dot.add_css_class("hogwarts-dot")
         status = fleet_status_key(agent.status)
         mode = presence_mode_key(agent)
-        if status == "offline":
+        if status in ("offline", "archived"):
             dot_class = "hogwarts-dot-off"
         elif mode == "interactive":
             dot_class = "hogwarts-dot-busy"
@@ -1916,7 +1927,11 @@ class AgentsPanel(Gtk.Box):
         st_text = "LIVE" if status == "online" else status.upper()
         st = Gtk.Label(label=st_text, xalign=1)
         st.set_can_target(False)
-        paint = status if status in ("online", "offline") else "unknown"
+        paint = (
+            status
+            if status in ("online", "offline", "archived")
+            else "unknown"
+        )
         st.add_css_class(f"hogwarts-status-{paint}")
         top.append(st)
         outer.append(top)
@@ -2108,6 +2123,7 @@ class AgentsPanel(Gtk.Box):
             "hogwarts-status-online",
             "hogwarts-status-idle",
             "hogwarts-status-offline",
+            "hogwarts-status-archived",
             "hogwarts-status-unknown",
         ):
             self.detail_status_chip.remove_css_class(c)
@@ -2115,6 +2131,7 @@ class AgentsPanel(Gtk.Box):
             "online": "hogwarts-status-online",
             "idle": "hogwarts-status-idle",
             "offline": "hogwarts-status-offline",
+            "archived": "hogwarts-status-archived",
         }.get(status, "hogwarts-status-unknown")
         if live == "online":
             chip_cls = "hogwarts-status-online"
@@ -2144,7 +2161,7 @@ class AgentsPanel(Gtk.Box):
             "hogwarts-dot-idle",
         ):
             self.detail_dot.remove_css_class(c)
-        if live == "offline":
+        if live in ("offline", "archived"):
             self.detail_dot.add_css_class("hogwarts-dot-off")
         elif mode == "interactive":
             self.detail_dot.add_css_class("hogwarts-dot-busy")
@@ -2170,6 +2187,10 @@ class AgentsPanel(Gtk.Box):
             lines.append(f"sleep     {agent.sleep}s  jitter {agent.jitter or 0}")
         if wait_banner:
             lines.append(f"tempo     {wait_banner}")
+        elif agent.status == "archived":
+            lines.append(
+                "tempo     archived — long offline; re-enroll reuses this id"
+            )
         elif agent.status == "offline":
             lines.append("tempo     offline — task waits for next check-in")
         elif mode == "interactive":
