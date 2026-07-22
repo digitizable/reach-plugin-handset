@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.29-lab"
+VERSION = "0.5.30-lab"
 MIN_SLEEP = 0.12  # Control needs sub-200ms check-ins
 # Set by main(); when False, loop only logs enroll/errors/tasks>0 (less disk thrash)
 _AGENT_VERBOSE = False
@@ -2404,33 +2404,27 @@ def _input_provider_start(
             if not target:
                 raise RuntimeError("input_provider.pipe empty")
             if os.name == "nt" and not target.startswith("\\\\.\\pipe\\"):
-                target = f"\\\\.\\pipe\\{target.lstrip(chr(92) + '/')}"
-            last_err: Exception | None = None
+                leaf = target.replace("/", "\\").split("\\")[-1] or "hogwarts-input"
+                target = f"\\\\.\\pipe\\{leaf}"
             if os.name == "nt":
-                stream = None
-                # ~4s total: helper task / WaitForConnection can lag Session
-                for attempt in range(20):
-                    try:
-                        # open for write line protocol (server must already be listening)
-                        stream = open(  # noqa: SIM115
-                            target, "w", encoding="utf-8", buffering=1
-                        )
-                        stream.write(hello)
-                        stream.flush()
-                        last_err = None
-                        break
-                    except OSError as exc:
-                        last_err = exc
-                        # WinError 2 / ENOENT = no server yet; 231 = all instances busy
-                        time.sleep(0.2)
+                stream = _win_open_named_pipe_write(target, timeout_s=6.0)
                 if stream is None:
                     hint = (
-                        f"pipe not open: {target!r} ({last_err}). "
+                        f"pipe not open: {target!r}. "
                         "Start High-IL helper first: "
                         "schtasks /Run /TN HogwartsInputProvider "
                         "or agent/windows/input-provider/start-input-provider-silent.ps1"
                     )
-                    raise RuntimeError(hint) from last_err
+                    raise RuntimeError(hint)
+                try:
+                    stream.write(hello)
+                    stream.flush()
+                except Exception as exc:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"pipe write HELLO failed: {exc}") from exc
                 with _ip_lock():
                     _INPUT_PROVIDER["stream"] = stream
                     _INPUT_PROVIDER["spec"] = spec
@@ -2508,6 +2502,86 @@ def _input_provider_start(
             "error": str(exc)[:200],
             "note": "provider_start_failed_fallback_local",
         }
+
+
+def _win_open_named_pipe_write(target: str, *, timeout_s: float = 6.0):
+    """Open a Windows named pipe for line writes (input_provider client).
+
+    Uses WaitNamedPipeW + CreateFileW when available; falls back to open().
+    Returns a text write stream or None on timeout/failure.
+    """
+    if os.name != "nt":
+        return None
+    deadline = time.monotonic() + max(0.5, float(timeout_s))
+    last: Exception | None = None
+    # Prefer Win32 APIs — plain open() often reports ENOENT while the server
+    # is between instances or not yet in WaitForConnection.
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        WaitNamedPipeW = kernel32.WaitNamedPipeW
+        WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
+        WaitNamedPipeW.restype = wintypes.BOOL
+        CreateFileW = kernel32.CreateFileW
+        CreateFileW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        CreateFileW.restype = wintypes.HANDLE
+        CloseHandle = kernel32.CloseHandle
+        GENERIC_WRITE = 0x40000000
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        INVALID = ctypes.c_void_p(-1).value
+
+        while time.monotonic() < deadline:
+            try:
+                # Wait up to 500ms per loop for a free pipe instance
+                WaitNamedPipeW(target, 500)
+                handle = CreateFileW(
+                    target,
+                    GENERIC_WRITE,
+                    0,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+                if handle is None or handle == INVALID or int(handle) == -1:
+                    err = ctypes.get_last_error()
+                    last = OSError(err, f"CreateFileW failed winerr={err}")
+                    time.sleep(0.15)
+                    continue
+                fd = msvcrt.open_osfhandle(int(handle), os.O_WRONLY)
+                # fd owns the handle now
+                return open(fd, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
+            except OSError as exc:
+                last = exc
+                time.sleep(0.15)
+            except Exception as exc:
+                last = exc  # type: ignore[assignment]
+                time.sleep(0.15)
+    except Exception as exc:
+        last = exc  # type: ignore[assignment]
+
+    # Fallback: builtin open() with short retries
+    while time.monotonic() < deadline:
+        try:
+            return open(target, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
+        except OSError as exc:
+            last = exc
+            time.sleep(0.2)
+    if last:
+        print(f"[agent] pipe open failed {target!r}: {last}", flush=True)
+    return None
 
 
 def _input_provider_send(events: list[dict[str, Any]]) -> bool:
