@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.23-lab"
+VERSION = "0.5.24-lab"
 MIN_SLEEP = 0.12  # Control needs sub-200ms check-ins
 # Set by main(); when False, loop only logs enroll/errors/tasks>0 (less disk thrash)
 _AGENT_VERBOSE = False
@@ -116,6 +116,19 @@ _INPUT_PROVIDER: dict[str, Any] = {
     "error": "",
     "lock": None,  # set lazily
 }
+
+
+def _log(msg: str) -> None:
+    """Console-safe log (Windows cp1252 cannot print U+2192 → etc.)."""
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+            safe = msg.encode(enc, errors="replace").decode(enc, errors="replace")
+            print(safe, flush=True)
+        except Exception:
+            print(msg.encode("ascii", errors="replace").decode("ascii"), flush=True)
 
 
 def _load_config(path: Path) -> dict[str, Any]:
@@ -3373,16 +3386,21 @@ def run_cycle(cfg: dict[str, Any], cfg_path: Path) -> dict[str, Any]:
                 # Write dual fields first so crash between save and POST can recover
                 cfg["agent_token_pending"] = pending_token
                 _save_config(cfg_path, cfg)
+            # Keep results POST outside of console print (Windows cp1252 used to
+            # raise on "→" and we mis-spooled successful posts as failures).
             client.results(tid, status, result)
-            print(f"[agent] result {tid} → {status}", flush=True)
-            if typ == "rekey" and status == "succeeded" and pending_token:
-                cfg["agent_token"] = pending_token
-                cfg.pop("agent_token_pending", None)
-                _save_config(cfg_path, cfg)
-                client.token = pending_token
-                print("[agent] token rotated", flush=True)
+            try:
+                if typ == "rekey" and status == "succeeded" and pending_token:
+                    cfg["agent_token"] = pending_token
+                    cfg.pop("agent_token_pending", None)
+                    _save_config(cfg_path, cfg)
+                    client.token = pending_token
+                    _log("[agent] token rotated")
+            except Exception as post_ok_exc:
+                _log(f"[agent] post-ok followup: {post_ok_exc}")
+            _log(f"[agent] result {tid} -> {status}")
         except Exception as exc:
-            print(f"[agent] result post failed: {exc}", flush=True)
+            _log(f"[agent] result post failed: {exc}")
             # Do NOT rotate token on failure — plane still has the old hash.
             # Spool the result and keep using the current agent_token.
             if typ == "rekey":
