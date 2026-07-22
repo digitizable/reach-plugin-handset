@@ -237,14 +237,16 @@ class RemoteDesktopViewer(Gtk.Window):
         self._mode_control = Gtk.ToggleButton(label="2 · Control")
         self._mode_control.add_css_class("rdv-mode-btn")
         self._mode_control.set_group(self._mode_view)
-        self._mode_control.set_tooltip_text(
-            "Interactive: click the frame to inject mouse/keys (desktop_input)"
-        )
         self._mode_session = Gtk.ToggleButton(label="3 · Session")
         self._mode_session.add_css_class("rdv-mode-btn")
         self._mode_session.set_group(self._mode_view)
         self._mode_session.set_tooltip_text(
-            "Keepstream Session: continuous JPEG + input over TCP (not task-poll)"
+            "Keepstream Session: start/stop stream (view-only). "
+            "Use 2 · Control for mouse/keyboard while streaming."
+        )
+        self._mode_control.set_tooltip_text(
+            "Interactive control: inject mouse/keys. "
+            "If Keepstream is up, input rides the Session stream; else Live poll."
         )
         self._mode_view.connect(
             "toggled", lambda b: b.get_active() and self._set_mode("view")
@@ -608,12 +610,13 @@ class RemoteDesktopViewer(Gtk.Window):
             _g: Gtk.GestureClick, n_press: int, x: float, y: float
         ) -> None:
             if self._accepts_remote_input():
-                # Claim keyboard focus so typing goes remote, not archive/chrome
+                # Control mode only — claim focus for host typing
                 try:
                     self.picture.grab_focus()
                 except Exception:
                     pass
-                return  # drag gesture owns left button when controlling/session
+                return  # drag gesture owns left button when controlling
+            # Session/View: stream is watch-only; optional zoom on click
             if n_press == 1 and self._pixbuf is not None:
                 self._set_zoom(1.0 if self._zoom_mode is None else None)
             elif n_press >= 2:
@@ -953,10 +956,11 @@ class RemoteDesktopViewer(Gtk.Window):
         key = Gtk.EventControllerKey()
 
         def _remote_keys_active() -> bool:
+            # Only Control injects keys — Session stream is view-only
             try:
                 return bool(self._accepts_remote_input())
             except Exception:
-                return self._mode in ("control", "session")
+                return self._mode == "control"
 
         def _forward_key_to_remote(keyval: int, state: Gdk.ModifierType) -> bool:
             """Send a keystroke to the host; never trigger local zoom/focus/archive.
@@ -1400,22 +1404,30 @@ class RemoteDesktopViewer(Gtk.Window):
             self._set_default_pointer(w)
 
     def on_keepstream_up(self) -> None:
-        """Called when HELLO_OK lands (local_cursor flag now reliable)."""
+        """Called when HELLO_OK lands — stream only; Control still required for input."""
         self._main_stack.set_visible_child_name("view")
         self._apply_session_cursor()
-        self._set_status(
-            "Keepstream up — system cursor · absolute hover for Windows UI",
-            ok=True,
-        )
-
-    def attach_keepstream(self, client: Any) -> None:
-        """Attach a live KeepstreamClient; frames already applied via page callbacks."""
-        self._keepstream = client
+        if self._mode == "control":
+            self._set_status(
+                "Keepstream up — Control active (mouse/keys → host)",
+                ok=True,
+            )
+        else:
+            self._set_status(
+                "Keepstream up — stream only · click 2 · Control to inject input",
+                ok=True,
+            )
+        # Refresh mode hint without forcing Control
         try:
-            self.picture.grab_focus()
+            self._set_mode(self._mode)
         except Exception:
             pass
-        # Pre-seed local_cursor from profile BEFORE HELLO (attach often runs first)
+
+    def attach_keepstream(self, client: Any) -> None:
+        """Attach Keepstream client for stream frames (input only in Control)."""
+        self._keepstream = client
+        # Do NOT grab_focus — that stole the window for typing without Control
+        # Pre-seed local_cursor from profile BEFORE HELLO
         try:
             if self.current_session_profile() in ("gaming", "gaming-lan"):
                 self._session_local_cursor = True
@@ -1429,40 +1441,44 @@ class RemoteDesktopViewer(Gtk.Window):
                     getattr(client, "local_cursor", False)
                 )
         except Exception:
-            self._session_local_cursor = True  # safe default: never both-off
+            self._session_local_cursor = True
         self.live_badge.set_text("SESSION")
         self.live_badge.add_css_class("rdv-badge-live")
-        # Show the picture surface (not the setup form) and accept input
+        # Show stream surface (leave mode as-is if user already chose View/Control)
         self._main_stack.set_visible_child_name("view")
-        if not self._mode_session.get_active():
-            self._mode_session.set_active(True)
+        # Prefer Session tab for stream status, but never auto-enable Control
+        if self._mode not in ("control", "view", "session"):
+            self._mode = "session"
+        if self._mode == "session" or not (
+            self._mode_view.get_active()
+            or self._mode_control.get_active()
+            or self._mode_session.get_active()
+        ):
+            if not self._mode_session.get_active():
+                self._mode_session.set_active(True)
+            else:
+                self._set_mode("session")
         else:
-            self._set_mode("session")
-        # Force view again — _set_mode may flip to setup while connected=False
+            # Stay on View or Control — only re-apply current mode chrome
+            self._set_mode(self._mode)
         self._main_stack.set_visible_child_name("view")
         self._apply_session_cursor()
         # Stop task-poll Live — Keepstream owns frames now
         if self.btn_live.get_active() and self._on_live:
             self.btn_live.set_active(False)
-        if self._wants_local_cursor():
-            self._set_status(
-                "Keepstream Session — local cursor + relative mouse · input over TCP",
-                ok=True,
-            )
-        else:
-            self._set_status(
-                "Keepstream Session — host cursor in stream · local pointer hidden",
-                ok=True,
-            )
+        self._set_status(
+            "Keepstream stream live — view only · click 2 · Control to use mouse/keys",
+            ok=True,
+        )
 
     def _accepts_remote_input(self) -> bool:
-        """Control mode, or Session mode while Keepstream is connected."""
-        if self._mode == "control":
-            return True
-        if self._mode == "session":
-            ks = self._keepstream
-            return bool(ks is not None and getattr(ks, "connected", False))
-        return False
+        """Only Control mode injects input (Session is stream-only).
+
+        Ladder: View = watch · Control = inject · Session = start/stop Keepstream.
+        With Keepstream up, Control rides the Session TCP/UDP path; without it,
+        Control uses Live poll + desktop_input.
+        """
+        return self._mode == "control"
 
     def set_live_active(self, on: bool) -> None:
         if bool(self.btn_live.get_active()) != bool(on):
@@ -1500,60 +1516,58 @@ class RemoteDesktopViewer(Gtk.Window):
             # Setup panel until Keepstream is connected
             self._main_stack.set_visible_child_name("session")
             self.mode_hint.set_text(
-                "Session: Start Keepstream for continuous JPEG + input (not task-poll)"
+                "Session: Start Keepstream for continuous stream (view-only). "
+                "Then click 2 · Control to inject mouse/keys."
             )
         else:
             # Stream frames live in the picture view
             self._main_stack.set_visible_child_name("view")
             if mode == "session" and ks_up:
-                local = self._wants_local_cursor()
-                if local:
-                    self.mode_hint.set_text(
-                        "Session (Keepstream): local cursor · relative mouse · "
-                        "host pointer off · click/drag/wheel over TCP"
-                    )
-                else:
-                    self.mode_hint.set_text(
-                        "Session (Keepstream): host cursor in-frame · "
-                        "local pointer hidden · click/drag over TCP"
-                    )
-                # Stay on picture view while Session is connected
+                self.mode_hint.set_text(
+                    "Session (Keepstream): watching stream only · "
+                    "click 2 · Control for mouse/keyboard"
+                )
                 self._main_stack.set_visible_child_name("view")
                 self._apply_session_cursor()
             elif mode == "control":
                 if ks_up:
-                    local = self._wants_local_cursor()
-                    if local:
-                        self.mode_hint.set_text(
-                            "Control + Keepstream: local cursor · input over TCP"
-                        )
-                    else:
-                        self.mode_hint.set_text(
-                            "Control + Keepstream: host cursor in-frame · "
-                            "local pointer hidden · input over TCP"
-                        )
+                    self.mode_hint.set_text(
+                        "Control + Keepstream: mouse/keys → host · stream live"
+                    )
                     self._apply_session_cursor()
+                    try:
+                        self.picture.grab_focus()
+                    except Exception:
+                        pass
                 else:
                     self.mode_hint.set_text(
-                        "Control: host cursor in-frame · input prioritized · "
-                        "Live ~300ms @ lighter res (or use Session for true stream)"
+                        "Control: inject via Live poll · "
+                        "Start Keepstream (Session) for smooth stream + control"
                     )
-                    # Snappier Live while controlling (lighter frames + faster poll)
+                    # Snappier Live while controlling without Keepstream
                     self._set_live_interval(0.3)
                     if not self.btn_live.get_active() and self._on_live:
                         self.btn_live.set_active(True)
                     try:
-                        # Live-poll frames composite remote cursor
-                        self.picture.set_cursor_from_name("none")
-                    except Exception:
                         self.picture.set_cursor_from_name("default")
+                    except Exception:
+                        pass
             else:
-                self.mode_hint.set_text(
-                    "View: Capture / Live / archive — host cursor composited into frames"
-                )
+                if ks_up:
+                    self.mode_hint.set_text(
+                        "View + Keepstream: watching stream · "
+                        "2 · Control to inject · 3 · Session to stop"
+                    )
+                else:
+                    self.mode_hint.set_text(
+                        "View: Capture / Live / archive"
+                    )
                 if not ks_up:
                     self._set_live_interval(0.8)
-                    self.picture.set_cursor_from_name("default")
+                    try:
+                        self.picture.set_cursor_from_name("default")
+                    except Exception:
+                        pass
                 self._flush_input(force=True)
 
     def _set_live_interval(self, sec: float) -> None:
