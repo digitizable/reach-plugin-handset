@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.34-lab"
+VERSION = "0.5.35-lab"
 # Keepstream VIDEO codec byte (matches research keepstream-v0)
 _KS_CODEC_JPEG = 1
 _KS_CODEC_H264 = 2
@@ -1743,6 +1743,7 @@ class _FfmpegH264Source:
         self.method = "ffmpeg-h264"
         self._pending: list[bytes] = []
         self._have_vcl = False
+        self._param_sets = b""  # last SPS/PPS (Annex-B) for keyframe self-containment
         self.last_error = ""
         self._err_file: Any = None
 
@@ -1837,6 +1838,9 @@ class _FfmpegH264Source:
                     str(crf),
                     "-profile:v",
                     "baseline",
+                    # Repeat SPS/PPS on keyframes so desk can join mid-stream
+                    "-x264-params",
+                    f"repeat-headers=1:keyint={gop}:min-keyint={gop}",
                 ],
             ),
             (
@@ -1851,13 +1855,24 @@ class _FfmpegH264Source:
                     "vbr",
                     "-cq",
                     str(max(19, crf - 2)),
+                    "-bsf:v",
+                    "dump_extra=freq=keyframe",
                 ],
             ),
             # Simpler NVENC for drivers that reject p1/ll
             (
                 "nvenc-simple",
                 "h264_nvenc",
-                ["-preset", "llhp", "-rc", "cbr", "-b:v", "4M"],
+                [
+                    "-preset",
+                    "llhp",
+                    "-rc",
+                    "cbr",
+                    "-b:v",
+                    "4M",
+                    "-bsf:v",
+                    "dump_extra=freq=keyframe",
+                ],
             ),
         ]
 
@@ -1958,8 +1973,45 @@ class _FfmpegH264Source:
             return 0
         return nal[i] & 0x1F
 
+    def _remember_param_sets(self, nal: bytes) -> None:
+        """Track latest SPS (7) / PPS (8) so keyframe AUs stay self-contained."""
+        nt = self._nal_type(nal)
+        if nt not in (7, 8):
+            return
+        # Rebuild param blob from pending non-VCL + this style: keep rolling SPS+PPS
+        # Extract existing types from _param_sets and replace matching type.
+        parts: list[bytes] = []
+        if self._param_sets:
+            # split prior blob into NALs
+            pos = self._start_code_positions(self._param_sets)
+            for i, start in enumerate(pos):
+                end = pos[i + 1] if i + 1 < len(pos) else len(self._param_sets)
+                old = self._param_sets[start:end]
+                if self._nal_type(old) != nt:
+                    parts.append(bytes(old))
+        parts.append(nal)
+        self._param_sets = b"".join(parts)
+
+    def _emit_au(self, nals: list[bytes]) -> tuple[bytes, bool] | None:
+        if not nals:
+            return None
+        # Only emit AUs that contain a coded slice (VCL). Bare SPS/PPS is not a frame.
+        types = [self._nal_type(x) for x in nals]
+        if not any(t in (1, 5) for t in types):
+            return None
+        is_key = 5 in types
+        au = b"".join(nals)
+        if is_key and self._param_sets and 7 not in types:
+            # Desk may join mid-GOP; prepend last SPS/PPS on IDR
+            au = self._param_sets + au
+        return au, is_key
+
     def read_au(self, timeout_s: float = 0.5) -> tuple[bytes, bool] | None:
-        """Return (annex_b_access_unit, is_keyframe) or None."""
+        """Return (annex_b_access_unit, is_keyframe) or None.
+
+        Access unit model (single-slice zerolatency):
+        non-VCL (SPS/PPS/SEI) accumulate, then one VCL slice completes the AU.
+        """
         proc = self._proc
         if proc is None or proc.stdout is None or proc.poll() is not None:
             return None
@@ -1968,25 +2020,34 @@ class _FfmpegH264Source:
             positions = self._start_code_positions(self._buf)
             # Need at least 2 start codes to carve one complete NAL
             if len(positions) >= 2:
-                for pi in range(len(positions) - 1):
-                    start = positions[pi]
-                    end = positions[pi + 1]
-                    nal = bytes(self._buf[start:end])
-                    del self._buf[:end]
-                    nt = self._nal_type(nal)
-                    is_vcl = nt in (1, 5)
-                    if is_vcl and self._have_vcl and self._pending:
-                        # New primary picture — emit previous AU
-                        au = b"".join(self._pending)
-                        is_key = any(self._nal_type(x) == 5 for x in self._pending)
+                start = positions[0]
+                end = positions[1]
+                nal = bytes(self._buf[start:end])
+                del self._buf[:end]
+                nt = self._nal_type(nal)
+                is_vcl = nt in (1, 5)
+                if nt in (7, 8):
+                    self._remember_param_sets(nal)
+                if is_vcl:
+                    # Complete previous AU if it already had a VCL (shouldn't with
+                    # single-slice model), else attach leading non-VCL + this VCL.
+                    if self._have_vcl and self._pending:
+                        emitted = self._emit_au(self._pending)
                         self._pending = [nal]
                         self._have_vcl = True
-                        return au, is_key
-                    self._pending.append(nal)
-                    if is_vcl:
+                        if emitted is not None:
+                            return emitted
+                    else:
+                        self._pending.append(nal)
                         self._have_vcl = True
-                    # Re-scan after delete
-                    break
+                        emitted = self._emit_au(self._pending)
+                        self._pending.clear()
+                        self._have_vcl = False
+                        if emitted is not None:
+                            return emitted
+                else:
+                    # Leading parameter sets / SEI for the next slice
+                    self._pending.append(nal)
                 continue
             try:
                 import select
@@ -1999,13 +2060,10 @@ class _FfmpegH264Source:
                 chunk = proc.stdout.read(65536)
             if not chunk:
                 if proc.poll() is not None:
-                    if self._pending:
-                        au = b"".join(self._pending)
-                        is_key = any(self._nal_type(x) == 5 for x in self._pending)
-                        self._pending.clear()
-                        self._have_vcl = False
-                        return au, is_key
-                    return None
+                    emitted = self._emit_au(self._pending)
+                    self._pending.clear()
+                    self._have_vcl = False
+                    return emitted
                 continue
             self._buf.extend(chunk)
             if len(self._buf) > 12_000_000:
@@ -2039,6 +2097,7 @@ class _FfmpegH264Source:
         self._buf.clear()
         self._pending.clear()
         self._have_vcl = False
+        self._param_sets = b""
 
 
 def _ks_recv_exact(conn: Any, n: int) -> bytes:

@@ -19,6 +19,7 @@ class H264ToJpeg:
         self._lock = threading.Lock()
         self._ok = False
         self._Gst: Any = None
+        self._pushed = 0
 
     @property
     def available(self) -> bool:
@@ -44,11 +45,13 @@ class H264ToJpeg:
             if not getattr(Gst, "is_initialized", lambda: False)():
                 Gst.init(None)
             self._Gst = Gst
-            # is-live + drop for latest-frame paint under load
+            # byte-stream Annex-B; config-interval so parse can recover SPS/PPS
             desc = (
                 "appsrc name=src is-live=true do-timestamp=true format=time "
-                "block=false max-bytes=0 ! "
-                "h264parse ! avdec_h264 ! videoconvert ! "
+                "block=false max-bytes=0 "
+                "caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
+                "h264parse config-interval=-1 ! "
+                "avdec_h264 ! videoconvert ! "
                 "jpegenc quality=80 ! "
                 "appsink name=sink emit-signals=false sync=false "
                 "max-buffers=2 drop=true enable-last-sample=false"
@@ -68,6 +71,7 @@ class H264ToJpeg:
             self._src = src
             self._sink = sink
             self._ok = True
+            self._pushed = 0
             return True
         except Exception:
             self.stop()
@@ -79,13 +83,14 @@ class H264ToJpeg:
         self._src = None
         self._sink = None
         self._ok = False
+        self._pushed = 0
         if pipe is not None:
             try:
                 pipe.set_state(self._Gst.State.NULL if self._Gst else 1)
             except Exception:
                 pass
 
-    def decode(self, annex_b_au: bytes, *, timeout_s: float = 0.35) -> bytes | None:
+    def decode(self, annex_b_au: bytes, *, timeout_s: float = 0.6) -> bytes | None:
         if not annex_b_au:
             return None
         with self._lock:
@@ -95,7 +100,11 @@ class H264ToJpeg:
             try:
                 buf = Gst.Buffer.new_allocate(None, len(annex_b_au), None)
                 buf.fill(0, annex_b_au)
-                # Mark as delta/key not required for avdec when SPS/PPS in-band
+                # Treat as complete access unit
+                try:
+                    buf.set_flags(Gst.BufferFlags.HEADER if self._pushed == 0 else 0)
+                except Exception:
+                    pass
                 ret = self._src.emit("push-buffer", buf)
                 if ret != Gst.FlowReturn.OK:
                     # try restart once
@@ -104,11 +113,22 @@ class H264ToJpeg:
                         return None
                     buf = Gst.Buffer.new_allocate(None, len(annex_b_au), None)
                     buf.fill(0, annex_b_au)
-                    self._src.emit("push-buffer", buf)
+                    ret = self._src.emit("push-buffer", buf)
+                    if ret != Gst.FlowReturn.OK:
+                        return None
+                self._pushed += 1
+                # Parameter-set-only AUs won't produce a sample — short wait is fine.
+                # Picture AUs may need a bit longer on first IDR after join.
                 timeout_ns = int(max(0.05, timeout_s) * Gst.SECOND)
                 sample = self._sink.emit("try-pull-sample", timeout_ns)
                 if sample is None:
-                    return None
+                    # Drain a bit longer once the pipeline is warm
+                    if self._pushed <= 3:
+                        sample = self._sink.emit(
+                            "try-pull-sample", int(0.4 * Gst.SECOND)
+                        )
+                    if sample is None:
+                        return None
                 out_buf = sample.get_buffer()
                 if out_buf is None:
                     return None
