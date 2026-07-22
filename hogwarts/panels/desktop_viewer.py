@@ -1214,24 +1214,36 @@ class RemoteDesktopViewer(Gtk.Window):
         )
 
         if is_stream and not self._archive_live:
-            # ── Fast path (Session / Live) ──────────────────────────
+            # ── Fast path (Session / Live) — minimize GTK work per frame ──
             try:
                 self.empty_lab.set_visible(False)
             except Exception:
                 pass
             self._capturing = False
             self._current_path = None
-            self._render()
+            # Prefer Texture paint when available (less work than set_pixbuf path)
+            try:
+                if self._zoom_mode is None:
+                    self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+                    self.picture.set_can_shrink(True)
+                    tex = Gdk.Texture.new_for_pixbuf(pb)
+                    self.picture.set_paintable(tex)
+                    self._stream_texture = tex  # keep ref
+                else:
+                    self._render()
+            except Exception:
+                self._render()
             # Throttle chrome hard — status/title updates steal frames
             import time as _time
 
             now = _time.monotonic()
             last = float(getattr(self, "_stream_chrome_ts", 0.0) or 0.0)
-            if now - last >= 0.75:
+            # Session: update status ~1/s so paint stays on the stream
+            if now - last >= 1.0:
                 self._stream_chrome_ts = now
                 self._set_status(self._note, ok=ok)
                 self._update_meta()
-                if now - float(getattr(self, "_stream_title_ts", 0.0) or 0.0) >= 2.5:
+                if now - float(getattr(self, "_stream_title_ts", 0.0) or 0.0) >= 3.0:
                     self._stream_title_ts = now
                     self.set_title(
                         f"Remote Viewer - {self._agent_label} · {w}×{h}"
@@ -2275,7 +2287,7 @@ class RemoteDesktopViewer(Gtk.Window):
                 pass
             if prof == "gaming-lan":
                 self._set_status(
-                    "Session: Gaming LAN (≤1600 @ 60 sharp MJPEG · pure UDP)",
+                    "Session: Gaming LAN (≤1440 @ 60 · NVENC/MJPEG · pure UDP · smooth)",
                     ok=None,
                 )
             else:
@@ -2296,11 +2308,12 @@ class RemoteDesktopViewer(Gtk.Window):
         opts["profile"] = prof
         side = self.current_max_side()
         if prof == "gaming-lan":
-            # Premium lab LAN session — quality + latency first
-            opts["max_side"] = min(max(int(side), 1280), 1600)
+            # Buttery LAN: NVENC @ 60 when available (auto), else lean MJPEG.
+            # 1440 + quality 82 sustains smooth UI better than 1600@88 MJPEG.
+            opts["max_side"] = min(max(int(side), 1280), 1440)
             opts["fps"] = 60
-            opts["quality"] = 88  # q:v ~3 — crisp UI / desktop
-            opts["codec"] = "jpeg"  # MJPEG — lowest glass-to-glass on LAN
+            opts["quality"] = 82
+            opts["codec"] = "auto"  # NVENC first → MJPEG fallback
             opts["local_cursor"] = True
             opts["draw_mouse"] = False
             opts["transport"] = "udp"

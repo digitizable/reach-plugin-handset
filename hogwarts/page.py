@@ -2285,15 +2285,15 @@ class HogwartsPage(Gtk.Box):
                 max_side = int(self._agents.shot_max_side())
             profile = str(start_opts.get("profile") or "balanced").lower()
             if profile == "gaming-lan":
-                # Lab LAN: allow sharper capture
-                max_side = max(960, min(max_side, 1600))
+                # Lab LAN: 1440 sweet spot for smooth 60fps
+                max_side = max(960, min(max_side, 1440))
             elif profile == "gaming":
                 max_side = max(640, min(max_side, 1280))
             else:
                 max_side = max(960, min(max_side, 1280))
         except Exception:
             max_side = (
-                1600
+                1440
                 if str(start_opts.get("profile") or "") == "gaming-lan"
                 else 1280
             )
@@ -2348,17 +2348,17 @@ class HogwartsPage(Gtk.Box):
                         fps = 45.0  # balanced — smooth UI animations
                 except (TypeError, ValueError):
                     fps = 60.0 if profile in ("gaming", "gaming-lan") else 45.0
-                if profile == "gaming-lan":
-                    codec = "jpeg"
-                try:
-                    quality = int(start_opts.get("quality") or 72)
-                except (TypeError, ValueError):
-                    quality = 72
-                # Honor explicit codec from Session profile
+                # Honor explicit codec from Session profile (gaming-lan: auto)
                 if start_opts.get("codec"):
                     c2 = str(start_opts.get("codec") or "").strip().lower()
                     if c2 in ("jpeg", "h264", "auto"):
                         codec = c2
+                elif profile == "gaming-lan":
+                    codec = "auto"  # NVENC for buttery 60; MJPEG if no GPU
+                try:
+                    quality = int(start_opts.get("quality") or 72)
+                except (TypeError, ValueError):
+                    quality = 72
                 payload: dict = {
                     "mode": "keepstream",
                     "face": face if face != "path" else "loopback",
@@ -2490,14 +2490,20 @@ class HogwartsPage(Gtk.Box):
                     return False
 
                 def on_frame(_data: bytes, _meta: dict) -> None:
-                    # Schedule at most one paint; drop intermediates (latest wins).
+                    # One paint scheduled; always paints *latest* frame (smooth).
                     if getattr(self, "_ks_paint_src", None) is not None:
                         return
-                    # Prefer idle for all Session profiles so 45–60 fps UI
-                    # animations are not capped by a 6ms timer (~160→~60).
                     prof = str(getattr(self, "_ks_profile", "") or "").lower()
-                    if prof in ("gaming", "gaming-lan", "balanced", "quality"):
-                        self._ks_paint_src = GLib.idle_add(_ks_paint_tick)
+                    # PRIORITY_DEFAULT beats DEFAULT_IDLE so 60fps isn't starved
+                    # by other GTK idle work (chrome, archive, etc.).
+                    if prof in ("gaming", "gaming-lan"):
+                        self._ks_paint_src = GLib.idle_add(
+                            _ks_paint_tick, priority=GLib.PRIORITY_DEFAULT
+                        )
+                    elif prof in ("balanced", "quality"):
+                        self._ks_paint_src = GLib.idle_add(
+                            _ks_paint_tick, priority=GLib.PRIORITY_DEFAULT_IDLE
+                        )
                     else:
                         self._ks_paint_src = GLib.timeout_add(4, _ks_paint_tick)
 
