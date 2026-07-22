@@ -1864,8 +1864,7 @@ class AgentsPanel(Gtk.Box):
     ) -> None:
         """Cache frame and push into Remote Viewer window (only image UI).
 
-        Stream frames (Live / Keepstream) default to not writing ~/Pictures.
-        Explicit Capture keeps record_history=True.
+        Frames never auto-write ~/Pictures — viewer "Save to disk" is opt-in.
         ``pixel_format``: ``jpeg`` (default) or ``rgb24`` (Keepstream H.264).
         """
         self._frame_bytes = data
@@ -1878,12 +1877,13 @@ class AgentsPanel(Gtk.Box):
             self.desktop_status.add_css_class("hogwarts-ok")
         elif ok is False:
             self.desktop_status.add_css_class("hogwarts-fail")
-        # Infer stream vs still when caller omits the flag
+        # Default: do not mark for disk archive (viewer also requires Save to disk)
         if record_history is None:
             nu = msg.upper()
             is_stream = nu.startswith(
                 ("LIVE", "SESSION", "STREAM", "KEEPSTREAM")
             )
+            # Capture stills: display only unless viewer Save-to-disk is on
             record_history = not is_stream
         # While Keepstream owns the surface, never push Capture/Live stills
         nu = msg.upper()

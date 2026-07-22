@@ -156,10 +156,7 @@ class RemoteDesktopViewer(Gtk.Window):
                 for c in (agent_label or safe_id)
             )[:48] or safe_id
             self._archive_dir = Path.home() / "Pictures" / "Hogwarts" / host_part
-        try:
-            self._archive_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
+        # Do not create ~/Pictures/Hogwarts until the user opts into Save to disk
 
         self._raw: bytes | None = initial_bytes
         self._pixbuf: GdkPixbuf.Pixbuf | None = None
@@ -175,7 +172,9 @@ class RemoteDesktopViewer(Gtk.Window):
         self._items: list[dict[str, Any]] = []
         self._selected_i = -1
         self._loading_archive = False  # suppress re-save when loading from disk
+        # OFF by default — never write Capture/Stream frames to disk unless user opts in
         self._archive_live = False
+        self._keys_held: set[str] = set()  # remote key names currently down
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         root.add_css_class("rdv")
@@ -349,12 +348,12 @@ class RemoteDesktopViewer(Gtk.Window):
         # No multi-profile dropdown — single Default stream mode only
         self.session_profile_dd = None
 
-        self.chk_archive_live = Gtk.CheckButton(label="Archive stream")
+        self.chk_archive_live = Gtk.CheckButton(label="Save to disk")
         self.chk_archive_live.add_css_class("rdv-check")
         self.chk_archive_live.set_active(False)
         self.chk_archive_live.set_tooltip_text(
-            "OFF by default. When on, also save Live/Keepstream frames to "
-            "~/Pictures/Hogwarts (can fill disk very quickly)."
+            "OFF by default. Screenshots and stream frames stay in memory only. "
+            "When on, write to ~/Pictures/Hogwarts (can fill disk quickly)."
         )
         self.chk_archive_live.connect(
             "toggled",
@@ -987,7 +986,7 @@ class RemoteDesktopViewer(Gtk.Window):
         root.append(status_bar)
         self._status_bar = status_bar
 
-        # Keys
+        # Keys — Control mode uses real key_down / key_up (games WASD holds)
         key = Gtk.EventControllerKey()
 
         def _remote_keys_active() -> bool:
@@ -997,48 +996,11 @@ class RemoteDesktopViewer(Gtk.Window):
             except Exception:
                 return self._mode == "control"
 
-        def _forward_key_to_remote(keyval: int, state: Gdk.ModifierType) -> bool:
-            """Send a keystroke to the host; never trigger local zoom/focus/archive.
-
-            Printable chars (no Ctrl/Alt) use type=text (Shift via agent VkKeyScan).
-            Named keys + Ctrl/Alt chords use type=key with mods.
-            """
+        def _keyval_to_remote_name(keyval: int) -> str | None:
+            """Map GDK keyval → agent key name (w/a/s/d, arrows, …)."""
             name = (Gdk.keyval_name(keyval) or "").lower()
-            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
-            alt = bool(state & Gdk.ModifierType.ALT_MASK)
-            shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
-            super_m = bool(
-                state & getattr(Gdk.ModifierType, "SUPER_MASK", 0)
-                or state & getattr(Gdk.ModifierType, "META_MASK", 0)
-            )
-            mods: list[str] = []
-            if ctrl:
-                mods.append("ctrl")
-            if alt:
-                mods.append("alt")
-            if shift:
-                mods.append("shift")
-            if super_m:
-                mods.append("super")
-
-            # Prefer unicode for plain typing (Shift+number punctuation, etc.)
-            # Skip when Ctrl/Alt held so Ctrl+C / Alt+F4 reach the host correctly.
-            try:
-                uc = Gdk.keyval_to_unicode(keyval)
-            except Exception:
-                uc = 0
-            if (
-                not ctrl
-                and not alt
-                and not super_m
-                and uc
-                and 32 <= uc < 0x10FFFF
-            ):
-                ch = chr(uc)
-                if ch.isprintable() or ch == " ":
-                    self._send_input([{"type": "type", "text": ch}])
-                    return True
-            # Named / special keys + modified letters
+            if not name:
+                return None
             aliases = {
                 "return": "return",
                 "kp_enter": "return",
@@ -1058,38 +1020,78 @@ class RemoteDesktopViewer(Gtk.Window):
                 "page_up": "page_up",
                 "page_down": "page_down",
                 "insert": "insert",
+                # Modifiers as real keys (games often bind these)
+                "shift_l": "shift",
+                "shift_r": "shift",
+                "control_l": "ctrl",
+                "control_r": "ctrl",
+                "alt_l": "alt",
+                "alt_r": "alt",
+                "super_l": "super",
+                "super_r": "super",
+                "meta_l": "super",
+                "meta_r": "super",
             }
-            key_name = aliases.get(name, name)
-            if key_name.startswith("kp_") and len(key_name) == 4 and key_name[3].isdigit():
-                key_name = key_name[3]  # KP_0..9
-            if key_name.startswith("f") and key_name[1:].isdigit():
-                pass  # f1..f12
-            # Ctrl/Alt + letter often arrives as "c" / "C" — normalize
-            if len(key_name) == 1 and key_name.isalpha():
-                key_name = key_name.lower()
-            if not key_name or key_name in (
-                "shift_l",
-                "shift_r",
-                "control_l",
-                "control_r",
-                "alt_l",
-                "alt_r",
-                "super_l",
-                "super_r",
-                "meta_l",
-                "meta_r",
-                "caps_lock",
-                "num_lock",
-                "scroll_lock",
-            ):
-                # Modifiers alone: still consume so they don't hit local UI
+            if name in aliases:
+                return aliases[name]
+            if name in ("caps_lock", "num_lock", "scroll_lock", "iso_level3_shift"):
+                return None
+            if name.startswith("kp_") and len(name) == 4 and name[3].isdigit():
+                return name[3]
+            if name.startswith("f") and name[1:].isdigit():
+                return name  # f1..f12
+            # Letters / digits: use lower keyval so Shift doesn't change name
+            try:
+                base = Gdk.keyval_to_lower(keyval)
+                bname = (Gdk.keyval_name(base) or name).lower()
+            except Exception:
+                bname = name
+            if len(bname) == 1:
+                return bname
+            # Punctuation names → single char when possible
+            try:
+                uc = Gdk.keyval_to_unicode(Gdk.keyval_to_lower(keyval))
+                if uc and 32 < uc < 127:
+                    ch = chr(uc)
+                    if ch.isprintable() and ch not in " \t\n\r":
+                        return ch
+            except Exception:
+                pass
+            return bname if bname else None
+
+        def _release_all_remote_keys() -> None:
+            held = list(getattr(self, "_keys_held", set()) or [])
+            self._keys_held = set()
+            if not held:
+                return
+            try:
+                self._send_input(
+                    [{"type": "key_up", "key": k} for k in held]
+                )
+            except Exception:
+                pass
+
+        def _remote_key_down(keyval: int) -> bool:
+            """key_down once per physical hold — critical for WASD / Roblox."""
+            kn = _keyval_to_remote_name(keyval)
+            if not kn:
+                return True  # consume unknown so it doesn't hit local UI
+            if kn in self._keys_held:
+                return True  # auto-repeat — do not re-fire down
+            self._keys_held.add(kn)
+            self._send_input([{"type": "key_down", "key": kn}])
+            return True
+
+        def _remote_key_up(keyval: int) -> bool:
+            kn = _keyval_to_remote_name(keyval)
+            if not kn:
                 return True
-            ev: dict[str, Any] = {"type": "key", "key": key_name}
-            if mods:
-                # Drop shift when agent will get a named non-letter key and
-                # shift was only for capitalization (already handled above).
-                ev["mods"] = mods
-            self._send_input([ev])
+            if kn not in self._keys_held:
+                # Still send up (host may have state from earlier session)
+                pass
+            else:
+                self._keys_held.discard(kn)
+            self._send_input([{"type": "key_up", "key": kn}])
             return True
 
         def on_key(
@@ -1099,12 +1101,10 @@ class RemoteDesktopViewer(Gtk.Window):
             state: Gdk.ModifierType,
         ) -> bool:
             ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
-            shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
             alt = bool(state & Gdk.ModifierType.ALT_MASK)
             remote = _remote_keys_active()
 
             # Desk-only chords (never sent remote) — keep theater/zoom stable
-            # while typing. Plain Esc/F9/F/1 must NOT mutate local layout.
             if ctrl and not alt:
                 if keyval == Gdk.KEY_F9:
                     self._set_focus_mode(not self._focus_mode)
@@ -1127,7 +1127,6 @@ class RemoteDesktopViewer(Gtk.Window):
                 if keyval in (Gdk.KEY_o, Gdk.KEY_O) and not remote:
                     self._open_folder()
                     return True
-                # Ctrl+Plus/Minus zoom only when not remote-typing
                 if not remote and keyval in (
                     Gdk.KEY_plus,
                     Gdk.KEY_equal,
@@ -1139,10 +1138,9 @@ class RemoteDesktopViewer(Gtk.Window):
                     self._nudge_zoom(-1)
                     return True
 
-            # Control: ALL keys go to host (incl. Esc, F, 1, Space).
-            # This stops focus mode exit + fit/1:1 zoom "screen spreads out".
+            # Control: real key_down (games: WASD hold, Roblox, Studio)
             if remote:
-                return _forward_key_to_remote(keyval, state)
+                return _remote_key_down(keyval)
 
             # Local-only shortcuts (Watch mode)
             if keyval == Gdk.KEY_Escape:
@@ -1190,13 +1188,28 @@ class RemoteDesktopViewer(Gtk.Window):
                 return True
             return False
 
+        def on_key_released(
+            _c: Gtk.EventControllerKey,
+            keyval: int,
+            _keycode: int,
+            state: Gdk.ModifierType,
+        ) -> bool:
+            if _remote_keys_active():
+                return _remote_key_up(keyval)
+            return False
+
         key.connect("key-pressed", on_key)
+        try:
+            key.connect("key-released", on_key_released)
+        except Exception:
+            pass
         # Propagate phase so we get keys even when a child has focus
         try:
             key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         except Exception:
             pass
         self.add_controller(key)
+        self._release_all_remote_keys = _release_all_remote_keys  # type: ignore[method-assign]
         # Let the stream surface take focus when clicked (typing stays on host)
         try:
             self.picture.set_focusable(True)
@@ -1289,7 +1302,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self._pixbuf = pb
         w, h = pb.get_width(), pb.get_height()
         self._note = note or f"{w}×{h} · {_fmt_bytes(len(data))}"
-        # Stream frames must NEVER flood ~/Pictures unless "Archive live" is on
+        # Never write to disk unless user checked "Save to disk" (_archive_live)
         note_u = self._note.upper()
         is_stream = (
             (not record_history)
@@ -1327,20 +1340,25 @@ class RemoteDesktopViewer(Gtk.Window):
                     )
             return
 
-        if record_history and not self._loading_archive:
-            should_archive = (not is_stream) or self._archive_live
-            if should_archive:
-                saved = path or self._archive_to_disk(
-                    data, pb, note=self._note, live=is_stream
-                )
-                if saved is not None:
-                    self._current_path = saved
-                    self._prepend_item(saved, data, pb, self._note)
+        # Capture stills: paint only. Disk only when "Save to disk" is checked.
+        if (
+            self._archive_live
+            and record_history
+            and not self._loading_archive
+            and pf != "rgb24"
+        ):
+            saved = path or self._archive_to_disk(
+                data, pb, note=self._note, live=is_stream
+            )
+            if saved is not None:
+                self._current_path = saved
+                self._prepend_item(saved, data, pb, self._note)
             else:
-                # Stream preview without archiving — still show
                 self._current_path = None
         elif path is not None:
             self._current_path = path
+        else:
+            self._current_path = None
 
         self._capture_gen = int(getattr(self, "_capture_gen", 0)) + 1
         self._capturing = False
@@ -1657,8 +1675,17 @@ class RemoteDesktopViewer(Gtk.Window):
         # Only Watch | Control (legacy "session" → Watch)
         if mode == "session":
             mode = "view"
+        prev = self._mode
         self._mode = mode
         self._control_on = mode == "control"
+        # Leaving Control: release any held game keys (WASD stuck walk)
+        if prev == "control" and mode != "control":
+            try:
+                rel = getattr(self, "_release_all_remote_keys", None)
+                if callable(rel):
+                    rel()
+            except Exception:
+                self._keys_held = set()
         ks_up = bool(
             self._keepstream is not None
             and getattr(self._keepstream, "connected", False)
@@ -1759,12 +1786,29 @@ class RemoteDesktopViewer(Gtk.Window):
         ks_up = bool(ks is not None and getattr(ks, "connected", False))
         et = str(event.get("type") or "")
         # Immediate path for hover + typing (no GLib delay)
-        if ks_up and et in ("move", "rmove", "wheel", "wheel_h", "key", "type"):
+        if ks_up and et in (
+            "move",
+            "rmove",
+            "wheel",
+            "wheel_h",
+            "key",
+            "key_down",
+            "key_up",
+            "type",
+        ):
             try:
                 if et == "move" and not self._input_queue:
                     ks.send_input([event])
                     return
-                if et in ("rmove", "wheel", "wheel_h", "key", "type"):
+                if et in (
+                    "rmove",
+                    "wheel",
+                    "wheel_h",
+                    "key",
+                    "key_down",
+                    "key_up",
+                    "type",
+                ):
                     ks.send_input([event])
                     return
             except Exception:
@@ -2720,6 +2764,12 @@ class RemoteDesktopViewer(Gtk.Window):
             self.unfullscreen()
 
     def _on_close(self, *_a) -> bool:
+        try:
+            rel = getattr(self, "_release_all_remote_keys", None)
+            if callable(rel):
+                rel()
+        except Exception:
+            pass
         if self._input_flush_src is not None:
             try:
                 GLib.source_remove(self._input_flush_src)

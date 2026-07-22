@@ -107,11 +107,70 @@ public static class HogwartsInject {
     SendInput(1, new[] { inp }, Marshal.SizeOf(typeof(INPUT)));
   }
 
+  [DllImport("user32.dll")]
+  public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+  const uint KEYEVENTF_EXTENDEDKEY = 0x0001, KEYEVENTF_SCANCODE = 0x0008;
+
   static void Key(ushort vk, bool up) {
+    // Scan-code inject — games (Roblox etc.) need holds via scancodes
+    uint scan = MapVirtualKey(vk, 0 /* MAPVK_VK_TO_VSC */) & 0xFF;
+    uint flags = up ? KEYEVENTF_KEYUP : 0;
+    // Extended keys: arrows, insert/delete/home/end/pgup/pgdn, Win
+    if (vk == 0x21 || vk == 0x22 || vk == 0x23 || vk == 0x24 ||
+        vk == 0x25 || vk == 0x26 || vk == 0x27 || vk == 0x28 ||
+        vk == 0x2D || vk == 0x2E || vk == 0x5B || vk == 0x5C) {
+      flags |= KEYEVENTF_EXTENDEDKEY;
+    }
     var inp = new INPUT();
     inp.type = INPUT_KEYBOARD;
-    inp.U.ki = new KEYBDINPUT { wVk = vk, dwFlags = up ? KEYEVENTF_KEYUP : 0 };
+    if (scan != 0) {
+      flags |= KEYEVENTF_SCANCODE;
+      inp.U.ki = new KEYBDINPUT { wVk = 0, wScan = (ushort)scan, dwFlags = flags };
+    } else {
+      inp.U.ki = new KEYBDINPUT { wVk = vk, dwFlags = flags };
+    }
     SendInput(1, new[] { inp }, Marshal.SizeOf(typeof(INPUT)));
+  }
+
+  static ushort ResolveVk(string key) {
+    if (string.IsNullOrEmpty(key)) return 0;
+    string k = key.ToLowerInvariant().Replace("-", "_");
+    switch (k) {
+      case "return": case "enter": return 0x0D;
+      case "escape": case "esc": return 0x1B;
+      case "tab": return 0x09;
+      case "backspace": return 0x08;
+      case "space": return 0x20;
+      case "up": return 0x26;
+      case "down": return 0x28;
+      case "left": return 0x25;
+      case "right": return 0x27;
+      case "delete": return 0x2E;
+      case "home": return 0x24;
+      case "end": return 0x23;
+      case "page_up": case "prior": return 0x21;
+      case "page_down": case "next": return 0x22;
+      case "insert": return 0x2D;
+      case "shift": return 0x10;
+      case "ctrl": case "control": return 0x11;
+      case "alt": return 0x12;
+      case "super": case "win": return 0x5B;
+      default:
+        if (k.Length >= 2 && k[0] == 'f') {
+          int fn;
+          if (int.TryParse(k.Substring(1), out fn) && fn >= 1 && fn <= 12)
+            return (ushort)(0x70 + fn - 1);
+        }
+        if (k.Length == 1) {
+          char c = char.ToUpperInvariant(k[0]);
+          if (c >= 'A' && c <= 'Z') return (ushort)c;
+          if (c >= '0' && c <= '9') return (ushort)c;
+          short vk = VkKeyScanW(k[0]);
+          if (vk != -1) return (ushort)(vk & 0xFF);
+        }
+        return 0;
+    }
   }
 
   public static void ApplyEvent(string type, double? fx, double? fy, int? x, int? y, string button, string key, string text) {
@@ -167,36 +226,13 @@ public static class HogwartsInject {
       }
       return;
     }
+    if ((typ == "key_down" || typ == "keydown" || typ == "key_up" || typ == "keyup") && !string.IsNullOrEmpty(key)) {
+      ushort code = ResolveVk(key);
+      if (code != 0) Key(code, typ == "key_up" || typ == "keyup");
+      return;
+    }
     if (typ == "key" && !string.IsNullOrEmpty(key)) {
-      string k = key.ToLowerInvariant();
-      ushort code = 0;
-      switch (k) {
-        case "return": case "enter": code = 0x0D; break;
-        case "escape": case "esc": code = 0x1B; break;
-        case "tab": code = 0x09; break;
-        case "backspace": code = 0x08; break;
-        case "space": code = 0x20; break;
-        case "up": code = 0x26; break;
-        case "down": code = 0x28; break;
-        case "left": code = 0x25; break;
-        case "right": code = 0x27; break;
-        case "delete": code = 0x2E; break;
-        case "home": code = 0x24; break;
-        case "end": code = 0x23; break;
-        case "page_up": case "prior": code = 0x21; break;
-        case "page_down": case "next": code = 0x22; break;
-        case "insert": code = 0x2D; break;
-        default:
-          if (k.Length >= 2 && k[0] == 'f') {
-            int fn;
-            if (int.TryParse(k.Substring(1), out fn) && fn >= 1 && fn <= 12)
-              code = (ushort)(0x70 + fn - 1);
-          } else if (k.Length == 1) {
-            short vk = VkKeyScanW(k[0]);
-            if (vk != -1) code = (ushort)(vk & 0xFF);
-          }
-          break;
-      }
+      ushort code = ResolveVk(key);
       // Optional mods: "ctrl,alt,shift,super"
       var modVks = new System.Collections.Generic.List<ushort>();
       if (!string.IsNullOrEmpty(mods)) {

@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     from keepstream.server import session_stop as _ks_session_stop
 
 
-VERSION = "0.5.56-lab"
+VERSION = "0.5.57-lab"
 # Keepstream VIDEO codec byte (matches research keepstream-v0)
 _KS_CODEC_JPEG = 1
 _KS_CODEC_H264 = 2
@@ -2139,11 +2139,12 @@ def _process_elevated() -> bool | None:
 def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
     """Inject mouse/keyboard for Remote Viewer Control mode.
 
-    Event types: move | rmove | click | dblclick | down | up | key | type |
-    wheel | wheel_h
+    Event types: move | rmove | click | dblclick | down | up | key |
+    key_down | key_up | type | wheel | wheel_h
     Position: fx/fy in [0,1] of primary screen, or absolute x/y pixels.
     Relative: rmove with dx/dy host pixels (Parsec-class gaming).
     Key mods: optional ``mods`` list: ctrl, alt, shift, super.
+    Games (Roblox etc.): prefer key_down/key_up holds over tap ``key``.
 
     If a user ``input_provider`` plug-in is active, events are forwarded to it
     (operator-supplied elevated helper). Otherwise local SendInput/xdotool.
@@ -2284,11 +2285,109 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
             inp.ii.mi = MOUSEINPUT(0, 0, d & 0xFFFFFFFF, flag, 0, None)
             user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
+        KEYEVENTF_EXTENDEDKEY = 0x0001
+        KEYEVENTF_SCANCODE = 0x0008
+        # Arrows / navigation / Win — need EXTENDEDKEY for games/DirectInput
+        _EXT_VKS = frozenset(
+            {
+                0x21,
+                0x22,
+                0x23,
+                0x24,
+                0x25,
+                0x26,
+                0x27,
+                0x28,
+                0x2D,
+                0x2E,
+                0x5B,
+                0x5C,
+            }
+        )
+
         def send_key(vk: int, up: bool = False) -> None:
+            """Inject via scan code (games-friendly) + VK fallback.
+
+            Roblox / Unity / many engines read scancodes; pure VK taps fail for
+            held WASD. We send KEYEVENTF_SCANCODE with MapVirtualKey scan.
+            """
+            vk = int(vk) & 0xFF
+            if vk == 0:
+                return
+            # MAPVK_VK_TO_VSC = 0
+            try:
+                scan = int(user32.MapVirtualKeyW(vk, 0)) & 0xFF
+            except Exception:
+                scan = 0
+            flags = 0
+            if up:
+                flags |= KEYEVENTF_KEYUP
+            if vk in _EXT_VKS:
+                flags |= KEYEVENTF_EXTENDEDKEY
             inp = INPUT()
             inp.type = INPUT_KEYBOARD
-            inp.ii.ki = KEYBDINPUT(vk & 0xFF, 0, KEYEVENTF_KEYUP if up else 0, 0, None)
+            if scan:
+                flags |= KEYEVENTF_SCANCODE
+                # wVk=0 when using scan codes (MS docs); some UIs still want VK
+                inp.ii.ki = KEYBDINPUT(0, scan, flags, 0, None)
+            else:
+                inp.ii.ki = KEYBDINPUT(vk, 0, flags & ~KEYEVENTF_SCANCODE, 0, None)
             user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+        def resolve_vk(key: str) -> int | None:
+            key = str(key or "").lower().replace("-", "_")
+            vk_map = {
+                "return": 0x0D,
+                "enter": 0x0D,
+                "escape": 0x1B,
+                "esc": 0x1B,
+                "tab": 0x09,
+                "backspace": 0x08,
+                "space": 0x20,
+                "up": 0x26,
+                "down": 0x28,
+                "left": 0x25,
+                "right": 0x27,
+                "delete": 0x2E,
+                "home": 0x24,
+                "end": 0x23,
+                "page_up": 0x21,
+                "page_down": 0x22,
+                "prior": 0x21,
+                "next": 0x22,
+                "insert": 0x2D,
+                "shift": 0x10,
+                "ctrl": 0x11,
+                "control": 0x11,
+                "alt": 0x12,
+                "super": 0x5B,
+                "win": 0x5B,
+                "f1": 0x70,
+                "f2": 0x71,
+                "f3": 0x72,
+                "f4": 0x73,
+                "f5": 0x74,
+                "f6": 0x75,
+                "f7": 0x76,
+                "f8": 0x77,
+                "f9": 0x78,
+                "f10": 0x79,
+                "f11": 0x7A,
+                "f12": 0x7B,
+            }
+            code = vk_map.get(key)
+            if code is not None:
+                return code
+            if len(key) == 1:
+                # Prefer literal letter/digit VKs (A=0x41 … Z=0x5A, 0=0x30)
+                ch = key.upper()
+                if "A" <= ch <= "Z":
+                    return ord(ch)
+                if "0" <= ch <= "9":
+                    return ord(ch)
+                code = user32.VkKeyScanW(ord(key)) & 0xFF
+                return code if code != 0xFF else None
+            return None
 
         def place_cursor() -> None:
             """Move host pointer under reported fx/fy before click/wheel."""
@@ -2388,44 +2487,14 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                 if shift:
                     send_key(0x10, up=True)
             return
+        if typ in ("key_down", "keydown", "key_up", "keyup"):
+            # Game holds (WASD): down on press, up on release — no auto-tap
+            code = resolve_vk(str(ev.get("key") or ""))
+            if code:
+                send_key(code, up=typ in ("key_up", "keyup"))
+            return
         if typ == "key":
-            key = str(ev.get("key") or "").lower().replace("-", "_")
-            vk_map = {
-                "return": 0x0D,
-                "enter": 0x0D,
-                "escape": 0x1B,
-                "esc": 0x1B,
-                "tab": 0x09,
-                "backspace": 0x08,
-                "space": 0x20,
-                "up": 0x26,
-                "down": 0x28,
-                "left": 0x25,
-                "right": 0x27,
-                "delete": 0x2E,
-                "home": 0x24,
-                "end": 0x23,
-                "page_up": 0x21,
-                "page_down": 0x22,
-                "prior": 0x21,
-                "next": 0x22,
-                "insert": 0x2D,
-                "f1": 0x70,
-                "f2": 0x71,
-                "f3": 0x72,
-                "f4": 0x73,
-                "f5": 0x74,
-                "f6": 0x75,
-                "f7": 0x76,
-                "f8": 0x77,
-                "f9": 0x78,
-                "f10": 0x79,
-                "f11": 0x7A,
-                "f12": 0x7B,
-            }
-            code = vk_map.get(key)
-            if code is None and len(key) == 1:
-                code = user32.VkKeyScanW(ord(key)) & 0xFF
+            code = resolve_vk(str(ev.get("key") or ""))
             raw_mods = ev.get("mods") or ev.get("modifiers") or []
             if isinstance(raw_mods, str):
                 raw_mods = [m.strip() for m in raw_mods.split(",") if m.strip()]
@@ -2521,30 +2590,45 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                     timeout=5,
                 )
             return
+        def _xdo_key_name(key: str) -> str:
+            kmap = {
+                "return": "Return",
+                "enter": "Return",
+                "escape": "Escape",
+                "esc": "Escape",
+                "backspace": "BackSpace",
+                "space": "space",
+                "tab": "Tab",
+                "up": "Up",
+                "down": "Down",
+                "left": "Left",
+                "right": "Right",
+                "delete": "Delete",
+                "home": "Home",
+                "end": "End",
+                "page_up": "Page_Up",
+                "page_down": "Page_Down",
+                "insert": "Insert",
+                "shift": "Shift_L",
+                "ctrl": "Control_L",
+                "control": "Control_L",
+                "alt": "Alt_L",
+                "super": "Super_L",
+                "win": "Super_L",
+            }
+            return kmap.get(key.lower(), key)
+
+        if typ in ("key_down", "keydown", "key_up", "keyup"):
+            key = str(ev.get("key") or "")
+            if key:
+                k = _xdo_key_name(key)
+                cmd = "keyup" if typ in ("key_up", "keyup") else "keydown"
+                subprocess.check_call(["xdotool", cmd, k], timeout=3)
+            return
         if typ == "key":
             key = str(ev.get("key") or "")
             if key:
-                # Map common names to xdotool
-                kmap = {
-                    "return": "Return",
-                    "enter": "Return",
-                    "escape": "Escape",
-                    "esc": "Escape",
-                    "backspace": "BackSpace",
-                    "space": "space",
-                    "tab": "Tab",
-                    "up": "Up",
-                    "down": "Down",
-                    "left": "Left",
-                    "right": "Right",
-                    "delete": "Delete",
-                    "home": "Home",
-                    "end": "End",
-                    "page_up": "Page_Up",
-                    "page_down": "Page_Down",
-                    "insert": "Insert",
-                }
-                k = kmap.get(key.lower(), key)
+                k = _xdo_key_name(key)
                 raw_mods = ev.get("mods") or ev.get("modifiers") or []
                 if isinstance(raw_mods, str):
                     raw_mods = [m.strip() for m in raw_mods.split(",") if m.strip()]
@@ -2569,7 +2653,6 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                     elif m in ("super", "win", "meta", "cmd"):
                         prefix.append("super")
                 chord = "+".join(prefix + [k]) if prefix else k
-                # clearmodifiers only when no explicit mods (avoid wiping them)
                 if prefix:
                     subprocess.check_call(["xdotool", "key", chord], timeout=3)
                 else:
