@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import ssl
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -28,6 +29,9 @@ class AgentDTO:
     arch: str = ""
     sleep: float | None = None
     jitter: float | None = None
+    # async = beacon-class check-in; interactive = session-class / turbo sleep
+    presence: str = "async"
+    package_id: str = ""
 
 
 @dataclass
@@ -52,21 +56,27 @@ class TaskDTO:
 
 
 class C2Client:
-    """Thin HTTP client with connection keep-alive — no extra pip deps."""
+    """Thin HTTP client with connection keep-alive — no extra pip deps.
+
+    Thread-safe: Live/Control/poll/task workers share one desk client; all
+    request I/O is serialized on ``_lock`` (http.client is not re-entrant).
+    """
 
     def __init__(self, config: PlaneConfig) -> None:
         self.config = config
         self._conn: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
         self._conn_key: tuple[str, str, int] | None = None
+        self._lock = threading.RLock()
 
     def close(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-        self._conn = None
-        self._conn_key = None
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = None
+            self._conn_key = None
 
     def _url(self, path: str) -> str:
         base = self.config.base_url.rstrip("/") + "/"
@@ -81,7 +91,11 @@ class C2Client:
         port = int(parsed.port or (443 if scheme == "https" else 80))
         key = (scheme, host, port)
         if self._conn is None or self._conn_key != key:
-            self.close()
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
             if scheme == "https":
                 ctx = ssl.create_default_context()
                 self._conn = http.client.HTTPSConnection(
@@ -106,6 +120,17 @@ class C2Client:
         body: dict[str, Any] | None = None,
         timeout: float = 5.0,
     ) -> Any:
+        with self._lock:
+            return self._request_locked(method, path, body=body, timeout=timeout)
+
+    def _request_locked(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        timeout: float = 5.0,
+    ) -> Any:
         conn, _scheme = self._ensure_conn(timeout)
         full = self._url(path)
         parsed = urlparse(full)
@@ -115,7 +140,7 @@ class C2Client:
 
         headers = {
             "Accept": "application/json",
-            "User-Agent": "hogwarts/0.5.9",
+            "User-Agent": "hogwarts/0.5.44",
             "Connection": "keep-alive",
         }
         if self.config.api_token:
@@ -135,7 +160,13 @@ class C2Client:
             return json.loads(raw) if raw.strip() else {}
         except (http.client.HTTPException, OSError, TimeoutError) as exc:
             # Drop dead keep-alive socket and retry once
-            self.close()
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = None
+            self._conn_key = None
             try:
                 conn, _ = self._ensure_conn(timeout)
                 conn.request(method, req_path, body=raw_body, headers=headers)
@@ -147,13 +178,31 @@ class C2Client:
             except ConnectionError:
                 raise
             except Exception as exc2:
-                self.close()
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                self._conn = None
+                self._conn_key = None
                 raise ConnectionError(f"Unreachable: {exc2}") from exc2
         except ConnectionError:
-            self.close()
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = None
+            self._conn_key = None
             raise
         except Exception as exc:
-            self.close()
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            self._conn = None
+            self._conn_key = None
             raise ConnectionError(f"Unreachable: {exc}") from exc
 
     def health(self) -> dict[str, Any]:
@@ -215,13 +264,34 @@ class C2Client:
         return _parse_task(task) if task else None
 
     def mint_enroll_secret(
-        self, *, max_uses: int = 1, ttl_sec: int = 3600
+        self,
+        *,
+        max_uses: int = 1,
+        ttl_sec: int = 3600,
+        label: str | None = None,
+        package_id: str | None = None,
+        canary_label: str | None = None,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {"max_uses": max_uses, "ttl_sec": ttl_sec}
+        if label:
+            body["label"] = label
+        if package_id:
+            body["package_id"] = package_id
+        if canary_label:
+            body["canary_label"] = canary_label
         return self._request(
             "POST",
             "/api/v1/operator/enroll-secrets",
-            body={"max_uses": max_uses, "ttl_sec": ttl_sec},
+            body=body,
         )
+
+    def list_canaries(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            f"/api/v1/operator/canaries?limit={int(limit)}",
+            timeout=4.0,
+        )
+        return list(payload.get("canaries") or [])
 
     def list_listeners(self) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v1/listeners")
@@ -246,6 +316,97 @@ class C2Client:
             "GET", "/api/v1/events?" + "&".join(qs), timeout=4.0
         )
         return [_parse_event(e) for e in payload.get("events") or []]
+
+    def open_event_stream(
+        self,
+        *,
+        since: str | None = None,
+        stop_flag: threading.Event | None = None,
+        max_sec: int = 0,
+    ):
+        """Yield (kind, payload) from GET /api/v1/events/stream (SSE).
+
+        kind is ``hello`` | ``plane`` | ``bye`` | ``raw``. Uses a **dedicated**
+        connection so keep-alive poll traffic is not blocked. Caller runs this
+        in a worker thread. Raises on connect/auth failure; yields until stop
+        or disconnect.
+        """
+        if not self.config.is_configured:
+            raise ConnectionError("Control plane not configured")
+        parsed = urlparse(
+            self.config.base_url
+            if "://" in self.config.base_url
+            else "http://" + self.config.base_url
+        )
+        scheme = (parsed.scheme or "http").lower()
+        host = parsed.hostname or "127.0.0.1"
+        port = int(parsed.port or (443 if scheme == "https" else 80))
+        qs = []
+        if since:
+            qs.append(f"since={quote(since)}")
+        if max_sec > 0:
+            qs.append(f"max_sec={int(max_sec)}")
+        path = "/api/v1/events/stream"
+        if qs:
+            path = path + "?" + "&".join(qs)
+        headers = {
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "User-Agent": "hogwarts/0.5.56",
+            "Connection": "keep-alive",
+        }
+        if self.config.api_token:
+            headers["Authorization"] = f"Bearer {self.config.api_token}"
+        if scheme == "https":
+            ctx = ssl.create_default_context()
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                host, port, timeout=60, context=ctx
+            )
+        else:
+            conn = http.client.HTTPConnection(host, port, timeout=60)
+        try:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            if resp.status >= 400:
+                body = resp.read().decode("utf-8", errors="replace")
+                raise ConnectionError(f"SSE HTTP {resp.status}: {body or resp.reason}")
+            event_name = "message"
+            data_lines: list[str] = []
+            while True:
+                if stop_flag is not None and stop_flag.is_set():
+                    break
+                # readline with socket timeout — heartbeats arrive ~12s
+                line_b = resp.readline()
+                if not line_b:
+                    break
+                line = line_b.decode("utf-8", errors="replace").rstrip("\r\n")
+                if line == "":
+                    if data_lines:
+                        raw = "\n".join(data_lines)
+                        data_lines = []
+                        try:
+                            payload = json.loads(raw)
+                        except json.JSONDecodeError:
+                            yield ("raw", raw)
+                        else:
+                            yield (event_name or "message", payload)
+                        event_name = "message"
+                    continue
+                if line.startswith(":"):
+                    # comment / heartbeat
+                    continue
+                if line.startswith("event:"):
+                    event_name = line[6:].strip() or "message"
+                    continue
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+                    continue
+                # ignore id: and other fields
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -284,6 +445,13 @@ def _parse_agent(raw: dict[str, Any] | None) -> AgentDTO:
         jitter_f = float(jitter) if jitter is not None else None
     except (TypeError, ValueError):
         jitter_f = None
+    presence = str(raw.get("presence") or "").strip().lower()
+    if presence not in ("async", "interactive"):
+        # Desk-side fallback if older plane omits presence
+        if sleep_f is not None and sleep_f <= 0.4:
+            presence = "interactive"
+        else:
+            presence = "async"
     return AgentDTO(
         id=str(raw.get("id") or ""),
         hostname=str(raw.get("hostname") or ""),
@@ -298,6 +466,8 @@ def _parse_agent(raw: dict[str, Any] | None) -> AgentDTO:
         arch=str(raw.get("arch") or ""),
         sleep=sleep_f,
         jitter=jitter_f,
+        presence=presence,
+        package_id=str(raw.get("package_id") or ""),
     )
 
 

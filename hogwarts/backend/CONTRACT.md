@@ -26,7 +26,8 @@ Config is stored under Reach plugin data:
 | Secret | Who | Routes |
 |--------|-----|--------|
 | `operator_token` | Hogwarts desk | inventory, task create, events, enroll-secrets |
-| `enroll_secret` | One-shot install | `POST /api/v1/agent/enroll` |
+| `enroll_secret` | One-shot **per export package** | `POST /api/v1/agent/enroll` |
+| `package_id` | Public package id (not a secret) | Bound at mint; stored on agent after enroll |
 | `agent_token` | Agent only | checkin / results |
 
 ---
@@ -53,6 +54,8 @@ GET /api/v1/agents?status=online|idle|offline&q=<search>&limit=200
       "os": "Linux 6.x",
       "arch": "x86_64",
       "status": "online",
+      "presence": "async|interactive",
+      "package_id": "pkg_…?",
       "last_seen": "…Z",
       "external_ip": "203.0.113.1",
       "internal_ip": "10.0.0.12",
@@ -64,6 +67,9 @@ GET /api/v1/agents?status=online|idle|offline&q=<search>&limit=200
   ],
   "next_cursor": null
 }
+
+`presence`: **async** = beacon-class check-in (default sleep); **interactive** =
+turbo sleep band and/or pending screenshot/desktop/session tasks (session-class).
 ```
 
 ```
@@ -145,18 +151,38 @@ Body: {
 - `fs_list` remains the folder browser; `fs_search` is full-index substring/glob search.
 - Search hit cap default 200 (max 2000). Index entry cap default 200_000 (agent-enforced).
 
-### Listeners (plane-managed)
+### Listeners / jobs (plane-managed battlements)
+
+Havoc-class **listener jobs**: first-class objects with bind, kind, lifecycle state,
+and **honest evidence**. Desk LED is green only when
+`state=deployed` **and** `evidence ∈ {tcp_ok, process_ok, plane_managed}`.
+Never invent “listening.”
 
 ```
 GET    /api/v1/listeners
-POST   /api/v1/listeners          body: listener fields
+POST   /api/v1/listeners          body: job fields
 PUT    /api/v1/listeners/{id}
 DELETE /api/v1/listeners/{id}
 GET    /api/v1/listeners/{id}
 ```
 
-Fields: `id, name, accept_host, accept_port, proto, face, agent_id, state, evidence, notes`.
-State: planned|deployed|disabled|burned. Evidence: none|tcp_ok|process_ok|plane_managed|unknown.
+| Field | Notes |
+|-------|--------|
+| `id` / `job_id` | `lst_…` |
+| `name` | Operator label |
+| `kind` | `reverse_tls` \| `reverse_tcp` \| `path_wrapped` \| `http_plane` \| `note` \| `other` |
+| `role` | Free text (e.g. agent reverse, session face) |
+| `accept_host` / `accept_port` | Bind (desk also exposes `bind` = host:port) |
+| `proto` | Transport face label (legacy-friendly) |
+| `face` | SNI / cover personality |
+| `agent_id` | Optional foothold link |
+| `state` | `planned` \| `deployed` \| `disabled` \| `burned` |
+| `evidence` | `none` \| `tcp_ok` \| `process_ok` \| `plane_managed` \| `unknown` |
+| `last_probe_at` | ISO time of last TCP probe |
+| `last_probe_vantage` | `desk` (operator path) — plane probe ≠ desk probe |
+| `notes` | Ops free text |
+
+**Non-goals (v0):** no SMB / External listeners on the plane — path multi-hop is Reach/Spectre.
 | `socks_start` | `{port?}` 0=ephemeral | `{started, port, bind, proto}` lab SOCKS5 |
 | `socks_stop` | `{}` | `{stopped, port}` |
 | `rekey` | plane injects `new_token` on deliver | `{rekeyed}` agent persists new token |
@@ -184,21 +210,91 @@ GET /api/v1/events?since=<iso>&limit=100
 → 200 {
   "events": [
     {
+      "id": 1,                 // optional row id
       "ts": "…Z",
       "level": "info|ok|warn|error",
-      "channel": "agent|listener|task|system",
+      "channel": "agent|listener|task|system|canary",
       "message": "…",
-      "agent_id": "…?"
+      "agent_id": "…?",
+      "meta": {}?
     }
   ]
 }
 ```
 
 ```
-POST /api/v1/operator/enroll-secrets
-Body: { "max_uses": 1, "ttl_sec": 3600 }
-→ 201 { "id", "secret", "max_uses", "expires_at" }
+GET /api/v1/events/stream?since=<iso>&max_sec=0
+Authorization: Bearer <operator_token>
+→ 200 text/event-stream
+
+// SSE frames:
+// event: hello
+// data: {"ok":true,"stream":"events","version":"…","time":"…Z"}
+//
+// id: 42
+// event: plane
+// data: {"id":42,"ts":"…","level":"warn","channel":"canary","message":"…"}
+//
+// : ping          // heartbeat comment ~12s
+// event: bye      // optional when max_sec expires
 ```
+
+**Live events (T5):** desk prefers SSE when the plane supports `/events/stream`;
+falls back to `GET /events` polling if the stream drops. Fleet/task refresh
+still uses the poll timer.
+
+```
+POST /api/v1/operator/enroll-secrets
+Body: {
+  "max_uses": 1,
+  "ttl_sec": 3600,
+  "label"?: "export-…",
+  "package_id"?: "pkg_…"   // optional; plane mints if omitted
+  "canary_label"?: "hex…"  // optional; plane mints 16-hex if omitted
+}
+→ 201 {
+  "id",                 // enroll secret id (enr_…)
+  "package_id",         // stable package identity (pkg_…)
+  "canary_label",       // public package canary token (not a secret)
+  "label"?,
+  "secret",             // one-shot cleartext — only returned here
+  "max_uses",
+  "expires_at",
+  "created"
+}
+```
+
+```
+GET /api/v1/operator/canaries?limit=50
+→ 200 {
+  "canaries": [
+    {
+      "export_id", "package_id", "label", "canary_label",
+      "canary_hits", "canary_last_hit", "canary_last_ip",
+      "agent_id", "created", "expires_at", "uses", "max_uses"
+    }
+  ]
+}
+```
+
+```
+GET|POST /api/v1/canary/{canary_label}     // no auth
+→ 200 { "ok": true, "canary_label" }       // known label; event channel=canary
+→ 404                                      // unknown (still logged as unknown)
+```
+
+**Package identity (export):** each desk “Export agent zip” mints a **unique**
+`package_id` + one-shot secret + `canary_label`. The zip’s `agent.json` /
+`MANIFEST.json` carry `package_id` and canary fields (not a shared lab password).
+On enroll, the plane binds `package_id` to the new agent and records it on the
+enroll-secret row. Reuse of the same zip after first enroll fails (`max_uses`).
+
+**Package canary (purple):** on first agent start, the reference agent GETs
+`canary_url` (`{plane}/api/v1/canary/{label}`) once and optionally resolves
+`canary_fqdn` when Ops “Canary domain” is set. Plane emits `channel=canary`
+events with remote IP. DNS is operator-side (wildcard sinkhole + analytics);
+HTTP canary works without DNS control. `canary_label` is **public attribution**,
+not an enroll secret.
 
 ---
 
@@ -206,8 +302,8 @@ Body: { "max_uses": 1, "ttl_sec": 3600 }
 
 ```
 POST /api/v1/agent/enroll
-Body: { "enroll_secret", "hostname", "username", "os", "arch", … }
-→ 201 { "agent_id", "agent_token", "sleep", "jitter" }
+Body: { "enroll_secret", "hostname", "username", "os", "arch", "package_id"?, … }
+→ 201 { "agent_id", "agent_token", "package_id"?, "sleep", "jitter" }
 
 POST /api/v1/agent/checkin
 Authorization: Bearer <agent_token>

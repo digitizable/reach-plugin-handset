@@ -210,7 +210,13 @@ class RemoteFileExplorer(Gtk.Window):
         self._selected_ent: dict[str, Any] | None = None
         self._selected_row: Gtk.Widget | None = None
         self._filter = ""
+        self._filter_debounce_src: int | None = None
         self._listing = False
+        self._browse_debounce_src: int | None = None
+        self._browse_pending: str | None = None
+        self._browse_inflight: str | None = None
+        self._address_programmatic = False
+        self._address_debounce_src: int | None = None
         self._sort_key = "name"
         self._sort_asc = True
         self._history: list[str] = []
@@ -332,6 +338,8 @@ class RemoteFileExplorer(Gtk.Window):
         self.address.set_placeholder_text("Address")
         self.address.set_text(self._path)
         self.address.connect("activate", lambda *_: self._go_address())
+        # Live navigate after typing pause (ignored when set programmatically)
+        self.address.connect("changed", self._on_address_changed)
         addr_wrap.append(self.address)
         self.btn_go = self._icon_btn("go-jump", "Go")
         self.btn_go.add_css_class("wfe-go")
@@ -689,13 +697,26 @@ class RemoteFileExplorer(Gtk.Window):
     ) -> None:
         self._listing = False
         prev = self._path
+        # Keep selection across re-list when path unchanged (same folder refresh)
+        keep_name = None
+        if (
+            prev == (path or "")
+            and self._selected_ent is not None
+            and str(self._selected_ent.get("name") or "")
+        ):
+            keep_name = str(self._selected_ent.get("name") or "")
         self._path = path or ""
         self._parent = parent
         self._sep = sep or "/"
         self._entries = list(entries or [])
         self._clear_selection()
         if self._path:
-            self.address.set_text(self._path)
+            self._address_programmatic = True
+            try:
+                self.address.set_text(self._path)
+            finally:
+                self._address_programmatic = False
+        self._browse_inflight = None
         if self._hist_lock:
             self._hist_lock = False
         elif ok is not False and self._path and record_history:
@@ -704,7 +725,7 @@ class RemoteFileExplorer(Gtk.Window):
         msg = note or (self._path or "Ready")
         self._set_status(msg, ok=ok if ok is not None else True)
         self.count_lab.set_text(f"{n} item{'s' if n != 1 else ''}")
-        self._rebuild_list()
+        self._rebuild_list(preserve_name=keep_name)
         self._update_nav_sensitive()
         # Path/sep may reveal Windows vs Linux when agent.os was vague
         self._rebuild_sidebar(force=False)
@@ -953,15 +974,84 @@ class RemoteFileExplorer(Gtk.Window):
         self._browse(parent)
 
     def _go_address(self) -> None:
-        self._browse(self.address.get_text().strip())
+        # Immediate (Enter / Go) — still coalesces with in-flight same path
+        self._browse(self.address.get_text().strip(), immediate=True)
+
+    def _on_address_changed(self, *_a) -> None:
+        """Debounced navigate after the operator stops typing a path."""
+        if self._address_programmatic:
+            return
+        if self._address_debounce_src is not None:
+            try:
+                GLib.source_remove(self._address_debounce_src)
+            except Exception:
+                pass
+            self._address_debounce_src = None
+
+        def fire() -> bool:
+            self._address_debounce_src = None
+            if self._address_programmatic:
+                return False
+            path = self.address.get_text().strip()
+            # Skip empty / identical to current listing
+            if not path or path == (self._path or ""):
+                return False
+            # Require a path-ish string (slash or drive) so half-typed names wait
+            sep = self._sep or "/"
+            if sep not in path and not (
+                len(path) >= 2 and path[1] == ":"
+            ):
+                return False
+            self._browse(path, immediate=False)
+            return False
+
+        self._address_debounce_src = GLib.timeout_add(420, fire)
 
     def _refresh(self) -> None:
-        self._browse(self._path or self.address.get_text().strip())
+        self._browse(self._path or self.address.get_text().strip(), immediate=True)
 
-    def _browse(self, path: str) -> None:
-        if self._on_browse:
-            self.mark_listing(path or "(default)")
-            self._on_browse(path)
+    def _browse(self, path: str, *, immediate: bool = True) -> None:
+        """Request a remote listing, coalescing spam navigations."""
+        path = (path or "").strip()
+        # Already working on this exact path — ignore double-Enter / Go spam
+        if self._listing and self._browse_inflight == path:
+            return
+        if not immediate:
+            # Debounced path from address bar
+            self._browse_pending = path
+            if self._browse_debounce_src is not None:
+                try:
+                    GLib.source_remove(self._browse_debounce_src)
+                except Exception:
+                    pass
+                self._browse_debounce_src = None
+
+            def fire() -> bool:
+                self._browse_debounce_src = None
+                pending = self._browse_pending
+                self._browse_pending = None
+                if pending is not None:
+                    self._browse_now(pending)
+                return False
+
+            self._browse_debounce_src = GLib.timeout_add(80, fire)
+            return
+        # Cancel any pending debounced browse in favor of explicit Go/click
+        if self._browse_debounce_src is not None:
+            try:
+                GLib.source_remove(self._browse_debounce_src)
+            except Exception:
+                pass
+            self._browse_debounce_src = None
+            self._browse_pending = None
+        self._browse_now(path)
+
+    def _browse_now(self, path: str) -> None:
+        if not self._on_browse:
+            return
+        self._browse_inflight = path
+        self.mark_listing(path or "(default)")
+        self._on_browse(path)
 
     def _on_hidden(self, *_a) -> None:
         self._show_hidden = bool(self.chk_hidden.get_active())
@@ -969,8 +1059,25 @@ class RemoteFileExplorer(Gtk.Window):
             self._on_hidden_toggle(self._show_hidden)
 
     def _on_filter_changed(self, *_a) -> None:
-        self._filter = self.filter_entry.get_text().strip().lower()
-        self._rebuild_list()
+        # Debounce: rebuild once typing pauses so selection/hover aren't
+        # destroyed on every keystroke.
+        if self._filter_debounce_src is not None:
+            try:
+                GLib.source_remove(self._filter_debounce_src)
+            except Exception:
+                pass
+            self._filter_debounce_src = None
+
+        def apply() -> bool:
+            self._filter_debounce_src = None
+            self._filter = self.filter_entry.get_text().strip().lower()
+            keep = None
+            if self._selected_ent is not None:
+                keep = str(self._selected_ent.get("name") or "") or None
+            self._rebuild_list(preserve_name=keep)
+            return False
+
+        self._filter_debounce_src = GLib.timeout_add(160, apply)
 
     def _join(self, base: str, name: str) -> str:
         sep = self._sep or "/"
@@ -987,7 +1094,10 @@ class RemoteFileExplorer(Gtk.Window):
             self._sort_key = key
             self._sort_asc = True
         self._update_header_labels()
-        self._rebuild_list()
+        keep = None
+        if self._selected_ent is not None:
+            keep = str(self._selected_ent.get("name") or "") or None
+        self._rebuild_list(preserve_name=keep)
 
     def _update_header_labels(self) -> None:
         names = {
@@ -1046,10 +1156,14 @@ class RemoteFileExplorer(Gtk.Window):
         self._selected_ent = ent
         row.add_css_class("wfe-row-selected")
 
-    def _rebuild_list(self) -> None:
+    def _rebuild_list(self, *, preserve_name: str | None = None) -> None:
+        keep = preserve_name
+        if keep is None and self._selected_ent is not None:
+            keep = str(self._selected_ent.get("name") or "") or None
         while child := self.list_box.get_first_child():
             self.list_box.remove(child)
         self._selected_row = None
+        self._selected_ent = None
         entries = self._filtered_entries()
         if not entries:
             empty = Gtk.Label(
@@ -1066,8 +1180,16 @@ class RemoteFileExplorer(Gtk.Window):
             self.list_box.append(empty)
             self.count_lab.set_text("0 items")
             return
+        restore_row = None
+        restore_ent = None
         for ent in entries:
-            self.list_box.append(self._row(ent))
+            row = self._row(ent)
+            self.list_box.append(row)
+            if keep and str(ent.get("name") or "") == keep:
+                restore_row = row
+                restore_ent = ent
+        if restore_row is not None and restore_ent is not None:
+            self._select_row(restore_row, restore_ent)
         shown = len(entries)
         total = len(self._entries)
         if self._filter and shown != total:

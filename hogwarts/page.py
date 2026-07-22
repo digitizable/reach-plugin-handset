@@ -88,11 +88,21 @@ class HogwartsPage(Gtk.Box):
         self._c2: C2Client | None = None
         self._page_mapped = False
         self._fs_index_source: int | None = None
+        # T5 SSE live events (poll remains fleet/tasks + fallback)
+        self._sse_stop: threading.Event | None = None
+        self._sse_thread: threading.Thread | None = None
+        self._sse_alive = False
+        self._sse_fail_streak = 0
         apply_css(self)
         self.connect("destroy", lambda *_: self._on_destroy())
         # Stack hides non-visible pages — pause heavy work when Hogwarts is off-rail
         self.connect("map", lambda *_: self._on_map())
         self.connect("unmap", lambda *_: self._on_unmap())
+
+        # Sticky clearnet-risk strip (Reach Settings → Privacy opt-out)
+        self._policy_warn = self._build_policy_warn_bar()
+        self.append(self._policy_warn)
+        self._sync_policy_warn()
 
         # Header
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -218,12 +228,14 @@ class HogwartsPage(Gtk.Box):
         meta_pb = meta.get("playbook")
         if isinstance(meta_pb, dict):
             self._ops.load_playbook(meta_pb)
+        self._ops.set_canary_domain(str(meta.get("canary_domain") or ""))
+        self._ops.refresh_export_ledger(meta)
         self._log = LogPanel(on_clear=self._clear_log)
 
         nav_items = (
             ("channel", "Channel", "network-wired-symbolic", self._channel),
             ("agents", "Agents", "system-users-symbolic", self._agents),
-            ("listener", "Listener", "network-server-symbolic", self._listener),
+            ("listener", "Jobs", "network-server-symbolic", self._listener),
             ("egress", "Egress", "network-transmit-receive-symbolic", self._egress),
             ("console", "Console", "utilities-terminal-symbolic", self._console),
             ("plane", "Plane", "network-workgroup-symbolic", self._plane_panel),
@@ -290,14 +302,66 @@ class HogwartsPage(Gtk.Box):
                 except Exception:
                     pass
 
+    def _build_policy_warn_bar(self) -> Gtk.Widget:
+        """Non-dismissible yellow strip when sensitive ops are allowed without a path."""
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        bar.add_css_class("hogwarts-policy-warn")
+        bar.set_hexpand(True)
+        bar.set_halign(Gtk.Align.FILL)
+        # No close control — sticky while the Reach privacy opt-out is on
+        try:
+            ic = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+        except Exception:
+            ic = Gtk.Image.new_from_icon_name("dialog-information-symbolic")
+        ic.set_pixel_size(16)
+        ic.set_valign(Gtk.Align.CENTER)
+        bar.append(ic)
+        lab = Gtk.Label(
+            label=(
+                "Sensitive ops allowed without a path · clearnet risk · "
+                "Settings → Privacy"
+            ),
+            xalign=0,
+            wrap=True,
+        )
+        lab.add_css_class("hogwarts-policy-warn-label")
+        lab.set_hexpand(True)
+        lab.set_valign(Gtk.Align.CENTER)
+        bar.append(lab)
+        return bar
+
+    def _sync_policy_warn(self) -> None:
+        """Show sticky bar only when Reach allows Operate without a path."""
+        bar = getattr(self, "_policy_warn", None)
+        if bar is None:
+            return
+        show = False
+        ctx = getattr(self, "_ctx", None)
+        if ctx is not None:
+            if hasattr(ctx, "allows_sensitive_without_path"):
+                try:
+                    show = bool(ctx.allows_sensitive_without_path())
+                except Exception:
+                    show = False
+            else:
+                # Fallback if older Reach host lacks the helper
+                svc = getattr(ctx, "services", None)
+                cfg = getattr(svc, "config", None) if svc is not None else None
+                if cfg is not None:
+                    show = bool(getattr(cfg, "allow_sensitive_without_path", False))
+        bar.set_visible(show)
+
     def _on_map(self) -> None:
         self._page_mapped = True
+        self._sync_policy_warn()
         if self._plane.is_configured:
             self._start_event_poll()
+            self._start_event_stream()
 
     def _on_unmap(self) -> None:
         self._page_mapped = False
         # Leaving Hogwarts: stop timers so Reach does not keep polling plane forever
+        self._stop_event_stream()
         self._stop_event_poll()
         self._stop_live_and_index()
 
@@ -327,6 +391,7 @@ class HogwartsPage(Gtk.Box):
 
     def _on_destroy(self) -> None:
         self._page_mapped = False
+        self._stop_event_stream()
         self._stop_event_poll()
         self._stop_live_and_index()
         if self._c2 is not None:
@@ -356,6 +421,7 @@ class HogwartsPage(Gtk.Box):
         return self._c2
 
     def _refresh_all(self) -> None:
+        self._sync_policy_warn()
         self._refresh_status()
         if self._plane.is_configured:
             self._refresh_agents(quiet=True)
@@ -429,6 +495,7 @@ class HogwartsPage(Gtk.Box):
         self._refresh_status()
         if self._page_mapped:
             self._start_event_poll()
+            self._start_event_stream()
         if self._ctx.toast:
             self._ctx.toast("Plane config saved")
 
@@ -440,8 +507,157 @@ class HogwartsPage(Gtk.Box):
                 pass
             self._poll_source = None
 
+    def _stop_event_stream(self) -> None:
+        """Stop T5 SSE worker."""
+        self._sse_alive = False
+        stop = getattr(self, "_sse_stop", None)
+        if stop is not None:
+            stop.set()
+        self._sse_stop = None
+        self._sse_thread = None
+
+    def _start_event_stream(self) -> None:
+        """Long-lived SSE for plane events; poll still handles fleet/tasks."""
+        self._stop_event_stream()
+        if not self._plane.is_configured:
+            return
+        if not self._events_since:
+            self._events_since = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        stop = threading.Event()
+        self._sse_stop = stop
+        self._sse_alive = False
+        self._sse_fail_streak = 0
+
+        def worker() -> None:
+            while not stop.is_set():
+                if not getattr(self, "_page_mapped", False):
+                    break
+                try:
+                    client = self._client()
+                    since = self._events_since
+                    for kind, payload in client.open_event_stream(
+                        since=since, stop_flag=stop
+                    ):
+                        if stop.is_set():
+                            break
+                        if kind == "hello":
+                            self._sse_alive = True
+                            self._sse_fail_streak = 0
+
+                            def _hello() -> bool:
+                                self._log_msg("Live events SSE connected")
+                                return False
+
+                            GLib.idle_add(_hello)
+                            continue
+                        if kind == "bye":
+                            break
+                        if kind != "plane" or not isinstance(payload, dict):
+                            continue
+                        from hogwarts.backend.client import _parse_event
+
+                        ev = _parse_event(payload)
+
+                        def _push(e=ev) -> bool:
+                            self._ingest_events([e], source="sse")
+                            return False
+
+                        GLib.idle_add(_push)
+                    self._sse_alive = False
+                except Exception as exc:
+                    self._sse_alive = False
+                    self._sse_fail_streak = int(
+                        getattr(self, "_sse_fail_streak", 0)
+                    ) + 1
+                    if self._sse_fail_streak <= 2:
+
+                        def _err(msg=str(exc)) -> bool:
+                            self._log_msg(f"SSE events: {msg} — poll fallback")
+                            return False
+
+                        GLib.idle_add(_err)
+                if stop.is_set():
+                    break
+                # Backoff before reconnect
+                delay = min(30.0, 2.0 * max(1, self._sse_fail_streak))
+                stop.wait(delay)
+            self._sse_alive = False
+
+        th = threading.Thread(
+            target=worker, name="hogwarts-sse", daemon=True
+        )
+        self._sse_thread = th
+        th.start()
+
+    def _ingest_events(
+        self, events_out: list[Any], *, source: str = "poll"
+    ) -> None:
+        """Advance event cursor + calm console (shared by poll and SSE)."""
+        if not events_out:
+            return
+        last_ts = None
+        on_console = False
+        try:
+            on_console = self._stack.get_visible_child_name() == "console"
+        except Exception:
+            on_console = False
+        seen: set[str] = getattr(self, "_console_event_seen", set())
+        serious = []
+        for e in events_out:
+            lvl = str(getattr(e, "level", "") or "").lower()
+            if lvl not in ("error", "warn", "warning"):
+                # Still advance cursor for info/ok
+                if getattr(e, "ts", None):
+                    last_ts = e.ts
+                continue
+            ch = str(getattr(e, "channel", None) or "")
+            msg = str(getattr(e, "message", None) or "")
+            if ch == "task" and (
+                "queued type=" in msg
+                or "check-in" in msg.lower()
+                or "succeeded" in msg.lower()
+                or "assigned" in msg.lower()
+            ):
+                if getattr(e, "ts", None):
+                    last_ts = e.ts
+                continue
+            msg_norm = msg
+            for tok in msg.split():
+                if tok.startswith("tsk_") or tok.startswith("agt_"):
+                    msg_norm = msg_norm.replace(tok, "<id>")
+            key = f"{lvl}|{ch}|{msg_norm}"
+            if key in seen:
+                if getattr(e, "ts", None):
+                    last_ts = e.ts
+                continue
+            serious.append(e)
+            seen.add(key)
+            if getattr(e, "ts", None):
+                last_ts = e.ts
+        for e in events_out:
+            if getattr(e, "ts", None):
+                last_ts = e.ts
+        if len(seen) > 80:
+            seen = set(list(seen)[-40:])
+        self._console_event_seen = seen
+        if on_console:
+            # SSE can deliver faster — still cap lines per batch
+            cap = 4 if source == "sse" else 2
+            for e in serious[-cap:]:
+                ts = e.ts.strftime("%H:%M:%S") if e.ts else "?"
+                msg = str(e.message or "")
+                if len(msg) > 220:
+                    msg = msg[:217] + "…"
+                self._console.append_out(
+                    f"[{ts}] {e.level}/{e.channel} {msg}"
+                )
+        if last_ts is not None:
+            self._events_since = last_ts.isoformat().replace("+00:00", "Z")
+
     def _start_event_poll(self) -> None:
-        """Auto-pull fleet/tasks; events advance silently (console stays calm)."""
+        """Auto-pull fleet/tasks; events via SSE when alive, else poll."""
         self._stop_event_poll()
         if not self._plane.is_configured:
             return
@@ -458,7 +674,7 @@ class HogwartsPage(Gtk.Box):
             self, "_console_event_seen", set()
         )
         # Session log only — not the interactive console
-        self._log_msg(f"Background poll every {interval}s (console quiet)")
+        self._log_msg(f"Background poll every {interval}s (SSE when available)")
 
     def _poll_tick(self) -> bool:
         if not self._plane.is_configured:
@@ -484,8 +700,11 @@ class HogwartsPage(Gtk.Box):
             (not on_detail and self._poll_gen % 2 == 1)
             or (agent_id is None and self._poll_gen % 3 == 1)
         )
-        # Events: Console open, or every 4th tick for cursor advance
-        want_events = nav == "console" or self._poll_gen % 4 == 1
+        # Events: poll only when SSE is down (or Console open and SSE cold)
+        sse_up = bool(getattr(self, "_sse_alive", False))
+        want_events = (not sse_up) and (
+            nav == "console" or self._poll_gen % 4 == 1
+        )
         # Tasks: only while viewing an agent in Agents
         want_tasks = bool(agent_id) and nav == "agents" and on_detail
         want_channel = self._poll_gen % 3 == 1
@@ -516,6 +735,9 @@ class HogwartsPage(Gtk.Box):
 
             def done() -> bool:
                 self._poll_busy = False
+                # Drop UI work if page was closed/unmapped mid-request
+                if not getattr(self, "_page_mapped", True) or not self.get_mapped():
+                    return True
                 if err:
                     return True
                 if want_channel:
@@ -524,45 +746,7 @@ class HogwartsPage(Gtk.Box):
                     except Exception:
                         pass
                 if events_out:
-                    last_ts = None
-                    # Calm console: warn/error only, de-dupe, skip noisy task noise.
-                    seen: set[str] = getattr(self, "_console_event_seen", set())
-                    serious = []
-                    for e in events_out:
-                        lvl = str(e.level).lower()
-                        if lvl not in ("error", "warn", "warning"):
-                            continue
-                        ch = str(e.channel or "")
-                        msg = str(e.message or "")
-                        # Task queue/fail lines often flood when a chunked op dies
-                        if ch == "task" and (
-                            "queued type=" in msg
-                            or "check-in" in msg.lower()
-                        ):
-                            continue
-                        key = f"{lvl}|{ch}|{msg}"
-                        if key in seen:
-                            continue
-                        serious.append(e)
-                        seen.add(key)
-                    # Cap memory of de-dupe set
-                    if len(seen) > 80:
-                        seen = set(list(seen)[-40:])
-                    self._console_event_seen = seen
-                    for e in serious[-3:]:
-                        ts = e.ts.strftime("%H:%M:%S") if e.ts else "?"
-                        # Truncate huge error dumps (e.g. traceback in message)
-                        msg = str(e.message or "")
-                        if len(msg) > 220:
-                            msg = msg[:217] + "…"
-                        self._console.append_out(
-                            f"[{ts}] {e.level}/{e.channel} {msg}"
-                        )
-                    for e in events_out:
-                        if e.ts:
-                            last_ts = e.ts
-                    if last_ts is not None:
-                        self._events_since = last_ts.isoformat().replace("+00:00", "Z")
+                    self._ingest_events(events_out, source="poll")
                 if agents is not None:
                     self._agents.set_agents(agents, quiet=True)
                 if want_tasks and agent_id and tasks is not None:
@@ -850,6 +1034,10 @@ class HogwartsPage(Gtk.Box):
 
         status = self._agents.filter_status()
         q = self._agents.query()
+        # Drop in-flight refresh results — spam-clicking Refresh used to queue
+        # many idle_add callbacks that rebuilt fleet and killed hover.
+        self._agents._fleet_gen = int(getattr(self._agents, "_fleet_gen", 0)) + 1
+        gen = self._agents._fleet_gen
 
         def work() -> None:
             try:
@@ -860,16 +1048,20 @@ class HogwartsPage(Gtk.Box):
                 err = str(exc)
 
             def done() -> bool:
+                # Stale response from an earlier Refresh — ignore
+                if gen != getattr(self._agents, "_fleet_gen", gen):
+                    return False
                 if err:
+                    msg = err
                     low = err.lower()
                     if "refused" in low or "errno 111" in low:
-                        err = (
+                        msg = (
                             f"{err}\n\n"
                             "Plane is not running or not reachable. "
                             "Open Plane → Start plane (local lab), then refresh Agents."
                         )
-                    self._agents.show_error(err)
-                    self._log_msg(f"Agents error: {err}")
+                    self._agents.show_error(msg)
+                    self._log_msg(f"Agents error: {msg}")
                 else:
                     self._agents.set_agents(agents)
                     self._log_msg(f"Agents refreshed ({len(agents)})")
@@ -1730,10 +1922,19 @@ class HogwartsPage(Gtk.Box):
         def tick() -> bool:
             if self._live_desktop_agent != agent_id:
                 return False
-            if self._agents.selected_agent_id() != agent_id:
-                return True
+            # Stop timer when viewer closes or agent selection left this id
             if not self._agents.desktop_viewer_open():
-                return True
+                self._live_desktop_agent = None
+                self._live_desktop_source = None
+                self._live_desktop_busy = False
+                return False
+            if self._agents.selected_agent_id() != agent_id:
+                # Detail may have changed; keep Live only if viewer still open
+                # for this agent session — otherwise stop
+                if not self._agents.desktop_viewer_open():
+                    self._live_desktop_agent = None
+                    self._live_desktop_source = None
+                    return False
             if not self._live_desktop_busy:
                 self._live_desktop_busy = True
 
@@ -1798,6 +1999,16 @@ class HogwartsPage(Gtk.Box):
                 client, tid, tries=40, max_wait=4.0 if control_mode else 8.0
             )
             if not task or task.status != "succeeded":
+                st = task.status if task else "timeout"
+                GLib.idle_add(
+                    lambda s=st: (
+                        self._agents.set_desktop_note(
+                            f"Live frame {s} — will retry",
+                            ok=False,
+                        ),
+                        False,
+                    )[-1]
+                )
                 return
             res = task.result or {}
             blob = self._decode_frame_result(res)
@@ -2055,12 +2266,19 @@ class HogwartsPage(Gtk.Box):
         def work_start() -> None:
             err: str | None = None
             res: dict | None = None
+            # Spike 2: when Reach path SOCKS is up, dial Session through it
+            path_socks = self._socks_tuple()
             try:
                 client = self._client()
+                # Prefer reverse bind; operator can force loopback via viewer options
+                face = str(start_opts.get("face") or "reverse").strip().lower()
+                bind = str(start_opts.get("bind") or "").strip()
+                if not bind:
+                    bind = "127.0.0.1" if face in ("loopback", "path") else "0.0.0.0"
                 payload: dict = {
                     "mode": "keepstream",
-                    "face": "reverse",
-                    "bind": "0.0.0.0",
+                    "face": face if face != "path" else "loopback",
+                    "bind": bind,
                     "port": 0,
                     "max_side": max_side,
                     "fps": 60,
@@ -2175,6 +2393,14 @@ class HogwartsPage(Gtk.Box):
 
                     GLib.idle_add(ui)
 
+                socks_h: str | None = None
+                socks_p: int | None = None
+                if path_socks:
+                    socks_h, socks_p = path_socks
+                # Direct LAN when no path SOCKS; else Spike 2 path dial
+                force_direct = bool(start_opts.get("direct")) or face == "lan"
+                if force_direct:
+                    socks_h, socks_p = None, None
                 ks = KeepstreamClient(
                     host=host,
                     port=port,
@@ -2183,6 +2409,8 @@ class HogwartsPage(Gtk.Box):
                     on_frame=on_frame,
                     on_status=on_status,
                     on_closed=on_closed,
+                    socks_host=socks_h,
+                    socks_port=socks_p,
                 )
                 self._keepstream = ks
                 # Viewer can send input over Keepstream
@@ -2191,11 +2419,17 @@ class HogwartsPage(Gtk.Box):
                 except Exception:
                     pass
                 ks.start()
+                via = "path SOCKS" if socks_h else "direct"
                 note = (
-                    f"Keepstream {host}:{port} · {sid} · codec={res.get('codec')}"
+                    f"Keepstream {host}:{port} · {via} · {sid} · "
+                    f"codec={res.get('codec')}"
                 )
                 self._agents.set_desktop_note(note, ok=True)
-                self._agents.set_desktop_session_info(res)
+                info = dict(res or {})
+                info["via"] = via
+                if socks_h:
+                    info["socks"] = f"{socks_h}:{socks_p}"
+                self._agents.set_desktop_session_info(info)
                 self._log_msg(f"session_start {note}")
                 self._refresh_tasks(agent_id)
                 return False
@@ -2238,16 +2472,16 @@ class HogwartsPage(Gtk.Box):
         data = self._store.load()
         data.update(snap)
         self._store.save(data)
-        self._log_msg("Listener notes saved")
+        self._log_msg("Listener job saved")
         if not quiet and self._ctx.toast:
-            self._ctx.toast("Listener saved")
+            self._ctx.toast("Listener job saved")
 
     def _copy_listener_line(self, *_a) -> None:
         line = self._listener.listener_line()
         self._clipboard_set(line)
-        self._log_msg(f"Copied listener: {line}")
+        self._log_msg(f"Copied job: {line}")
         if self._ctx.toast:
-            self._ctx.toast("Listener line copied")
+            self._ctx.toast("Job line copied")
 
     def _listeners_pull(self) -> None:
         if not self._plane.is_configured:
@@ -2325,9 +2559,39 @@ class HogwartsPage(Gtk.Box):
                 import zipfile
 
                 client = self._client()
-                minted = client.mint_enroll_secret(max_uses=1, ttl_sec=7200)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                label = f"export-{stamp}"
+                minted = client.mint_enroll_secret(
+                    max_uses=1, ttl_sec=7200, label=label
+                )
                 secret = str(minted.get("secret") or "")
+                package_id = str(minted.get("package_id") or "").strip()
+                enroll_id = str(minted.get("id") or "").strip()
+                canary_label = str(minted.get("canary_label") or "").strip().lower()
+                expires_at = str(minted.get("expires_at") or "")
+                created = str(minted.get("created") or "")
                 base = self._plane.base_url.rstrip("/")
+                # Optional DNS canary base from Ops kit (persisted in hogwarts.json)
+                try:
+                    canary_domain = self._ops.get_canary_domain()
+                except Exception:
+                    canary_domain = ""
+                if not canary_domain:
+                    try:
+                        canary_domain = str(
+                            (self._store.load() or {}).get("canary_domain") or ""
+                        ).strip()
+                    except Exception:
+                        canary_domain = ""
+                canary_domain = canary_domain.lstrip(".").rstrip(".").lower()
+                canary_url = (
+                    f"{base}/api/v1/canary/{canary_label}" if canary_label else ""
+                )
+                canary_fqdn = (
+                    f"{canary_label}.{canary_domain}"
+                    if canary_label and canary_domain
+                    else ""
+                )
                 # Locate agent.py next to plugin or repo
                 plugin_dir = Path(getattr(self._ctx, "plugin_dir", "") or ".")
                 # page.py lives at <root>/hogwarts/page.py → parents[1] is repo/plugin root
@@ -2339,20 +2603,69 @@ class HogwartsPage(Gtk.Box):
                 agent_src = next((p for p in candidates if p.is_file()), None)
                 if agent_src is None:
                     raise FileNotFoundError("agent/agent.py not found near plugin")
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                out_path = self._ctx.data_path(f"agent-export-{stamp}.zip")
+                out_path = self._ctx.data_path(
+                    f"agent-export-{package_id or stamp}.zip"
+                )
+                # Per-package identity (Sliver lesson: no shared lab password).
+                # enroll_secret is one-shot; package_id survives on the agent record.
+                # canary_label is public attribution (HTTP + optional DNS).
                 agent_json = {
                     "base_url": base,
                     # Optional failovers: "base_urls": ["https://edge1", "https://edge2"],
                     "enroll_secret": secret,
+                    "package_id": package_id,
+                    "export_id": enroll_id,
+                    "export_label": label,
+                    "export_expires_at": expires_at,
+                    "canary_label": canary_label,
+                    "canary_url": canary_url,
+                    "canary_fqdn": canary_fqdn,
                     "sleep": 5,
                     "jitter": 0.2,
                     "clear_enroll_secret": True,
                 }
+                manifest = {
+                    "kind": "hogwarts-agent-package",
+                    "version": 1,
+                    "package_id": package_id,
+                    "export_id": enroll_id,
+                    "label": label,
+                    "plane": base,
+                    "canary_label": canary_label,
+                    "canary_url": canary_url,
+                    "canary_fqdn": canary_fqdn or None,
+                    "max_uses": 1,
+                    "created": created,
+                    "expires_at": expires_at,
+                    "note": (
+                        "Unique package identity + canary. One enroll then secret is burned. "
+                        "Do not reuse zips across hosts; mint a new export per agent. "
+                        "First agent start fires the canary (HTTP; DNS if canary_fqdn set)."
+                    ),
+                }
                 readme = f"""Hogwarts lab agent package
 ==========================
-Plane: {base}
-Enroll secret is single-use (TTL ~2h). Do not commit this zip.
+Plane:     {base}
+Package:   {package_id or "(unknown)"}
+Export id: {enroll_id or "(unknown)"}
+Label:     {label}
+Expires:   {expires_at or "n/a"}
+Canary:    {canary_label or "(none)"}
+Canary URL:{canary_url or "(none)"}
+Canary DNS:{canary_fqdn or "(disabled — set Ops canary domain)"}
+
+Identity (Sliver-class lesson):
+  - This zip has a UNIQUE one-shot enroll secret and package_id.
+  - Do not share the same zip across machines — mint a new export per agent.
+  - After enroll, package_id is bound to the agent on the plane (audit/attribution).
+  - Enroll secret is cleared from agent.json after first successful enroll.
+
+Package canary (purple / stolen-export):
+  - On first start the agent GETs canary_url (plane event channel=canary).
+  - Optional DNS resolve of canary_fqdn if you operate that zone (sinkhole + logs).
+  - canary_label is public identity, not a secret — do not treat it as enroll.
+
+Do not commit this zip.
 
 Stability (built into agent.py loop):
   - Never exits on network errors; exponential backoff (2s→120s) + jitter
@@ -2369,10 +2682,16 @@ Windows (Python 3.10+ on PATH):
   py agent.py loop -c agent.json
   watchdog-windows.bat
 
-Optional one-file binary (build host needs PyInstaller):
+Optional one-file binary (PyInstaller on *same* OS — no Linux→PE cross):
   pip install pyinstaller
   pyinstaller --onefile --name hogwarts-agent agent.py
-  # then: hogwarts-agent loop -c agent.json
+  # Windows: pwsh -File agent/windows/build-windows.ps1 (repo)
+  # CI: GitHub Actions workflow windows-agent.yml
+
+Keepstream 60fps (Session): install ffmpeg on PATH
+  Windows: winget install Gyan.FFmpeg   → gdigrab MJPEG
+  Linux:   apt install ffmpeg           → x11grab MJPEG
+  Without ffmpeg the agent uses slow PIL fallback.
 
 Hogwarts Plane panel: URL={base}  token=<operator token>
 """
@@ -2402,10 +2721,12 @@ Hogwarts Plane panel: URL={base}  token=<operator token>
                 )
                 build_win = (
                     "@echo off\r\n"
-                    "REM Build hogwarts-agent.exe (requires pip install pyinstaller)\r\n"
+                    "REM Build hogwarts-agent.exe (PyInstaller — run on Windows, not Linux)\r\n"
+                    "REM Prefer: pwsh -File agent\\windows\\build-windows.ps1 from full repo\r\n"
                     "py -m pip install pyinstaller\r\n"
                     "py -m PyInstaller --onefile --name hogwarts-agent agent.py\r\n"
                     "echo Built dist\\hogwarts-agent.exe\r\n"
+                    "echo Keepstream 60fps needs ffmpeg on PATH (winget install Gyan.FFmpeg)\r\n"
                 )
                 build_sh = (
                     "#!/bin/sh\n"
@@ -2417,6 +2738,9 @@ Hogwarts Plane panel: URL={base}  token=<operator token>
                 with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
                     zf.write(agent_src, arcname="agent.py")
                     zf.writestr("agent.json", json.dumps(agent_json, indent=2) + "\n")
+                    zf.writestr(
+                        "MANIFEST.json", json.dumps(manifest, indent=2) + "\n"
+                    )
                     zf.writestr("README.txt", readme)
                     zf.writestr("run-linux.sh", run_sh)
                     zf.writestr("run-windows.bat", run_bat)
@@ -2464,6 +2788,33 @@ Hogwarts Plane panel: URL={base}  token=<operator token>
                     out_path.chmod(0o600)
                 except OSError:
                     pass
+                # Local ledger (no enroll secret — id + path + canary only)
+                try:
+                    meta = self._store.load()
+                    # Persist canary domain for next export / restart
+                    if canary_domain:
+                        meta["canary_domain"] = canary_domain
+                    ledger = list(meta.get("agent_exports") or [])
+                    ledger.insert(
+                        0,
+                        {
+                            "package_id": package_id,
+                            "export_id": enroll_id,
+                            "label": label,
+                            "plane": base,
+                            "canary_label": canary_label,
+                            "canary_url": canary_url,
+                            "canary_fqdn": canary_fqdn,
+                            "path": str(out_path),
+                            "created": created or stamp,
+                            "expires_at": expires_at,
+                            "max_uses": 1,
+                        },
+                    )
+                    meta["agent_exports"] = ledger[:40]
+                    self._store.save(meta)
+                except Exception:
+                    pass
                 _ = shutil  # keep import used on some paths
             except Exception as exc:
                 err = str(exc)
@@ -2473,16 +2824,33 @@ Hogwarts Plane panel: URL={base}  token=<operator token>
                     self._ops.set_export_status(f"Export failed: {err}", ok=False)
                     self._log_msg(f"Agent export fail: {err}")
                 else:
-                    self._ops.set_export_status(str(out_path), ok=True)
-                    self._log_msg(f"Agent export → {out_path.name if out_path else '?'}")
+                    pkg = ""
+                    try:
+                        # recover package_id from path name if needed
+                        if out_path is not None:
+                            meta = self._store.load()
+                            le = (meta.get("agent_exports") or [{}])[0]
+                            pkg = str(le.get("package_id") or "")
+                    except Exception:
+                        pkg = ""
+                    status = str(out_path)
+                    if pkg:
+                        status = f"{pkg} · one-shot · {out_path.name if out_path else ''}"
+                    self._ops.set_export_status(status, ok=True)
+                    self._ops.refresh_export_ledger(self._store.load())
+                    self._log_msg(
+                        f"Agent export package={pkg or '?'} → "
+                        f"{out_path.name if out_path else '?'}"
+                    )
                     if self._ctx.toast:
-                        self._ctx.toast(f"Agent zip → {out_path.name if out_path else ''}")
+                        name = out_path.name if out_path else ""
+                        self._ctx.toast(f"Agent package {pkg or name}")
                 return False
 
             GLib.idle_add(done)
 
         threading.Thread(target=work, name="hogwarts-agent-zip", daemon=True).start()
-        self._ops.set_export_status("Building agent zip…")
+        self._ops.set_export_status("Minting unique package + building zip…")
 
     def _probe_listener(self, snap: dict[str, Any]) -> None:
         host = str(snap.get("accept_host") or "").strip()
@@ -2550,44 +2918,54 @@ Hogwarts Plane panel: URL={base}  token=<operator token>
 
         def work() -> None:
             rows: list[dict[str, Any]] = []
-            for host, port, label in targets:
-                d_ok, d_ms, d_err = tcp_probe(host, port, timeout=3.0)
-                row: dict[str, Any] = {
-                    "label": label,
-                    "host": host,
-                    "port": port,
-                    "direct_ok": d_ok,
-                    "direct_ms": round(d_ms, 1),
-                    "direct_err": d_err,
-                }
-                if socks:
-                    s_ok, s_ms, s_err = socks_tcp_probe(
-                        socks[0], socks[1], host, port, timeout=8.0
-                    )
-                    row["path_ok"] = s_ok
-                    row["path_ms"] = round(s_ms, 1)
-                    row["path_err"] = s_err
-                rows.append(row)
-
+            err: str | None = None
             ts = datetime.now(timezone.utc).isoformat()
             try:
-                meta = self._store.load()
-                meta["last_probe_rows"] = rows
-                meta["last_probe_ts"] = ts
-                meta["last_probe_socks"] = (
-                    f"{socks[0]}:{socks[1]}" if socks else None
-                )
-                self._store.save(meta)
-            except Exception:
-                pass
+                for host, port, label in targets:
+                    d_ok, d_ms, d_err = tcp_probe(host, port, timeout=3.0)
+                    row: dict[str, Any] = {
+                        "label": label,
+                        "host": host,
+                        "port": port,
+                        "direct_ok": d_ok,
+                        "direct_ms": round(d_ms, 1),
+                        "direct_err": d_err,
+                    }
+                    if socks:
+                        s_ok, s_ms, s_err = socks_tcp_probe(
+                            socks[0], socks[1], host, port, timeout=8.0
+                        )
+                        row["path_ok"] = s_ok
+                        row["path_ms"] = round(s_ms, 1)
+                        row["path_err"] = s_err
+                    rows.append(row)
+
+                ts = datetime.now(timezone.utc).isoformat()
+                try:
+                    meta = self._store.load()
+                    meta["last_probe_rows"] = rows
+                    meta["last_probe_ts"] = ts
+                    meta["last_probe_socks"] = (
+                        f"{socks[0]}:{socks[1]}" if socks else None
+                    )
+                    self._store.save(meta)
+                except Exception:
+                    pass
+            except Exception as exc:
+                err = str(exc)
 
             def done() -> bool:
                 self._probe_busy = False
                 self._egress.set_busy(False)
-                self._egress.render_rows(rows, ts=ts)
-                self._log_msg(f"Egress matrix complete ({len(rows)} targets)")
-                if self._ctx.toast:
-                    self._ctx.toast("Egress matrix complete")
+                if err:
+                    self._log_msg(f"Egress matrix failed: {err}")
+                    if self._ctx.toast:
+                        self._ctx.toast("Egress probe failed")
+                else:
+                    self._egress.render_rows(rows, ts=ts)
+                    self._log_msg(f"Egress matrix complete ({len(rows)} targets)")
+                    if self._ctx.toast:
+                        self._ctx.toast("Egress matrix complete")
                 return False
 
             GLib.idle_add(done)
@@ -2613,41 +2991,50 @@ Hogwarts Plane panel: URL={base}  token=<operator token>
         socks = self._socks_tuple()
 
         def work() -> None:
-            d_ok, d_ms, d_err = tcp_probe(host, port, timeout=4.0)
-            row: dict[str, Any] = {
-                "label": "Custom",
-                "host": host,
-                "port": port,
-                "direct_ok": d_ok,
-                "direct_ms": round(d_ms, 1),
-                "direct_err": d_err,
-            }
-            if socks:
-                s_ok, s_ms, s_err = socks_tcp_probe(
-                    socks[0], socks[1], host, port, timeout=10.0
-                )
-                row["path_ok"] = s_ok
-                row["path_ms"] = round(s_ms, 1)
-                row["path_err"] = s_err
-            rows = [row]
-            meta = self._store.load()
-            prev = meta.get("last_probe_rows")
-            if isinstance(prev, list):
-                rows = [row] + [
-                    r
-                    for r in prev
-                    if not (r.get("host") == host and r.get("port") == port)
-                ][:12]
+            rows: list[dict[str, Any]] = []
             ts = datetime.now(timezone.utc).isoformat()
-            meta["last_probe_rows"] = rows
-            meta["last_probe_ts"] = ts
-            self._store.save(meta)
+            err: str | None = None
+            try:
+                d_ok, d_ms, d_err = tcp_probe(host, port, timeout=4.0)
+                row: dict[str, Any] = {
+                    "label": "Custom",
+                    "host": host,
+                    "port": port,
+                    "direct_ok": d_ok,
+                    "direct_ms": round(d_ms, 1),
+                    "direct_err": d_err,
+                }
+                if socks:
+                    s_ok, s_ms, s_err = socks_tcp_probe(
+                        socks[0], socks[1], host, port, timeout=10.0
+                    )
+                    row["path_ok"] = s_ok
+                    row["path_ms"] = round(s_ms, 1)
+                    row["path_err"] = s_err
+                rows = [row]
+                meta = self._store.load()
+                prev = meta.get("last_probe_rows")
+                if isinstance(prev, list):
+                    rows = [row] + [
+                        r
+                        for r in prev
+                        if not (r.get("host") == host and r.get("port") == port)
+                    ][:12]
+                ts = datetime.now(timezone.utc).isoformat()
+                meta["last_probe_rows"] = rows
+                meta["last_probe_ts"] = ts
+                self._store.save(meta)
+            except Exception as exc:
+                err = str(exc)
 
             def done() -> bool:
                 self._probe_busy = False
                 self._egress.set_busy(False)
-                self._egress.render_rows(rows, ts=ts)
-                self._log_msg(f"Custom probe {host}:{port}")
+                if err:
+                    self._log_msg(f"Custom probe failed: {err}")
+                else:
+                    self._egress.render_rows(rows, ts=ts)
+                    self._log_msg(f"Custom probe {host}:{port}")
                 return False
 
             GLib.idle_add(done)
@@ -2713,6 +3100,14 @@ Hogwarts Plane panel: URL={base}  token=<operator token>
             self._ctx.navigate("marketplace")
 
     def _save_playbook_fields(self) -> None:
+        # Also persist Ops canary domain with playbook save
+        try:
+            domain = self._ops.get_canary_domain()
+            data = self._store.load()
+            data["canary_domain"] = domain
+            self._store.save(data)
+        except Exception:
+            pass
         fields = self._ops.snapshot_playbook()
         # Never persist anything that looks like a bearer token
         for k, v in list(fields.items()):
@@ -2965,8 +3360,25 @@ Hogwarts Plane panel: URL={base}  token=<operator token>
         return f"queued {type_} task_id={tid} agent={agent.hostname or agent.id}"
 
     def _log_msg(self, msg: str) -> None:
-        ts = datetime.now().strftime("%H:%M:%S")
-        self._log_lines.append(f"[{ts}] {msg}")
+        msg = (msg or "").strip()
+        if not msg:
+            return
+        # Collapse identical consecutive messages (refresh spam)
+        last = self._log_lines[-1] if self._log_lines else ""
+        if last.endswith(msg) or (last and last.split("] ", 1)[-1] == msg):
+            # Bump a simple ×N suffix on the last line
+            if " ·  ×" in last:
+                try:
+                    base, n_s = last.rsplit(" ·  ×", 1)
+                    n = int(n_s) + 1
+                    self._log_lines[-1] = f"{base} ·  ×{n}"
+                except ValueError:
+                    self._log_lines[-1] = f"{last} ·  ×2"
+            else:
+                self._log_lines[-1] = f"{last} ·  ×2"
+        else:
+            ts = datetime.now().strftime("%H:%M:%S")
+            self._log_lines.append(f"[{ts}] {msg}")
         self._log_lines = self._log_lines[-200:]
         # Only push into the Log panel when it is visible — set_text every
         # screenshot/poll on a 200-line buffer was pure UI work for no reason.

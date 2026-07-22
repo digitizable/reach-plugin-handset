@@ -19,7 +19,8 @@ from hogwarts.panels.desktop_viewer import RemoteDesktopViewer
 from hogwarts.panels.file_explorer import RemoteFileExplorer
 from hogwarts.widgets import scroll_panel, section_label
 
-_STATUS_FILTERS = ["All", "online", "idle", "offline"]
+# "Live" = online + idle (plane thrash between them must not empty the fleet)
+_STATUS_FILTERS = ["All", "live", "offline"]
 
 # (id, label) — ids match agent _resolve_shell_argv
 _SHELLS: list[tuple[str, str]] = [
@@ -90,6 +91,28 @@ def fleet_status_key(status: str | None) -> str:
     if st == "offline":
         return "offline"
     return st or "unknown"
+
+
+def presence_mode_key(agent: AgentDTO | None) -> str:
+    """Beacon-class async vs session-class interactive (Sliver/Havoc lesson)."""
+    if agent is None:
+        return "async"
+    if fleet_status_key(agent.status) == "offline":
+        return "async"
+    p = (agent.presence or "").lower().strip()
+    if p in ("async", "interactive"):
+        return p
+    # Fallback from sleep turbo band
+    try:
+        if agent.sleep is not None and float(agent.sleep) <= 0.4:
+            return "interactive"
+    except (TypeError, ValueError):
+        pass
+    return "async"
+
+
+def presence_label(mode: str) -> str:
+    return "INTER" if mode == "interactive" else "ASYNC"
 
 
 class AgentsPanel(Gtk.Box):
@@ -164,6 +187,9 @@ class AgentsPanel(Gtk.Box):
         self._agents_fp: tuple[Any, ...] | None = None
         self._fleet_paint_fp: tuple[Any, ...] | None = None
         self._tasks_fp: tuple[Any, ...] | None = None
+        self._task_rows: dict[str, dict[str, Any]] = {}
+        # Generation token so stale async refresh results never rebuild fleet
+        self._fleet_gen: int = 0
 
         # ── Sub-pages: full fleet list  ↔  full agent detail (tabs) ──
         # Stable button fleet (no ListBox thrash) + stack navigation for roomy UX.
@@ -182,10 +208,9 @@ class AgentsPanel(Gtk.Box):
 
         intro = Gtk.Label(
             label=(
-                "Click an agent for its detail page. "
-                "Tabs: Tasking · Files · Desktop · Tasks. "
-                "File Explorer and Remote Viewer open as separate windows. "
-                "Screenshot / Live / Control only work inside Remote Viewer. "
+                "Click an agent for the detail desk. "
+                "Tasking shows shell + last result inline. "
+                "Files / Desktop tabs open their work windows. "
                 "Use ← Fleet to return."
             ),
             wrap=True,
@@ -235,8 +260,14 @@ class AgentsPanel(Gtk.Box):
         # ── Detail page (full width, tabbed) ───────────────────────────
         detail_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         detail_page.add_css_class("hogwarts-panel")
+        detail_page.add_css_class("hogwarts-agents-detail")
         detail_page.set_hexpand(True)
         detail_page.set_vexpand(True)
+        try:
+            detail_page.set_can_focus(False)
+            detail_page.set_focusable(False)
+        except Exception:
+            pass
         self._detail_page = detail_page
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -258,16 +289,73 @@ class AgentsPanel(Gtk.Box):
         head_col.set_hexpand(True)
         self.detail_host = Gtk.Label(label="Agent", xalign=0)
         self.detail_host.add_css_class("hogwarts-agent-host")
+        try:
+            self.detail_host.set_can_focus(False)
+        except Exception:
+            pass
         head_col.append(self.detail_host)
-        self.detail_sub = Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
+        # Not selectable: focus+select-all on open painted the whole header blue
+        self.detail_sub = Gtk.Label(label="", xalign=0, wrap=True, selectable=False)
         self.detail_sub.add_css_class("hogwarts-agent-meta")
+        try:
+            self.detail_sub.set_can_focus(False)
+        except Exception:
+            pass
         head_col.append(self.detail_sub)
         header.append(head_col)
 
         self.detail_status_chip = Gtk.Label(label="")
         self.detail_status_chip.add_css_class("hogwarts-chip")
         self.detail_status_chip.set_valign(Gtk.Align.CENTER)
+        try:
+            self.detail_status_chip.set_can_focus(False)
+        except Exception:
+            pass
         header.append(self.detail_status_chip)
+
+        self.detail_presence_chip = Gtk.Label(label="")
+        self.detail_presence_chip.add_css_class("hogwarts-chip")
+        self.detail_presence_chip.add_css_class("hogwarts-presence")
+        self.detail_presence_chip.set_valign(Gtk.Align.CENTER)
+        self.detail_presence_chip.set_tooltip_text(
+            "ASYNC = beacon-class check-in · INTER = interactive/turbo"
+        )
+        try:
+            self.detail_presence_chip.set_can_focus(False)
+        except Exception:
+            pass
+        header.append(self.detail_presence_chip)
+
+        # Quick actions — always one click to Files / Desktop / Tasks (Havoc density)
+        quick = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+        quick.add_css_class("hogwarts-quick-actions")
+        self.btn_quick_files = Gtk.Button(label="Files")
+        self.btn_quick_files.add_css_class("flat")
+        self.btn_quick_files.add_css_class("hogwarts-quick-btn")
+        self.btn_quick_files.set_tooltip_text("Open Files tab + File Explorer window")
+        self.btn_quick_files.connect(
+            "clicked", lambda *_: self._goto_work_surface("files")
+        )
+        quick.append(self.btn_quick_files)
+        self.btn_quick_desktop = Gtk.Button(label="Desktop")
+        self.btn_quick_desktop.add_css_class("flat")
+        self.btn_quick_desktop.add_css_class("hogwarts-quick-btn")
+        self.btn_quick_desktop.set_tooltip_text(
+            "Open Desktop tab + Remote Viewer window"
+        )
+        self.btn_quick_desktop.connect(
+            "clicked", lambda *_: self._goto_work_surface("desktop")
+        )
+        quick.append(self.btn_quick_desktop)
+        self.btn_quick_tasks = Gtk.Button(label="Tasks")
+        self.btn_quick_tasks.add_css_class("flat")
+        self.btn_quick_tasks.add_css_class("hogwarts-quick-btn")
+        self.btn_quick_tasks.set_tooltip_text("Open Tasks queue + last result")
+        self.btn_quick_tasks.connect(
+            "clicked", lambda *_: self._goto_work_surface("tasks")
+        )
+        quick.append(self.btn_quick_tasks)
+        header.append(quick)
 
         self.btn_refresh_detail = Gtk.Button(label="Refresh")
         self.btn_refresh_detail.add_css_class("flat")
@@ -276,27 +364,33 @@ class AgentsPanel(Gtk.Box):
         header.append(self.btn_refresh_detail)
         detail_page.append(header)
 
-        # Identity card (compact facts)
-        id_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        id_card.add_css_class("hogwarts-card")
-        id_card.set_margin_bottom(10)
-        id_title = Gtk.Label(label="Agent", xalign=0)
-        id_title.add_css_class("hogwarts-card-title")
-        id_card.append(id_title)
-        self.detail_body = Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
+        # Identity facts — collapsed by default so tabs own the vertical space
+        self.detail_body = Gtk.Label(label="", xalign=0, wrap=True, selectable=False)
         self.detail_body.add_css_class("hogwarts-agent-meta")
-        id_card.append(self.detail_body)
-        detail_page.append(id_card)
+        try:
+            self.detail_body.set_can_focus(False)
+        except Exception:
+            pass
+        self._facts_expander = Gtk.Expander(label="Agent facts")
+        self._facts_expander.add_css_class("hogwarts-facts-expander")
+        self._facts_expander.set_expanded(False)
+        self._facts_expander.set_margin_bottom(6)
+        self._facts_expander.set_child(self.detail_body)
+        detail_page.append(self._facts_expander)
 
         self.task_status = Gtk.Label(label="", xalign=0, wrap=True)
         self.task_status.add_css_class("hogwarts-muted")
-        self.task_status.set_margin_bottom(8)
+        self.task_status.set_margin_bottom(6)
+        try:
+            self.task_status.set_can_focus(False)
+        except Exception:
+            pass
         detail_page.append(self.task_status)
 
         # Tab bar
         tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         tabs.add_css_class("hogwarts-tab-bar")
-        tabs.set_margin_bottom(12)
+        tabs.set_margin_bottom(8)
         self._tab_group: Gtk.ToggleButton | None = None
         for key, label in (
             ("tasking", "Tasking"),
@@ -322,11 +416,12 @@ class AgentsPanel(Gtk.Box):
         self._detail_stack.set_hexpand(True)
         self._detail_stack.set_vexpand(True)
 
-        # —— Tab: Tasking ——
-        tab_task = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        # —— Tab: Tasking (dense: actions + shell row + inline last result) ——
+        tab_task = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         tab_task.set_hexpand(True)
         tab_task.set_vexpand(True)
-        act = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        act = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        act.add_css_class("hogwarts-action-strip")
         self.btn_ping = Gtk.Button(label="Ping")
         self.btn_ping.add_css_class("flat")
         self.btn_ping.connect("clicked", lambda *_: self._queue("ping", {}))
@@ -340,80 +435,108 @@ class AgentsPanel(Gtk.Box):
         self.btn_rekey.set_tooltip_text("Rotate agent_token on next check-in")
         self.btn_rekey.connect("clicked", lambda *_: self._queue("rekey", {}))
         act.append(self.btn_rekey)
-        self.btn_socks_on = Gtk.Button(label="SOCKS start")
+        self.btn_socks_on = Gtk.Button(label="SOCKS ·")
         self.btn_socks_on.add_css_class("flat")
+        self.btn_socks_on.set_tooltip_text("Start SOCKS on agent (ephemeral port)")
         self.btn_socks_on.connect(
             "clicked", lambda *_: self._queue("socks_start", {"port": 0})
         )
         act.append(self.btn_socks_on)
-        self.btn_socks_off = Gtk.Button(label="SOCKS stop")
+        self.btn_socks_off = Gtk.Button(label="SOCKS ×")
         self.btn_socks_off.add_css_class("flat")
+        self.btn_socks_off.set_tooltip_text("Stop SOCKS")
         self.btn_socks_off.connect(
             "clicked", lambda *_: self._queue("socks_stop", {})
         )
         act.append(self.btn_socks_off)
         tab_task.append(act)
 
-        shell_pick = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        # One row: shell picker + command + Run (operator keyboard path)
+        shell_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         shell_lab = Gtk.Label(label="Shell", xalign=0)
         shell_lab.add_css_class("hogwarts-field-label")
-        shell_pick.append(shell_lab)
+        shell_row.append(shell_lab)
         self.shell_dd = Gtk.DropDown.new_from_strings([lab for _, lab in _SHELLS])
         self.shell_dd.set_selected(0)
+        self.shell_dd.set_size_request(110, -1)
         self.shell_dd.set_tooltip_text(
-            "Interpreter for Run shell (auto = sh on Unix, cmd on Windows)"
+            "Interpreter (auto = sh on Unix, cmd on Windows)"
         )
-        shell_pick.append(self.shell_dd)
-        tab_task.append(shell_pick)
-
+        shell_row.append(self.shell_dd)
         self.shell_entry = Gtk.Entry()
-        self.shell_entry.set_placeholder_text("shell command… e.g. uname -a")
+        self.shell_entry.set_placeholder_text("command…  Enter to run")
         self.shell_entry.set_hexpand(True)
         self.shell_entry.connect("activate", lambda *_: self._queue_shell())
-        tab_task.append(self.shell_entry)
-        shell_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        self.btn_shell = Gtk.Button(label="Run shell")
+        shell_row.append(self.shell_entry)
+        self.btn_shell = Gtk.Button(label="Run")
         self.btn_shell.add_css_class("suggested-action")
         self.btn_shell.connect("clicked", lambda *_: self._queue_shell())
         shell_row.append(self.btn_shell)
-        self.btn_tasks = Gtk.Button(label="Open Tasks tab")
+        self.btn_tasks = Gtk.Button(label="Queue…")
         self.btn_tasks.add_css_class("flat")
+        self.btn_tasks.set_tooltip_text("Open full Tasks queue")
         self.btn_tasks.connect("clicked", lambda *_: self._select_tab("tasks"))
         shell_row.append(self.btn_tasks)
         tab_task.append(shell_row)
-        tip = Gtk.Label(
-            label="Results appear under the Tasks tab after the agent checks in.",
-            xalign=0,
-            wrap=True,
+
+        # Inline last result — stay on Tasking while work returns (Havoc energy)
+        res_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        res_lab = section_label("Last result")
+        res_lab.set_hexpand(True)
+        res_head.append(res_lab)
+        self.tasking_result_meta = Gtk.Label(label="", xalign=1)
+        self.tasking_result_meta.add_css_class("hogwarts-muted")
+        self.tasking_result_meta.add_css_class("hogwarts-agent-meta")
+        res_head.append(self.tasking_result_meta)
+        tab_task.append(res_head)
+
+        self.tasking_result_view = Gtk.TextView()
+        self.tasking_result_view.set_editable(False)
+        self.tasking_result_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.tasking_result_view.set_monospace(True)
+        self.tasking_result_view.set_vexpand(True)
+        self.tasking_result_view.set_hexpand(True)
+        self.tasking_result_view.get_buffer().set_text(
+            "Shell, ping, and file results land here after the agent checks in.\n"
+            "Full queue is under the Tasks tab."
         )
-        tip.add_css_class("hogwarts-muted")
-        tab_task.append(tip)
+        tasking_res_scroll = Gtk.ScrolledWindow()
+        tasking_res_scroll.set_policy(
+            Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC
+        )
+        tasking_res_scroll.set_vexpand(True)
+        tasking_res_scroll.set_hexpand(True)
+        tasking_res_scroll.set_min_content_height(160)
+        tasking_res_scroll.set_child(self.tasking_result_view)
+        tasking_res_scroll.add_css_class("hogwarts-remote-scroll")
+        tab_task.append(tasking_res_scroll)
         self._detail_stack.add_named(tab_task, "tasking")
 
-        # —— Tab: Files (launcher only — File Explorer window is the browser) ——
-        tab_files = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        # —— Tab: Files (auto-opens File Explorer; panel is status + re-open) ——
+        tab_files = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         tab_files.set_hexpand(True)
         tab_files.set_vexpand(True)
 
-        files_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        files_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         files_card.add_css_class("hogwarts-card")
         files_card.add_css_class("hogwarts-launch-card")
         files_card.set_hexpand(True)
+        files_card.set_vexpand(True)
 
-        files_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        files_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         files_icon = Gtk.Image.new_from_icon_name("folder-open")
-        files_icon.set_pixel_size(36)
+        files_icon.set_pixel_size(28)
         files_icon.set_valign(Gtk.Align.START)
         files_head.append(files_icon)
-        files_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        files_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         files_text.set_hexpand(True)
         files_title = Gtk.Label(label="File Explorer", xalign=0)
         files_title.add_css_class("hogwarts-launch-title")
         files_text.append(files_title)
         files_blurb = Gtk.Label(
             label=(
-                "Browse the agent’s filesystem in a dedicated Windows-style window: "
-                "Quick access, details columns, double-click folders, download / push."
+                "Work window: browse, download, push, index search. "
+                "Selecting this tab opens (or focuses) it."
             ),
             xalign=0,
             wrap=True,
@@ -424,7 +547,7 @@ class AgentsPanel(Gtk.Box):
         files_card.append(files_head)
 
         self.remote_status = Gtk.Label(
-            label="No folder listed yet — open File Explorer to start.",
+            label="Window closed — select this tab or Open to launch.",
             xalign=0,
             wrap=True,
         )
@@ -436,55 +559,52 @@ class AgentsPanel(Gtk.Box):
         files_card.append(self.files_path_lab)
 
         files_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.btn_explorer = Gtk.Button(label="Open File Explorer")
+        self.btn_explorer = Gtk.Button(label="Open / focus")
         self.btn_explorer.add_css_class("suggested-action")
-        self.btn_explorer.set_tooltip_text("Open the remote File Explorer window")
+        self.btn_explorer.set_tooltip_text("Open or focus the File Explorer window")
         self.btn_explorer.connect("clicked", lambda *_: self._open_file_explorer())
         files_actions.append(self.btn_explorer)
-        self.btn_explorer_focus = Gtk.Button(label="Focus window")
+        self.btn_explorer_focus = Gtk.Button(label="Re-list path")
         self.btn_explorer_focus.add_css_class("flat")
-        self.btn_explorer_focus.set_tooltip_text("Bring an open File Explorer to the front")
-        self.btn_explorer_focus.connect("clicked", lambda *_: self._open_file_explorer())
+        self.btn_explorer_focus.set_tooltip_text(
+            "Queue fs_list for the current remote path"
+        )
+        self.btn_explorer_focus.connect(
+            "clicked",
+            lambda *_: self._browse_remote(
+                path=self._remote_path or self._default_remote_path()
+            ),
+        )
         files_actions.append(self.btn_explorer_focus)
         files_card.append(files_actions)
         tab_files.append(files_card)
-
-        files_tip = Gtk.Label(
-            label=(
-                "Tip: listings and transfers run as plane tasks — wait for the agent "
-                "check-in. Last path is remembered per agent."
-            ),
-            xalign=0,
-            wrap=True,
-        )
-        files_tip.add_css_class("hogwarts-muted")
-        tab_files.append(files_tip)
         self._detail_stack.add_named(tab_files, "files")
 
-        # —— Tab: Desktop (launcher only — Remote Viewer window) ——
-        tab_desk = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        # —— Tab: Desktop (auto-opens Remote Viewer) ——
+        tab_desk = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         tab_desk.set_hexpand(True)
         tab_desk.set_vexpand(True)
 
-        desk_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        desk_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         desk_card.add_css_class("hogwarts-card")
         desk_card.add_css_class("hogwarts-launch-card")
         desk_card.set_hexpand(True)
+        desk_card.set_vexpand(True)
 
-        desk_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        desk_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         desk_icon = Gtk.Image.new_from_icon_name("video-display")
-        desk_icon.set_pixel_size(36)
+        desk_icon.set_pixel_size(28)
         desk_icon.set_valign(Gtk.Align.START)
         desk_head.append(desk_icon)
-        desk_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        desk_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         desk_text.set_hexpand(True)
         desk_title = Gtk.Label(label="Remote Viewer", xalign=0)
         desk_title.add_css_class("hogwarts-launch-title")
         desk_text.append(desk_title)
         desk_blurb = Gtk.Label(
             label=(
-                "Open the Remote Viewer window for capture, Live, Control, and Session. "
-                "Those actions are not available on this page."
+                "Capture · Live · Control · Session live in the work window. "
+                "Selecting this tab opens (or focuses) it."
             ),
             xalign=0,
             wrap=True,
@@ -495,7 +615,7 @@ class AgentsPanel(Gtk.Box):
         desk_card.append(desk_head)
 
         self.desktop_status = Gtk.Label(
-            label="Remote Viewer closed — open it to capture or control.",
+            label="Window closed — select this tab or Open to launch.",
             xalign=0,
             wrap=True,
         )
@@ -503,28 +623,26 @@ class AgentsPanel(Gtk.Box):
         desk_card.append(self.desktop_status)
 
         desk_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.btn_desktop_win = Gtk.Button(label="Open Remote Viewer")
+        self.btn_desktop_win = Gtk.Button(label="Open / focus")
         self.btn_desktop_win.add_css_class("suggested-action")
         self.btn_desktop_win.set_tooltip_text(
-            "Open the Remote Viewer window (required for screenshot / Live / Control)"
+            "Open or focus Remote Viewer (screenshot / Live / Control)"
         )
         self.btn_desktop_win.connect(
             "clicked", lambda *_: self._open_desktop_viewer(auto_shot=False)
         )
         desk_actions.append(self.btn_desktop_win)
+        self.btn_desktop_shot = Gtk.Button(label="Open + Capture")
+        self.btn_desktop_shot.add_css_class("flat")
+        self.btn_desktop_shot.set_tooltip_text(
+            "Open Remote Viewer and queue a screenshot"
+        )
+        self.btn_desktop_shot.connect(
+            "clicked", lambda *_: self._open_desktop_viewer(auto_shot=True)
+        )
+        desk_actions.append(self.btn_desktop_shot)
         desk_card.append(desk_actions)
         tab_desk.append(desk_card)
-
-        desk_tip = Gtk.Label(
-            label=(
-                "In Remote Viewer: Capture · Live · View/Control/Session ladder. "
-                "Archives save under ~/Pictures/Hogwarts/<agent>/."
-            ),
-            xalign=0,
-            wrap=True,
-        )
-        desk_tip.add_css_class("hogwarts-muted")
-        tab_desk.append(desk_tip)
         self._detail_stack.add_named(tab_desk, "desktop")
 
         # —— Tab: Tasks + result ——
@@ -586,6 +704,7 @@ class AgentsPanel(Gtk.Box):
         self.show_empty("Configure the control plane under Plane, then Refresh.")
 
     def filter_status(self) -> str | None:
+        """Plane status filter. ``live`` matches online|idle on the plane."""
         i = int(self.status_filter.get_selected())
         if i <= 0:
             return None
@@ -598,7 +717,22 @@ class AgentsPanel(Gtk.Box):
         return self._selected.id if self._selected else None
 
     def show_error(self, msg: str) -> None:
-        self.status_lab.set_text(msg)
+        """Surface plane error without wiping a healthy roster.
+
+        Spam-refresh used to clear the fleet on the last failure → no hover
+        targets until a successful paint. Keep rows if we already have agents.
+        """
+        short = (msg or "Error").strip()
+        if len(short) > 220:
+            short = short[:217] + "…"
+        self.status_lab.set_text(short)
+        self.status_lab.remove_css_class("hogwarts-ok")
+        self.status_lab.add_css_class("hogwarts-fail")
+        if self._fleet_rows:
+            # Keep buttons / hover targets; only banner changes
+            return
+        self._agents_fp = None
+        self._fleet_paint_fp = None
         self._clear_list()
         self.list_box.append(self._placeholder_label(msg, fail=True))
         self._show_fleet()
@@ -646,6 +780,7 @@ class AgentsPanel(Gtk.Box):
                 (
                     a.id,
                     fleet_status_key(a.status),
+                    presence_mode_key(a),
                     age,
                     a.hostname or "",
                     a.username or "",
@@ -667,25 +802,37 @@ class AgentsPanel(Gtk.Box):
             self.show_empty(note or "No agents reported by the control plane.")
             return
         counts: dict[str, int] = {}
+        presence_counts = {"async": 0, "interactive": 0}
         for a in agents:
             # Count with collapsed live status so header does not flicker online/idle
             key = fleet_status_key(a.status)
             counts[key] = counts.get(key, 0) + 1
+            if key == "online":
+                pm = presence_mode_key(a)
+                presence_counts[pm] = presence_counts.get(pm, 0) + 1
         parts = [f"{len(agents)} agent" + ("s" if len(agents) != 1 else "")]
         for st in ("online", "offline"):
             if st in counts:
                 label = "live" if st == "online" else st
                 parts.append(f"{counts[st]} {label}")
+        if presence_counts.get("interactive"):
+            parts.append(f"{presence_counts['interactive']} inter")
+        if presence_counts.get("async") and counts.get("online"):
+            parts.append(f"{presence_counts['async']} async")
         if counts.get("unknown"):
             parts.append(f"{counts['unknown']} other")
         status_txt = " · ".join(parts) + (f" — {note}" if note else "")
         if self.status_lab.get_text() != status_txt:
             self.status_lab.set_text(status_txt)
+        self.status_lab.remove_css_class("hogwarts-fail")
 
         membership = self._fleet_membership(agents)
         paint_fp = self._fleet_paint_key(agents)
-        # Soft path: same agents present — patch labels only, never rebuild/reorder
-        if membership == self._agents_fp and self._fleet_rows:
+        # Soft path only when row map is intact and matches membership
+        rows_ok = bool(self._fleet_rows) and set(self._fleet_rows.keys()) == set(
+            membership
+        )
+        if membership == self._agents_fp and rows_ok:
             by_id = {a.id: a for a in agents}
             # Skip all GTK label/CSS writes when nothing user-visible changed
             if paint_fp != self._fleet_paint_fp:
@@ -710,7 +857,7 @@ class AgentsPanel(Gtk.Box):
                     self._show_fleet()
             return
 
-        # Hard rebuild only when agents join/leave
+        # Hard rebuild when agents join/leave OR row map was wiped/desynced
         self._agents_fp = membership
         self._fleet_paint_fp = paint_fp
         keep_id = self._selected.id if self._selected else None
@@ -718,6 +865,8 @@ class AgentsPanel(Gtk.Box):
         self._clear_list()
         for agent in agents:
             self.list_box.append(self._row(agent))
+        # Pointer may still sit on a row after rebuild — re-assert motion hover
+        self._sync_fleet_pointer_hover()
         if keep_id:
             match = next((a for a in agents if a.id == keep_id), None)
             if match:
@@ -740,6 +889,7 @@ class AgentsPanel(Gtk.Box):
         key = (
             agent.id,
             fleet_status_key(agent.status),
+            presence_mode_key(agent),
             age,
             agent.hostname,
             agent.username,
@@ -764,6 +914,7 @@ class AgentsPanel(Gtk.Box):
                 continue
             widgets["agent"] = fresh
             status = fleet_status_key(fresh.status)
+            mode = presence_mode_key(fresh)
             st_lab: Gtk.Label = widgets["status"]
             want_st = "LIVE" if status == "online" else status.upper()
             if st_lab.get_text() != want_st:
@@ -777,6 +928,25 @@ class AgentsPanel(Gtk.Box):
                     st_lab.remove_css_class(c)
                 paint = status if status in ("online", "offline") else "unknown"
                 st_lab.add_css_class(f"hogwarts-status-{paint}")
+            # Presence chip (ASYNC / INTER) — only when live
+            mode_lab: Gtk.Label | None = widgets.get("presence")
+            if mode_lab is not None:
+                want_mode = presence_label(mode) if status == "online" else ""
+                if mode_lab.get_text() != want_mode:
+                    mode_lab.set_text(want_mode)
+                    mode_lab.set_visible(bool(want_mode))
+                    for c in (
+                        "hogwarts-presence-async",
+                        "hogwarts-presence-interactive",
+                    ):
+                        mode_lab.remove_css_class(c)
+                    if want_mode:
+                        mode_lab.add_css_class(
+                            "hogwarts-presence-interactive"
+                            if mode == "interactive"
+                            else "hogwarts-presence-async"
+                        )
+            # Busy dot when interactive
             host_lab: Gtk.Label = widgets["host"]
             want_host = fresh.hostname or fresh.id or "?"
             if host_lab.get_text() != want_host:
@@ -788,6 +958,7 @@ class AgentsPanel(Gtk.Box):
                 fresh.external_ip,
                 fresh.group,
                 f"seen {age}",
+                fresh.package_id or "",
                 fresh.id,
             ]
             want_meta = " · ".join(b for b in meta_bits if b) or fresh.id
@@ -795,12 +966,16 @@ class AgentsPanel(Gtk.Box):
             # Skip set_text when unchanged — critical for stable hover
             if meta_lab.get_text() != want_meta:
                 meta_lab.set_text(want_meta)
-            # Dot class only if collapsed status changed (online/idle share live)
+            # Dot class: interactive → busy (blue), else live/off
             dot: Gtk.Widget = widgets["dot"]
-            want_dot = {
-                "online": "hogwarts-dot-live",
-                "offline": "hogwarts-dot-off",
-            }.get(status, "hogwarts-dot-idle")
+            if status == "offline":
+                want_dot = "hogwarts-dot-off"
+            elif mode == "interactive":
+                want_dot = "hogwarts-dot-busy"
+            elif status == "online":
+                want_dot = "hogwarts-dot-live"
+            else:
+                want_dot = "hogwarts-dot-idle"
             cur = widgets.get("dot_class")
             if cur != want_dot:
                 for c in (
@@ -813,7 +988,8 @@ class AgentsPanel(Gtk.Box):
                 dot.add_css_class(want_dot)
                 widgets["dot_class"] = want_dot
             btn: Gtk.Button = widgets["btn"]
-            want_tip = f"{fresh.hostname or aid} · {want_st.lower()}"
+            mode_tip = presence_label(mode).lower() if status == "online" else "off"
+            want_tip = f"{fresh.hostname or aid} · {want_st.lower()} · {mode_tip}"
             # set_tooltip_text every poll also resets hover styling on some themes
             if widgets.get("tip") != want_tip:
                 btn.set_tooltip_text(want_tip)
@@ -828,12 +1004,32 @@ class AgentsPanel(Gtk.Box):
             else:
                 btn.remove_css_class("hogwarts-fleet-btn-selected")
 
+    def _sync_fleet_pointer_hover(self) -> None:
+        """After hard rebuild, re-apply hover if the pointer is still over a row.
+
+        GTK often fires leave without re-enter when widgets are destroyed under
+        the cursor — motion class would stick off until the user wiggles.
+        """
+        for widgets in self._fleet_rows.values():
+            btn: Gtk.Button = widgets["btn"]
+            try:
+                over = bool(btn.contains_pointer())
+            except Exception:
+                over = False
+            if over:
+                btn.add_css_class("hogwarts-fleet-btn-hover")
+            else:
+                btn.remove_css_class("hogwarts-fleet-btn-hover")
+
     def _select_fleet_row(self, agent_id: str) -> None:
         self._mark_fleet_selected(agent_id)
 
     def _show_fleet(self) -> None:
-        """Return to full-width fleet roster sub-page."""
-        self.stop_live_ui()
+        """Return to full-width fleet roster sub-page.
+
+        Do not stop Live here — Remote Viewer is a separate window and should
+        keep polling until closed or the operator toggles Live off.
+        """
         # Drop sticky selected styling — roster is browse-only until next click.
         # (Selected class looked like a stuck hover after ← Fleet.)
         self._mark_fleet_selected(None)
@@ -848,46 +1044,141 @@ class AgentsPanel(Gtk.Box):
             btn.set_active(True)
         else:
             self._detail_stack.set_visible_child_name(key)
+            self._activate_work_surface(key)
+
+    def _goto_work_surface(self, key: str) -> None:
+        """Header quick-action: switch tab and open the real work window."""
+        if not self._selected:
+            self.set_task_note("Select an agent first", ok=False)
+            return
+        self._select_tab(key)
+
+    def _activate_work_surface(self, key: str) -> None:
+        """Make Files / Desktop first-class: tab selection opens the window."""
+        if key == "tasks" and self._selected:
+            self._refresh_tasks()
+            return
+        if key == "files" and self._selected:
+            # Defer so stack transition finishes before present()
+            GLib.idle_add(self._open_file_explorer_idle)
+            return
+        if key == "desktop" and self._selected:
+            GLib.idle_add(self._open_desktop_viewer_idle)
+            return
+
+    def _open_file_explorer_idle(self) -> bool:
+        try:
+            self._open_file_explorer()
+        except Exception:
+            pass
+        return False
+
+    def _open_desktop_viewer_idle(self) -> bool:
+        try:
+            self._open_desktop_viewer(auto_shot=False)
+        except Exception:
+            pass
+        return False
 
     def _on_tab(self, btn: Gtk.ToggleButton, key: str) -> None:
         if not btn.get_active():
             return
         self._detail_stack.set_visible_child_name(key)
-        if key == "tasks" and self._selected:
-            self._refresh_tasks()
+        self._activate_work_surface(key)
+        self._sync_work_tab_labels()
+
+    def _sync_work_tab_labels(self) -> None:
+        """Badge Files/Desktop tabs when their work windows are open."""
+        files_open = self._explorer is not None
+        desk_open = self._desktop_viewer is not None
+        mapping = {
+            "files": ("Files ●" if files_open else "Files", files_open),
+            "desktop": ("Desktop ●" if desk_open else "Desktop", desk_open),
+        }
+        for key, (label, open_) in mapping.items():
+            btn = self._tab_buttons.get(key)
+            if btn is None:
+                continue
+            if btn.get_label() != label:
+                btn.set_label(label)
+            if open_:
+                btn.add_css_class("hogwarts-tab-active-win")
+            else:
+                btn.remove_css_class("hogwarts-tab-active-win")
 
     def set_tasks(self, tasks: list[TaskDTO], *, note: str = "") -> None:
         self._tasks = tasks
         if note:
             self.task_status.set_text(note)
+        # Fingerprint without `updated` — poll-only timestamp thrash rebuilt
+        # the whole task list and killed selection/hover every few seconds.
+        shown = list(tasks[:30])
+        ids = tuple(t.id for t in shown if t.id)
         fp = tuple(
             (
                 t.id,
                 t.status or "",
                 t.type or "",
-                t.updated.isoformat() if t.updated else "",
                 bool(t.result),
+                (t.result or {}).get("exit_code") if t.result else None,
+                (t.result or {}).get("error") if t.result else None,
             )
-            for t in tasks[:40]
+            for t in shown
         )
         if fp == self._tasks_fp and self.task_list.get_first_child() is not None:
             return
+
+        # Soft path: same task ids in same order — patch labels only
+        if (
+            self._task_rows
+            and ids
+            and ids == tuple(self._task_rows.keys())
+            and self.task_list.get_first_child() is not None
+        ):
+            self._tasks_fp = fp
+            for t in shown:
+                widgets = self._task_rows.get(t.id)
+                if not widgets:
+                    continue
+                widgets["task"] = t
+                lab: Gtk.Label = widgets["lab"]
+                want = f"{t.status:10}  {t.type:6}  {t.id}"
+                if lab.get_text() != want:
+                    lab.set_text(want)
+                btn: Gtk.Button = widgets["btn"]
+                if self._selected_task and self._selected_task.id == t.id:
+                    btn.add_css_class("hogwarts-fleet-btn-selected")
+                    # Keep selected task DTO current for cancel
+                    self._selected_task = t
+                else:
+                    btn.remove_css_class("hogwarts-fleet-btn-selected")
+            self._maybe_auto_result(tasks)
+            return
+
+        # Hard rebuild when membership/order changes
         self._tasks_fp = fp
+        keep_sel = self._selected_task.id if self._selected_task else None
         self._clear_tasks()
-        if not tasks:
+        if not shown:
             empty = Gtk.Label(label="No tasks yet — Ping or shell first.", xalign=0)
             empty.add_css_class("hogwarts-muted")
             self.task_list.append(empty)
             return
-        for t in tasks[:30]:
+        for t in shown:
             self.task_list.append(self._task_row(t))
-        # Auto-show latest terminal result only when it changes (avoid poll spam)
+        if keep_sel and keep_sel in self._task_rows:
+            self._mark_task_selected(keep_sel)
+            self._selected_task = self._task_rows[keep_sel]["task"]
+        self._maybe_auto_result(tasks)
+
+    def _maybe_auto_result(self, tasks: list[TaskDTO]) -> None:
         for t in tasks:
             if t.result and t.status in ("succeeded", "failed"):
                 key = (
                     t.id,
                     t.status,
-                    t.updated.isoformat() if t.updated else "",
+                    (t.result or {}).get("exit_code"),
+                    (t.result or {}).get("error"),
                 )
                 if key != getattr(self, "_auto_result_key", None):
                     self._auto_result_key = key
@@ -918,13 +1209,21 @@ class AgentsPanel(Gtk.Box):
             result=None,
             agent_id=self._selected.id if self._selected else None,
         )
-        # Invalidate fingerprint so next set_tasks redraws cleanly
+        # Soft-insert at head without wiping the rest of the list
         self._tasks_fp = None
-        # Drop empty placeholder if present
         first = self.task_list.get_first_child()
         if first is not None and isinstance(first, Gtk.Label):
             self.task_list.remove(first)
+        prev_rows = dict(self._task_rows)
         self.task_list.prepend(self._task_row(t))
+        # Ordered map: new task first (Python 3.7+ dict order)
+        ordered: dict[str, dict[str, Any]] = {}
+        if t.id and t.id in self._task_rows:
+            ordered[t.id] = self._task_rows[t.id]
+        for tid, w in prev_rows.items():
+            if tid != t.id:
+                ordered[tid] = w
+        self._task_rows = ordered
         self._tasks = [t] + list(self._tasks)
 
     def _set_tasking_sensitive(self, on: bool) -> None:
@@ -940,11 +1239,16 @@ class AgentsPanel(Gtk.Box):
             self.btn_explorer,
             self.btn_explorer_focus,
             self.btn_desktop_win,
+            getattr(self, "btn_desktop_shot", None),
             self.btn_cancel,
             self.shell_entry,
             self.shell_dd,
+            getattr(self, "btn_quick_files", None),
+            getattr(self, "btn_quick_desktop", None),
+            getattr(self, "btn_quick_tasks", None),
         ):
-            w.set_sensitive(on)
+            if w is not None:
+                w.set_sensitive(on)
 
     def selected_shell(self) -> str:
         i = int(self.shell_dd.get_selected())
@@ -1146,6 +1450,10 @@ class AgentsPanel(Gtk.Box):
 
         def on_closed() -> None:
             self._explorer = None
+            self.set_remote_status(
+                "Window closed — select this tab or Open to launch.", ok=None
+            )
+            self._sync_work_tab_labels()
 
         def on_fs_index_start(roots: list[str] | None) -> None:
             if self._on_fs_index_start:
@@ -1204,6 +1512,10 @@ class AgentsPanel(Gtk.Box):
             win.set_transient_for(parent)
         self._explorer = win
         win.present()
+        self.set_remote_status(
+            f"File Explorer open · {label} · path {start or '—'}", ok=True
+        )
+        self._sync_work_tab_labels()
         if not self._remote_entries:
             self._browse_remote(path=start)
 
@@ -1322,16 +1634,19 @@ class AgentsPanel(Gtk.Box):
     def _open_desktop_viewer(self, *, auto_shot: bool = False) -> None:
         """Open (or focus) the large remote desktop viewer window.
 
-        Capture / Live / Session only run from controls inside this window.
-        ``auto_shot`` is ignored (no silent capture from the agent sub-page).
+        Capture / Live / Session primary controls live inside this window.
+        ``auto_shot=True`` queues a screenshot after the window is up (density).
         """
-        del auto_shot  # never auto-capture from the Agents Desktop tab
         if not self._selected:
             self.set_task_note("Select an agent first", ok=False)
             return
         if self._desktop_viewer is not None:
             try:
                 self._desktop_viewer.present()
+                self.set_desktop_note("Remote Viewer focused.", ok=True)
+                self._sync_work_tab_labels()
+                if auto_shot:
+                    self._take_screenshot()
                 return
             except Exception:
                 self._desktop_viewer = None
@@ -1404,10 +1719,11 @@ class AgentsPanel(Gtk.Box):
                 except Exception:
                     pass
             self.desktop_status.set_text(
-                "Remote Viewer closed — open it to capture or control."
+                "Window closed — select this tab or Open to launch."
             )
             self.desktop_status.remove_css_class("hogwarts-ok")
             self.desktop_status.remove_css_class("hogwarts-fail")
+            self._sync_work_tab_labels()
 
         archive = self._screenshot_archive_dir(
             agent.id, hostname=agent.hostname or ""
@@ -1436,7 +1752,19 @@ class AgentsPanel(Gtk.Box):
             "Remote Viewer open — use Capture / Live / Session in that window."
         )
         self.desktop_status.remove_css_class("hogwarts-fail")
+        self.desktop_status.add_css_class("hogwarts-ok")
         win.present()
+        self._sync_work_tab_labels()
+        if auto_shot:
+            # Density: Open + Capture from Desktop tab
+            def _shot_once() -> bool:
+                try:
+                    self._take_screenshot()
+                except Exception:
+                    pass
+                return False
+
+            GLib.idle_add(_shot_once)
 
     def set_desktop_frame(
         self,
@@ -1514,6 +1842,7 @@ class AgentsPanel(Gtk.Box):
     def _clear_tasks(self) -> None:
         while child := self.task_list.get_first_child():
             self.task_list.remove(child)
+        self._task_rows.clear()
 
     def _placeholder_label(self, msg: str, *, fail: bool) -> Gtk.Label:
         lab = Gtk.Label(label=msg, xalign=0, wrap=True)
@@ -1531,8 +1860,9 @@ class AgentsPanel(Gtk.Box):
         btn.add_css_class("hogwarts-fleet-btn")
         btn.set_hexpand(True)
         btn.set_halign(Gtk.Align.FILL)
-        # Ensure the button owns pointer events (child labels must not steal hover)
-        btn.set_focus_on_click(True)
+        # Don't leave keyboard focus on the roster row after click — focus would
+        # jump into detail and highlight the whole identity card / stack page.
+        btn.set_focus_on_click(False)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         outer.add_css_class("hogwarts-agent-row")
@@ -1545,10 +1875,13 @@ class AgentsPanel(Gtk.Box):
         dot.set_can_target(False)
         dot.add_css_class("hogwarts-dot")
         status = fleet_status_key(agent.status)
-        if status == "online":
-            dot_class = "hogwarts-dot-live"
-        elif status == "offline":
+        mode = presence_mode_key(agent)
+        if status == "offline":
             dot_class = "hogwarts-dot-off"
+        elif mode == "interactive":
+            dot_class = "hogwarts-dot-busy"
+        elif status == "online":
+            dot_class = "hogwarts-dot-live"
         else:
             dot_class = "hogwarts-dot-idle"
         dot.add_css_class(dot_class)
@@ -1560,6 +1893,25 @@ class AgentsPanel(Gtk.Box):
         host.set_hexpand(True)
         host.set_can_target(False)
         top.append(host)
+
+        # Presence: ASYNC (beacon) / INTER (session-class turbo)
+        mode_text = presence_label(mode) if status == "online" else ""
+        mode_lab = Gtk.Label(label=mode_text, xalign=1)
+        mode_lab.set_can_target(False)
+        mode_lab.add_css_class("hogwarts-presence")
+        if mode_text:
+            mode_lab.add_css_class(
+                "hogwarts-presence-interactive"
+                if mode == "interactive"
+                else "hogwarts-presence-async"
+            )
+        mode_lab.set_visible(bool(mode_text))
+        mode_lab.set_tooltip_text(
+            "Interactive — turbo sleep / desktop work pending"
+            if mode == "interactive"
+            else "Async — beacon-class check-in"
+        )
+        top.append(mode_lab)
 
         st_text = "LIVE" if status == "online" else status.upper()
         st = Gtk.Label(label=st_text, xalign=1)
@@ -1576,6 +1928,7 @@ class AgentsPanel(Gtk.Box):
             agent.external_ip,
             agent.group,
             f"seen {age}",
+            agent.package_id or "",
             agent.id,
         ]
         meta = " · ".join(b for b in meta_bits if b) or agent.id
@@ -1585,14 +1938,30 @@ class AgentsPanel(Gtk.Box):
         outer.append(mlab)
 
         btn.set_child(outer)
-        tip0 = f"{agent.hostname or agent.id} · {st_text.lower()}"
+        mode_tip = presence_label(mode).lower() if status == "online" else "off"
+        tip0 = f"{agent.hostname or agent.id} · {st_text.lower()} · {mode_tip}"
         btn.set_tooltip_text(tip0)
         btn.connect("clicked", lambda *_a, aid=agent.id: self._open_agent_id(aid))
+
+        # Explicit motion hover class — GTK4 :hover can stick off after many
+        # refresh rebuilds / child label invalidations even with can_target=False.
+        motion = Gtk.EventControllerMotion()
+
+        def _enter(_c: Gtk.EventControllerMotion) -> None:
+            btn.add_css_class("hogwarts-fleet-btn-hover")
+
+        def _leave(_c: Gtk.EventControllerMotion) -> None:
+            btn.remove_css_class("hogwarts-fleet-btn-hover")
+
+        motion.connect("enter", _enter)
+        motion.connect("leave", _leave)
+        btn.add_controller(motion)
 
         self._fleet_rows[agent.id] = {
             "btn": btn,
             "host": host,
             "status": st,
+            "presence": mode_lab,
             "meta": mlab,
             "dot": dot,
             "dot_class": dot_class,
@@ -1614,6 +1983,7 @@ class AgentsPanel(Gtk.Box):
     def _task_row(self, task: TaskDTO) -> Gtk.Widget:
         btn = Gtk.Button()
         btn.add_css_class("flat")
+        btn.add_css_class("hogwarts-fleet-btn")
         btn.set_hexpand(True)
         lab = Gtk.Label(
             label=f"{task.status:10}  {task.type:6}  {task.id}",
@@ -1621,25 +1991,49 @@ class AgentsPanel(Gtk.Box):
         )
         lab.add_css_class("hogwarts-agent-meta")
         lab.set_selectable(True)
+        lab.set_can_target(False)
         btn.set_child(lab)
-        btn.connect(
-            "clicked",
-            lambda *_a, t=task: (self._select_task(t), self._show_result(t)),
-        )
+        tid = task.id
+
+        def on_click(*_a: Any, task_id: str = tid) -> None:
+            widgets = self._task_rows.get(task_id)
+            t = widgets["task"] if widgets else None
+            if t is None:
+                t = next((x for x in self._tasks if x.id == task_id), None)
+            if t is None:
+                return
+            self._select_task(t)
+            self._show_result(t)
+
+        btn.connect("clicked", on_click)
+        if tid:
+            self._task_rows[tid] = {"btn": btn, "lab": lab, "task": task}
         return btn
+
+    def _mark_task_selected(self, task_id: str | None) -> None:
+        for tid, widgets in self._task_rows.items():
+            btn: Gtk.Button = widgets["btn"]
+            if task_id and tid == task_id:
+                btn.add_css_class("hogwarts-fleet-btn-selected")
+            else:
+                btn.remove_css_class("hogwarts-fleet-btn-selected")
 
     def _select_task(self, task: TaskDTO) -> None:
         self._selected_task = task
+        self._mark_task_selected(task.id if task else None)
 
     def _show_detail(self, agent: AgentDTO) -> None:
         """Open full-width agent detail sub-page."""
         try:
             self._fill_detail(agent)
-            self._mark_fleet_selected(agent.id)
+            # Clear roster selection paint — detail is open; selected class on
+            # an off-screen fleet button is useless and confuses focus styling.
+            self._mark_fleet_selected(None)
             age, _ = format_last_seen(agent.last_seen, sleep=agent.sleep)
             self._selected_soft_key = (
                 agent.id,
                 fleet_status_key(agent.status),
+                presence_mode_key(agent),
                 age,
                 agent.hostname,
                 agent.username,
@@ -1650,14 +2044,36 @@ class AgentsPanel(Gtk.Box):
                 self._view_stack.set_visible_child(self._detail_page)
             except Exception:
                 self._view_stack.set_visible_child_name("detail")
+            mode = presence_label(presence_mode_key(agent))
             self.status_lab.set_text(
-                f"Opened {agent.hostname or agent.id} · "
-                "Tasking · Files · Desktop · Tasks"
+                f"Opened {agent.hostname or agent.id} · {mode} · "
+                "Tasking (inline result) · Files/Desktop windows · Tasks"
             )
             self._refresh_tasks()
+            # Park focus on the shell entry without selecting its text, so the
+            # detail page does not show a big focus/selection highlight.
+            GLib.idle_add(self._focus_detail_quietly)
         except Exception as exc:
             self.status_lab.set_text(f"Failed to open agent: {exc}")
             self.set_task_note(str(exc), ok=False)
+
+    def _focus_detail_quietly(self) -> bool:
+        try:
+            # Prefer shell box: natural next action, no full-page selection chrome
+            if hasattr(self.shell_entry, "grab_focus_without_selecting"):
+                self.shell_entry.grab_focus_without_selecting()
+            else:
+                self.shell_entry.grab_focus()
+                try:
+                    self.shell_entry.select_region(0, 0)
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                self.btn_back.grab_focus()
+            except Exception:
+                pass
+        return False
 
     def _fill_detail(self, agent: AgentDTO, *, soft: bool = False) -> None:
         """Update detail header/meta without forcing fleet↔detail navigation.
@@ -1671,17 +2087,22 @@ class AgentsPanel(Gtk.Box):
         age, wait_banner = format_last_seen(agent.last_seen, sleep=agent.sleep)
         iso = agent.last_seen.isoformat() if agent.last_seen else "—"
         status = (agent.status or "unknown").lower()
+        mode = presence_mode_key(agent)
         sub_bits = [
             agent.username or None,
             (agent.os or "").split()[0] if agent.os else None,
             agent.arch or None,
             agent.external_ip or None,
             f"seen {age}",
+            presence_label(mode) if fleet_status_key(status) == "online" else None,
         ]
         self.detail_sub.set_text(" · ".join(b for b in sub_bits if b))
 
-        # Status chip + header dot
-        self.detail_status_chip.set_text(status.upper())
+        # Status chip + presence chip + header dot
+        live = fleet_status_key(status)
+        self.detail_status_chip.set_text(
+            "LIVE" if live == "online" else status.upper()
+        )
         for c in (
             "hogwarts-chip-live",
             "hogwarts-status-online",
@@ -1695,9 +2116,26 @@ class AgentsPanel(Gtk.Box):
             "idle": "hogwarts-status-idle",
             "offline": "hogwarts-status-offline",
         }.get(status, "hogwarts-status-unknown")
+        if live == "online":
+            chip_cls = "hogwarts-status-online"
         self.detail_status_chip.add_css_class(chip_cls)
-        if status == "online":
+        if live == "online":
             self.detail_status_chip.add_css_class("hogwarts-chip-live")
+
+        mode_txt = presence_label(mode) if live == "online" else ""
+        self.detail_presence_chip.set_text(mode_txt)
+        self.detail_presence_chip.set_visible(bool(mode_txt))
+        for c in (
+            "hogwarts-presence-async",
+            "hogwarts-presence-interactive",
+        ):
+            self.detail_presence_chip.remove_css_class(c)
+        if mode_txt:
+            self.detail_presence_chip.add_css_class(
+                "hogwarts-presence-interactive"
+                if mode == "interactive"
+                else "hogwarts-presence-async"
+            )
 
         for c in (
             "hogwarts-dot-live",
@@ -1706,12 +2144,12 @@ class AgentsPanel(Gtk.Box):
             "hogwarts-dot-idle",
         ):
             self.detail_dot.remove_css_class(c)
-        if status == "online":
-            self.detail_dot.add_css_class("hogwarts-dot-live")
-        elif status == "idle":
-            self.detail_dot.add_css_class("hogwarts-dot-busy")
-        elif status == "offline":
+        if live == "offline":
             self.detail_dot.add_css_class("hogwarts-dot-off")
+        elif mode == "interactive":
+            self.detail_dot.add_css_class("hogwarts-dot-busy")
+        elif live == "online":
+            self.detail_dot.add_css_class("hogwarts-dot-live")
         else:
             self.detail_dot.add_css_class("hogwarts-dot-idle")
 
@@ -1722,6 +2160,8 @@ class AgentsPanel(Gtk.Box):
             f"external  {agent.external_ip or '—'}",
             f"internal  {agent.internal_ip or '—'}",
             f"group     {agent.group or '—'}",
+            f"package   {agent.package_id or '—'}",
+            f"presence  {mode}  (async=beacon · interactive=session-class)",
             f"last_seen {age}  ({iso})",
         ]
         if agent.tags:
@@ -1732,6 +2172,12 @@ class AgentsPanel(Gtk.Box):
             lines.append(f"tempo     {wait_banner}")
         elif agent.status == "offline":
             lines.append("tempo     offline — task waits for next check-in")
+        elif mode == "interactive":
+            lines.append(
+                "tempo     interactive — turbo sleep or desktop work pending"
+            )
+        else:
+            lines.append("tempo     async — beacon-class check-in")
         self.detail_body.set_text("\n".join(lines))
         if wait_banner and not soft:
             self.set_task_note(wait_banner, ok=None)
@@ -1795,10 +2241,21 @@ class AgentsPanel(Gtk.Box):
             lines.append("(no result yet — wait for agent check-in)")
         text = "\n".join(lines)
         # Skip rewrite if identical — reduces TextView churn on failed-task polls
-        buf = self.result_view.get_buffer()
-        start, end = buf.get_bounds()
-        if buf.get_text(start, end, False) != text:
-            buf.set_text(text)
+        for view in (
+            self.result_view,
+            getattr(self, "tasking_result_view", None),
+        ):
+            if view is None:
+                continue
+            buf = view.get_buffer()
+            start, end = buf.get_bounds()
+            if buf.get_text(start, end, False) != text:
+                buf.set_text(text)
+        meta = getattr(self, "tasking_result_meta", None)
+        if meta is not None:
+            want = f"{task.type} · {task.status}"
+            if meta.get_text() != want:
+                meta.set_text(want)
 
     def _queue(self, type_: str, payload: dict) -> None:
         if not self._selected or not self._on_task:

@@ -38,6 +38,7 @@ _DRILLS = (
     ("D7", "Battlement probe"),
     ("D8", "Desk scrape"),
     ("D9", "Compartment tabletop"),
+    ("D10", "Package canary"),
 )
 
 
@@ -68,19 +69,34 @@ class OpsPanel(Gtk.Box):
         card1.add_css_class("hogwarts-card")
         c1t = Gtk.Label(
             label=(
-                "Build a lab agent zip (agent.py + agent.json with one-shot enroll "
-                "secret + Linux/Windows runners). Also open Reach’s reverse export "
-                "folder for Inverse Snowflake / dial-out packages."
+                "Each export is a unique package (package_id + one-shot enroll secret + "
+                "canary). Mint one zip per agent — do not reuse across hosts. Includes "
+                "agent.py, agent.json, MANIFEST.json, runners. First start fires HTTP "
+                "canary to the plane (events channel=canary); optional DNS canary if you "
+                "set a base domain below."
             ),
             wrap=True,
             xalign=0,
         )
         c1t.add_css_class("hogwarts-muted")
         card1.append(c1t)
+        self.canary_domain = Gtk.Entry()
+        self.canary_domain.set_placeholder_text(
+            "Optional DNS canary base · e.g. c.lab.example (empty = HTTP only)"
+        )
+        self.canary_domain.set_hexpand(True)
+        self.canary_domain.set_tooltip_text(
+            "If set, each package gets canary_fqdn = {label}.{domain}. "
+            "Point a wildcard A/AAAA (or CF DNS analytics) at a sinkhole and watch "
+            "queries for stolen/run packages. HTTP canary always works without this."
+        )
+        card1.append(field("Canary domain", self.canary_domain))
         pack_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         exp_agent = Gtk.Button(label="Export agent zip")
         exp_agent.add_css_class("suggested-action")
-        exp_agent.set_tooltip_text("Mints enroll secret from plane + packs agent.py")
+        exp_agent.set_tooltip_text(
+            "Mint unique package_id + one-shot enroll secret + canary, pack agent.zip"
+        )
         exp_agent.connect(
             "clicked",
             lambda *_: self._on_export_agent() if self._on_export_agent else None,
@@ -94,6 +110,15 @@ class OpsPanel(Gtk.Box):
         self.export_status = Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
         self.export_status.add_css_class("hogwarts-kv-val")
         card1.append(self.export_status)
+        self.export_ledger = Gtk.Label(
+            label="No packages exported yet",
+            xalign=0,
+            wrap=True,
+            selectable=True,
+        )
+        self.export_ledger.add_css_class("hogwarts-muted")
+        self.export_ledger.add_css_class("hogwarts-agent-meta")
+        card1.append(self.export_ledger)
         body.append(card1)
 
         body.append(section_label("Playbook fields (no secrets)"))
@@ -253,3 +278,44 @@ class OpsPanel(Gtk.Box):
             self.export_status.add_css_class("hogwarts-ok")
         elif ok is False:
             self.export_status.add_css_class("hogwarts-fail")
+
+    def get_canary_domain(self) -> str:
+        ent = getattr(self, "canary_domain", None)
+        if ent is None:
+            return ""
+        return ent.get_text().strip().lstrip(".").rstrip(".").lower()
+
+    def set_canary_domain(self, domain: str) -> None:
+        ent = getattr(self, "canary_domain", None)
+        if ent is None:
+            return
+        ent.set_text((domain or "").strip())
+
+    def refresh_export_ledger(self, meta: dict | None) -> None:
+        """Show recent package_ids (local ledger — secrets never stored)."""
+        lab = getattr(self, "export_ledger", None)
+        if lab is None:
+            return
+        rows = list((meta or {}).get("agent_exports") or [])
+        if not rows:
+            lab.set_text("No packages exported yet · each zip is one-shot + canary")
+            return
+        lines: list[str] = []
+        for r in rows[:8]:
+            pid = str(r.get("package_id") or "?")
+            canary = str(r.get("canary_label") or "")
+            fqdn = str(r.get("canary_fqdn") or "")
+            exp = str(r.get("expires_at") or "")
+            path = str(r.get("path") or "")
+            name = path.rsplit("/", 1)[-1] if path else ""
+            bit = f"{pid}"
+            if canary:
+                bit += f" · canary {canary}"
+            if fqdn:
+                bit += f" · dns {fqdn}"
+            if exp:
+                bit += f" · exp {exp}"
+            if name:
+                bit += f" · {name}"
+            lines.append(bit)
+        lab.set_text("Recent packages:\n" + "\n".join(lines))

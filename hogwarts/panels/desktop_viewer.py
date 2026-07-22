@@ -117,6 +117,9 @@ class RemoteDesktopViewer(Gtk.Window):
         self._control_on = False
         self._session_info: dict[str, Any] = {}
         self._capturing = False
+        self._capture_gen: int = 0  # invalidate stale 12s re-enable timers
+        # path-str → button (path-keyed so soft-prepend does not stale indices)
+        self._archive_btns: dict[str, Gtk.Button] = {}
         # Input batching (Control mode latency)
         self._input_queue: list[dict[str, Any]] = []
         self._input_flush_src: int | None = None
@@ -790,6 +793,34 @@ class RemoteDesktopViewer(Gtk.Window):
             if keyval == Gdk.KEY_Escape and self._fullscreen:
                 self._toggle_fullscreen()
                 return True
+            if keyval == Gdk.KEY_F11:
+                self._toggle_fullscreen()
+                return True
+            # When remote input is active (Control or Keepstream Session), do not
+            # steal Left/Right/Space/R/F/1 for archive/zoom — send them remote.
+            remote_input = False
+            try:
+                remote_input = bool(self._accepts_remote_input())
+            except Exception:
+                remote_input = self._mode == "control"
+            if remote_input and not ctrl:
+                name = Gdk.keyval_name(keyval) or ""
+                if len(name) == 1 or name.lower() in (
+                    "return",
+                    "escape",
+                    "backspace",
+                    "tab",
+                    "space",
+                    "up",
+                    "down",
+                    "left",
+                    "right",
+                    "delete",
+                ):
+                    self._send_input([{"type": "key", "key": name}])
+                    return True
+                # Unmapped keys still consumed so they do not hit local shortcuts
+                return True
             if keyval in (Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add):
                 self._nudge_zoom(1)
                 return True
@@ -801,9 +832,6 @@ class RemoteDesktopViewer(Gtk.Window):
                 return True
             if keyval == Gdk.KEY_1 and not ctrl:
                 self._set_zoom(1.0)
-                return True
-            if keyval == Gdk.KEY_F11:
-                self._toggle_fullscreen()
                 return True
             if keyval == Gdk.KEY_Left:
                 self._hist_step(-1)
@@ -829,23 +857,6 @@ class RemoteDesktopViewer(Gtk.Window):
             if ctrl and keyval in (Gdk.KEY_o, Gdk.KEY_O):
                 self._open_folder()
                 return True
-            # Control mode: forward keys to agent
-            if self._mode == "control" and not ctrl:
-                name = Gdk.keyval_name(keyval) or ""
-                if len(name) == 1 or name.lower() in (
-                    "return",
-                    "escape",
-                    "backspace",
-                    "tab",
-                    "space",
-                    "up",
-                    "down",
-                    "left",
-                    "right",
-                    "delete",
-                ):
-                    self._send_input([{"type": "key", "key": name}])
-                    return True
             return False
 
         key.connect("key-pressed", on_key)
@@ -909,6 +920,7 @@ class RemoteDesktopViewer(Gtk.Window):
         elif path is not None:
             self._current_path = path
 
+        self._capture_gen = int(getattr(self, "_capture_gen", 0)) + 1
         self._capturing = False
         self.btn_shot.set_sensitive(True)
         try:
@@ -1304,8 +1316,16 @@ class RemoteDesktopViewer(Gtk.Window):
     def _prepend_item(
         self, path: Path, data: bytes, pb: GdkPixbuf.Pixbuf, note: str
     ) -> None:
-        # Drop if already first (same path)
-        self._items = [it for it in self._items if it.get("path") != path]
+        """Insert a new capture at the top without rebuilding every row."""
+        path_s = str(path)
+        # Drop duplicate path from model + widget map
+        self._items = [it for it in self._items if str(it.get("path") or "") != path_s]
+        old_btn = self._archive_btns.pop(path_s, None)
+        if old_btn is not None:
+            try:
+                self.archive_list.remove(old_btn)
+            except Exception:
+                pass
         try:
             thumb = pb.scale_simple(
                 _THUMB,
@@ -1314,27 +1334,48 @@ class RemoteDesktopViewer(Gtk.Window):
             )
         except Exception:
             thumb = None
-        self._items.insert(
-            0,
-            {
-                "path": path,
-                "bytes": data,
-                "w": pb.get_width(),
-                "h": pb.get_height(),
-                "size": len(data),
-                "mtime": path.stat().st_mtime if path.exists() else datetime.now().timestamp(),
-                "note": note,
-                "thumb": thumb,
-            },
-        )
-        if len(self._items) > _ARCHIVE_CAP:
-            self._items = self._items[:_ARCHIVE_CAP]
+        item = {
+            "path": path,
+            "bytes": data,
+            "w": pb.get_width(),
+            "h": pb.get_height(),
+            "size": len(data),
+            "mtime": path.stat().st_mtime if path.exists() else datetime.now().timestamp(),
+            "note": note,
+            "thumb": thumb,
+        }
+        self._items.insert(0, item)
+        # Cap: drop oldest items + their buttons
+        while len(self._items) > _ARCHIVE_CAP:
+            drop = self._items.pop()
+            drop_s = str(drop.get("path") or "")
+            drop_btn = self._archive_btns.pop(drop_s, None)
+            if drop_btn is not None:
+                try:
+                    self.archive_list.remove(drop_btn)
+                except Exception:
+                    pass
+
         self._selected_i = 0
-        self._rebuild_archive_list()
+        # Empty-state label → full rebuild is simpler
+        first = self.archive_list.get_first_child()
+        if first is not None and not isinstance(first, Gtk.Button):
+            self._rebuild_archive_list()
+            return
+        if not self._archive_btns and first is None:
+            self._rebuild_archive_list()
+            return
+
+        # Soft prepend: only construct the new row widget
+        btn = self._archive_row(0, item)
+        self.archive_list.prepend(btn)
+        self.archive_count.set_text(str(len(self._items)))
+        self._mark_archive_selected(0)
 
     def _rebuild_archive_list(self) -> None:
         while child := self.archive_list.get_first_child():
             self.archive_list.remove(child)
+        self._archive_btns.clear()
         self.archive_count.set_text(str(len(self._items)))
         if not self._items:
             empty = Gtk.Label(label="No captures yet", xalign=0.5)
@@ -1372,6 +1413,7 @@ class RemoteDesktopViewer(Gtk.Window):
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
         col.set_hexpand(True)
         path: Path = it["path"]
+        path_s = str(path)
         name = path.name
         # Short time label
         try:
@@ -1391,9 +1433,28 @@ class RemoteDesktopViewer(Gtk.Window):
         row.append(col)
 
         btn.set_child(row)
-        btn.set_tooltip_text(str(path))
-        btn.connect("clicked", lambda *_a, i=index: self._select_index(i))
+        btn.set_tooltip_text(path_s)
+        # Path-keyed click — stable across soft prepend (indices would go stale)
+        btn.connect("clicked", lambda *_a, p=path_s: self._select_by_path(p))
+        self._archive_btns[path_s] = btn
         return btn
+
+    def _select_by_path(self, path_s: str) -> None:
+        for i, it in enumerate(self._items):
+            if str(it.get("path") or "") == path_s:
+                self._select_index(i)
+                return
+
+    def _mark_archive_selected(self, index: int) -> None:
+        """Update selection CSS without rebuilding the whole archive list."""
+        sel = ""
+        if 0 <= index < len(self._items):
+            sel = str(self._items[index].get("path") or "")
+        for path_s, btn in self._archive_btns.items():
+            if path_s and path_s == sel:
+                btn.add_css_class("rdv-arch-row-selected")
+            else:
+                btn.remove_css_class("rdv-arch-row-selected")
 
     def _select_index(self, index: int) -> None:
         if index < 0 or index >= len(self._items):
@@ -1419,7 +1480,12 @@ class RemoteDesktopViewer(Gtk.Window):
             self._set_status(f"Load failed: {exc}", ok=False)
         finally:
             self._loading_archive = False
-        self._rebuild_archive_list()
+        # Soft selection paint — do not destroy archive rows (was killing hover)
+        path_s = str(it.get("path") or "")
+        if self._archive_btns and path_s in self._archive_btns:
+            self._mark_archive_selected(index)
+        else:
+            self._rebuild_archive_list()
         self._update_hist_ui()
 
     # ── Actions ──────────────────────────────────────────────────────
@@ -1576,14 +1642,19 @@ class RemoteDesktopViewer(Gtk.Window):
             return
         side = self.current_max_side()
         self._capturing = True
+        self._capture_gen = int(getattr(self, "_capture_gen", 0)) + 1
+        gen = self._capture_gen
         self.btn_shot.set_sensitive(False)
         self._set_status(f"Capturing… (max_side={side})", ok=None)
         if self._on_screenshot:
             self._on_screenshot(side)
-        # Re-enable after a short grace if frame never arrives
-        GLib.timeout_add_seconds(12, self._clear_capturing)
+        # Re-enable after a short grace if frame never arrives (gen-matched)
+        GLib.timeout_add_seconds(12, lambda g=gen: self._clear_capturing(g))
 
-    def _clear_capturing(self) -> bool:
+    def _clear_capturing(self, gen: int | None = None) -> bool:
+        # Ignore stale timers from a previous Capture
+        if gen is not None and gen != getattr(self, "_capture_gen", gen):
+            return False
         self._capturing = False
         try:
             self.btn_shot.set_sensitive(True)
@@ -1805,6 +1876,14 @@ class RemoteDesktopViewer(Gtk.Window):
             self.unfullscreen()
 
     def _on_close(self, *_a) -> bool:
+        if self._input_flush_src is not None:
+            try:
+                GLib.source_remove(self._input_flush_src)
+            except Exception:
+                pass
+            self._input_flush_src = None
+        self._capture_gen = int(getattr(self, "_capture_gen", 0)) + 1
+        self._capturing = False
         if self._on_closed:
             self._on_closed()
         return False

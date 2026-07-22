@@ -35,6 +35,8 @@ class KeepstreamClient:
         on_frame: Callable[[bytes, dict[str, Any]], None] | None = None,
         on_status: Callable[[str, bool | None], None] | None = None,
         on_closed: Callable[[], None] | None = None,
+        socks_host: str | None = None,
+        socks_port: int | None = None,
     ) -> None:
         self.host = host
         self.port = int(port)
@@ -43,6 +45,9 @@ class KeepstreamClient:
         self._on_frame = on_frame
         self._on_status = on_status
         self._on_closed = on_closed
+        # Spike 2: dial Session face via Reach path SOCKS when set
+        self.socks_host = (socks_host or "").strip() or None
+        self.socks_port = int(socks_port) if socks_port else None
         self._sock: socket.socket | None = None
         self._stop = False
         self._thread: threading.Thread | None = None
@@ -57,6 +62,8 @@ class KeepstreamClient:
         self.frames = 0
         self.dropped = 0
         self.last_rtt_ms: float | None = None
+        self.via = "direct"
+        self._closed_fired = False
 
     def _status(self, msg: str, ok: bool | None = None) -> None:
         if self._on_status:
@@ -69,6 +76,7 @@ class KeepstreamClient:
         if self._thread and self._thread.is_alive():
             return
         self._stop = False
+        self._closed_fired = False
         self._thread = threading.Thread(
             target=self._run, name="keepstream-client", daemon=True
         )
@@ -91,6 +99,13 @@ class KeepstreamClient:
         if thr is not None and thr.is_alive():
             thr.join(timeout=2.0)
         self.connected = False
+        self._fire_closed_once()
+
+    def _fire_closed_once(self) -> None:
+        """stop() and reader finally both call this — only first fires callback."""
+        if getattr(self, "_closed_fired", False):
+            return
+        self._closed_fired = True
         if self._on_closed:
             try:
                 self._on_closed()
@@ -146,15 +161,41 @@ class KeepstreamClient:
             except Exception:
                 pass
 
-    def _run(self) -> None:
-        try:
+    def _connect_sock(self) -> socket.socket:
+        """Direct TCP or SOCKS5 (path-wrapped Session — Spike 2)."""
+        if self.socks_host and self.socks_port:
+            from hogwarts.net import socks5_connect
+
+            self.via = f"socks5://{self.socks_host}:{self.socks_port}"
+            self._status(
+                f"Keepstream via path SOCKS {self.socks_host}:{self.socks_port} "
+                f"→ {self.host}:{self.port}…",
+                None,
+            )
+            sock = socks5_connect(
+                self.socks_host,
+                self.socks_port,
+                self.host,
+                self.port,
+                timeout=12.0,
+            )
+        else:
+            self.via = "direct"
             self._status(f"Keepstream connecting {self.host}:{self.port}…", None)
             sock = socket.create_connection((self.host, self.port), timeout=8.0)
+        try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-            except Exception:
-                pass
+        except Exception:
+            pass
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        except Exception:
+            pass
+        return sock
+
+    def _run(self) -> None:
+        try:
+            sock = self._connect_sock()
             self._sock = sock
             f = sock.makefile("rwb", buffering=0)
             f.write(b"KS0\n")
@@ -175,8 +216,10 @@ class KeepstreamClient:
                 pass
             self.codec = parts[4] if len(parts) > 4 else "jpeg"
             self.connected = True
+            via_bit = " · path SOCKS" if self.via != "direct" else ""
             self._status(
-                f"Keepstream up · {self.remote_w}×{self.remote_h} · {self.codec}",
+                f"Keepstream up · {self.remote_w}×{self.remote_h} · "
+                f"{self.codec}{via_bit}",
                 True,
             )
 
@@ -251,8 +294,4 @@ class KeepstreamClient:
             except Exception:
                 pass
             self._sock = None
-            if self._on_closed:
-                try:
-                    self._on_closed()
-                except Exception:
-                    pass
+            self._fire_closed_once()

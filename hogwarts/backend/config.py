@@ -43,3 +43,7 @@ def save_plane_config(path: Path, cfg: PlaneConfig) -> None:
         json.dumps(asdict(cfg), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass

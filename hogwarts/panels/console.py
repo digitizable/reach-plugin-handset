@@ -51,6 +51,12 @@ class ConsolePanel(Gtk.Box):
         self.set_vexpand(True)
         self._on_command = on_command
         self._history: list[str] = []
+        # Flood control: identical consecutive lines collapse; burst rate limit
+        self._last_line: str = ""
+        self._last_line_count: int = 0
+        self._burst_ts: float = 0.0
+        self._burst_n: int = 0
+        self._suppressed: int = 0
 
         bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         lab = Gtk.Label(label="Console", xalign=0)
@@ -113,7 +119,47 @@ class ConsolePanel(Gtk.Box):
     def _show_boot_banner(self) -> None:
         self.append_out(banner())
 
-    def append_out(self, text: str) -> None:
+    def append_out(self, text: str, *, force: bool = False) -> None:
+        """Append a line with collapse/rate-limit so poll floods stay readable.
+
+        force=True bypasses rate limits (user commands / help / clear).
+        """
+        import time
+
+        text = (text or "").rstrip("\n")
+        if not text:
+            return
+
+        # Collapse exact consecutive duplicates (no TextView surgery)
+        if not force and text == self._last_line and self._last_line_count > 0:
+            self._last_line_count += 1
+            if self._last_line_count == 2:
+                self._insert_raw(f"{text}  ·  (repeating…)")
+            return
+
+        if not force and self._last_line_count > 2:
+            self._insert_raw(f"… ×{self._last_line_count} total")
+
+        # Soft rate limit for non-forced appends (poll events)
+        if not force:
+            now = time.monotonic()
+            if now - self._burst_ts > 1.0:
+                self._burst_ts = now
+                if self._suppressed > 0:
+                    n = self._suppressed
+                    self._suppressed = 0
+                    self._insert_raw(f"… suppressed {n} similar line(s)")
+                self._burst_n = 0
+            self._burst_n += 1
+            if self._burst_n > 8:
+                self._suppressed += 1
+                return
+
+        self._last_line = text
+        self._last_line_count = 1
+        self._insert_raw(text)
+
+    def _insert_raw(self, text: str) -> None:
         buf = self.view.get_buffer()
         end = buf.get_end_iter()
         if buf.get_char_count() > 0:
@@ -150,31 +196,37 @@ class ConsolePanel(Gtk.Box):
         self._run(line)
 
     def _run(self, line: str) -> None:
-        self.append_out(f"› {line}")
+        self.append_out(f"› {line}", force=True)
         self._history.append(line)
         cmd, *rest = shlex.split(line) if line else [""]
         cmd = (cmd or "").lower()
 
         if cmd == "help":
-            self.append_out(_HELP.strip())
+            self.append_out(_HELP.strip(), force=True)
             return
         if cmd in ("banner", "splash", "logo"):
-            self.append_out(banner())
+            self.append_out(banner(), force=True)
             return
         if cmd == "clear":
             self.view.get_buffer().set_text("")
-            self.append_out(banner_short())
+            self._last_line = ""
+            self._last_line_count = 0
+            self._suppressed = 0
+            self._burst_n = 0
+            self.append_out(banner_short(), force=True)
             return
         if cmd == "echo":
-            self.append_out(" ".join(rest))
+            self.append_out(" ".join(rest), force=True)
             return
         if cmd == "time":
             now = datetime.now().astimezone()
             utc = datetime.now(timezone.utc)
-            self.append_out(f"local {now.isoformat()}\nutc   {utc.isoformat()}")
+            self.append_out(
+                f"local {now.isoformat()}\nutc   {utc.isoformat()}", force=True
+            )
             return
 
         # Delegate remaining commands to host
         out = self._on_command(line)
         if out:
-            self.append_out(out)
+            self.append_out(out, force=True)

@@ -12,6 +12,7 @@ See hogwarts/backend/CONTRACT.md and notes research/plane.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -25,7 +26,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.5.15-lab"
+# Max JSON body (operator + agent). Aligns with RESULT_CAP / upload chunks.
+MAX_BODY_BYTES = 4_000_000
+
+VERSION = "0.5.20-lab"
 DEFAULT_ADDR = "127.0.0.1:8080"
 DEFAULT_SLEEP = 1.0  # lab default — snappier task round-trips
 DEFAULT_JITTER = 0.1
@@ -62,6 +66,17 @@ LISTENER_STATES = frozenset({"planned", "deployed", "disabled", "burned"})
 LISTENER_EVIDENCE = frozenset(
     {"none", "tcp_ok", "process_ok", "plane_managed", "unknown"}
 )
+# Job kinds (Havoc-class listener objects; no SMB/External in plane)
+LISTENER_KINDS = frozenset(
+    {
+        "http_plane",
+        "reverse_tcp",
+        "reverse_tls",
+        "path_wrapped",
+        "note",
+        "other",
+    }
+)
 
 
 def _utc_now() -> str:
@@ -88,6 +103,7 @@ class Store:
     def _init_schema(self) -> None:
         with self._lock:
             c = self._conn
+            # Schema bootstrap (CREATE IF NOT EXISTS below)
             c.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS meta (
@@ -100,7 +116,14 @@ class Store:
                   max_uses INTEGER NOT NULL DEFAULT 1,
                   uses INTEGER NOT NULL DEFAULT 0,
                   expires_at TEXT,
-                  created TEXT NOT NULL
+                  created TEXT NOT NULL,
+                  package_id TEXT,
+                  label TEXT,
+                  agent_id TEXT,
+                  canary_label TEXT,
+                  canary_hits INTEGER NOT NULL DEFAULT 0,
+                  canary_last_hit TEXT,
+                  canary_last_ip TEXT
                 );
                 CREATE TABLE IF NOT EXISTS agents (
                   id TEXT PRIMARY KEY,
@@ -117,7 +140,8 @@ class Store:
                   jitter REAL NOT NULL DEFAULT 0.2,
                   status TEXT NOT NULL DEFAULT 'online',
                   last_seen TEXT,
-                  created TEXT NOT NULL
+                  created TEXT NOT NULL,
+                  package_id TEXT
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
                   id TEXT PRIMARY KEY,
@@ -151,11 +175,54 @@ class Store:
                   state TEXT NOT NULL DEFAULT 'planned',
                   evidence TEXT NOT NULL DEFAULT 'none',
                   notes TEXT,
+                  kind TEXT,
+                  role TEXT,
+                  last_probe_at TEXT,
+                  last_probe_vantage TEXT,
                   created TEXT NOT NULL,
                   updated TEXT NOT NULL
                 );
                 """
             )
+            # Migrate older DBs that predate package_id / canary / job columns
+            for table, cols in (
+                (
+                    "enroll_secrets",
+                    (
+                        "package_id",
+                        "label",
+                        "agent_id",
+                        "canary_label",
+                        "canary_hits",
+                        "canary_last_hit",
+                        "canary_last_ip",
+                    ),
+                ),
+                ("agents", ("package_id",)),
+                (
+                    "listeners",
+                    (
+                        "kind",
+                        "role",
+                        "last_probe_at",
+                        "last_probe_vantage",
+                    ),
+                ),
+            ):
+                existing = {
+                    str(r[1])
+                    for r in c.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for col in cols:
+                    if col not in existing:
+                        # INTEGER columns for hit counters when migrating
+                        if col == "canary_hits":
+                            c.execute(
+                                f"ALTER TABLE {table} ADD COLUMN {col} "
+                                "INTEGER NOT NULL DEFAULT 0"
+                            )
+                        else:
+                            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
             c.commit()
 
     def set_operator_token_hash(self, token_hash: str) -> None:
@@ -199,10 +266,31 @@ class Store:
             self._conn.commit()
 
     def mint_enroll_secret(
-        self, *, max_uses: int = 1, ttl_sec: int = 3600
+        self,
+        *,
+        max_uses: int = 1,
+        ttl_sec: int = 3600,
+        label: str | None = None,
+        package_id: str | None = None,
+        canary_label: str | None = None,
     ) -> dict[str, Any]:
+        """Mint a one-shot (or limited-use) enroll secret bound to a package_id.
+
+        package_id is stable identity for the *export package* (Sliver lesson:
+        per-binary / per-package identity — not a shared lab password).
+
+        canary_label is a public (non-secret) token for DNS/HTTP package canaries:
+        stolen/run packages hit GET /api/v1/canary/{label} without enroll auth.
+        """
         secret = secrets.token_urlsafe(24)
         sid = _new_id("enr")
+        pkg = (package_id or "").strip() or _new_id("pkg")
+        lab = (label or "").strip() or None
+        canary = (canary_label or "").strip().lower() or secrets.token_hex(8)
+        # DNS / path safe: hex only after mint; allow override if already safe
+        if not all(c in "0123456789abcdef" for c in canary) or len(canary) < 8:
+            canary = secrets.token_hex(8)
+        created = _utc_now()
         exp = None
         if ttl_sec > 0:
             exp_ts = time.time() + ttl_sec
@@ -211,24 +299,161 @@ class Store:
             ).isoformat().replace("+00:00", "Z")
         with self._lock:
             self._conn.execute(
-                "INSERT INTO enroll_secrets(id,secret_hash,max_uses,uses,expires_at,created) "
-                "VALUES(?,?,?,?,?,?)",
-                (sid, _hash_token(secret), max_uses, 0, exp, _utc_now()),
+                "INSERT INTO enroll_secrets(id,secret_hash,max_uses,uses,expires_at,"
+                "created,package_id,label,canary_label,canary_hits) "
+                "VALUES(?,?,?,?,?,?,?,?,?,0)",
+                (
+                    sid,
+                    _hash_token(secret),
+                    max_uses,
+                    0,
+                    exp,
+                    created,
+                    pkg,
+                    lab,
+                    canary,
+                ),
             )
             self._conn.commit()
         self.add_event(
             level="ok",
             channel="system",
-            message=f"enroll secret minted {sid} max_uses={max_uses}",
+            message=f"enroll package {pkg} secret {sid} canary={canary} max_uses={max_uses}",
         )
         return {
             "id": sid,
+            "package_id": pkg,
+            "label": lab,
+            "canary_label": canary,
             "secret": secret,
             "max_uses": max_uses,
             "expires_at": exp,
+            "created": created,
         }
 
-    def consume_enroll_secret(self, secret: str) -> bool:
+    def record_canary_hit(
+        self,
+        canary_label: str,
+        *,
+        remote_ip: str | None = None,
+        user_agent: str | None = None,
+        via: str = "http",
+    ) -> dict[str, Any] | None:
+        """Record a package canary fire. Returns package meta or None if unknown."""
+        label = (canary_label or "").strip().lower()
+        if not label or len(label) > 64:
+            return None
+        now = _utc_now()
+        ip = (remote_ip or "").strip()[:80] or None
+        ua = (user_agent or "").strip()[:200] or None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM enroll_secrets WHERE canary_label=? "
+                "ORDER BY created DESC",
+                (label,),
+            ).fetchone()
+            if not row:
+                # Unknown label — still log (scan / typo / old package)
+                self._conn.execute(
+                    "INSERT INTO events(ts,level,channel,message,agent_id,meta) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        now,
+                        "warn",
+                        "canary",
+                        f"canary unknown label={label} ip={ip or '?'}",
+                        None,
+                        json.dumps(
+                            {
+                                "canary_label": label,
+                                "remote_ip": ip,
+                                "user_agent": ua,
+                                "via": via,
+                                "known": False,
+                            }
+                        ),
+                    ),
+                )
+                self._conn.commit()
+                return None
+            self._conn.execute(
+                "UPDATE enroll_secrets SET canary_hits=canary_hits+1, "
+                "canary_last_hit=?, canary_last_ip=? WHERE id=?",
+                (now, ip, row["id"]),
+            )
+            hits = int(row["canary_hits"] or 0) + 1
+            pkg = row["package_id"] or ""
+            agent_id = row["agent_id"] or None
+            self._conn.execute(
+                "INSERT INTO events(ts,level,channel,message,agent_id,meta) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    now,
+                    "warn",
+                    "canary",
+                    f"canary hit package={pkg} label={label} hits={hits} "
+                    f"ip={ip or '?'} via={via}",
+                    agent_id,
+                    json.dumps(
+                        {
+                            "canary_label": label,
+                            "package_id": pkg,
+                            "export_id": row["id"],
+                            "hits": hits,
+                            "remote_ip": ip,
+                            "user_agent": ua,
+                            "via": via,
+                            "known": True,
+                            "agent_id": agent_id,
+                        }
+                    ),
+                ),
+            )
+            self._conn.commit()
+            return {
+                "package_id": pkg,
+                "export_id": row["id"],
+                "canary_label": label,
+                "hits": hits,
+                "agent_id": agent_id or "",
+                "last_hit": now,
+                "last_ip": ip or "",
+            }
+
+    def list_package_canaries(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Operator view: recent export packages with canary status (no secrets)."""
+        lim = max(1, min(int(limit), 200))
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, package_id, label, canary_label, canary_hits, "
+                "canary_last_hit, canary_last_ip, agent_id, created, expires_at, "
+                "uses, max_uses FROM enroll_secrets "
+                "WHERE canary_label IS NOT NULL AND canary_label != '' "
+                "ORDER BY created DESC LIMIT ?",
+                (lim,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "export_id": r["id"],
+                    "package_id": r["package_id"] or "",
+                    "label": r["label"] or "",
+                    "canary_label": r["canary_label"] or "",
+                    "canary_hits": int(r["canary_hits"] or 0),
+                    "canary_last_hit": r["canary_last_hit"] or "",
+                    "canary_last_ip": r["canary_last_ip"] or "",
+                    "agent_id": r["agent_id"] or "",
+                    "created": r["created"] or "",
+                    "expires_at": r["expires_at"] or "",
+                    "uses": int(r["uses"] or 0),
+                    "max_uses": int(r["max_uses"] or 1),
+                }
+            )
+        return out
+
+    def consume_enroll_secret(self, secret: str) -> dict[str, Any] | None:
+        """Validate secret and bump uses. Returns package row meta or None."""
         h = _hash_token(secret)
         now = _utc_now()
         with self._lock:
@@ -237,27 +462,43 @@ class Store:
                 (h,),
             ).fetchone()
             if not row:
-                return False
+                return None
             if row["expires_at"] and str(row["expires_at"]) < now:
-                return False
+                return None
             if int(row["uses"]) >= int(row["max_uses"]):
-                return False
+                return None
             self._conn.execute(
                 "UPDATE enroll_secrets SET uses=uses+1 WHERE id=?",
                 (row["id"],),
             )
             self._conn.commit()
-            return True
+            return {
+                "id": row["id"],
+                "package_id": row["package_id"] or "",
+                "label": row["label"] or "",
+                "canary_label": row["canary_label"] or "",
+            }
 
-    def enroll_agent(self, facts: dict[str, Any]) -> dict[str, Any]:
+    def bind_enroll_secret_agent(self, secret_id: str, agent_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE enroll_secrets SET agent_id=? WHERE id=?",
+                (agent_id, secret_id),
+            )
+            self._conn.commit()
+
+    def enroll_agent(
+        self, facts: dict[str, Any], *, package_id: str | None = None
+    ) -> dict[str, Any]:
         agent_id = _new_id("agt")
         token = secrets.token_urlsafe(32)
         now = _utc_now()
+        pkg = (package_id or facts.get("package_id") or "").strip() or None
         with self._lock:
             self._conn.execute(
                 "INSERT INTO agents(id,token_hash,hostname,username,os,arch,"
                 "external_ip,internal_ip,group_name,tags,sleep,jitter,status,"
-                "last_seen,created) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "last_seen,created,package_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     agent_id,
                     _hash_token(token),
@@ -274,18 +515,24 @@ class Store:
                     "online",
                     now,
                     now,
+                    pkg,
                 ),
             )
             self._conn.commit()
+        host = facts.get("hostname") or agent_id
+        msg = f"enrolled {host}"
+        if pkg:
+            msg += f" package={pkg}"
         self.add_event(
             level="ok",
             channel="agent",
-            message=f"enrolled {facts.get('hostname') or agent_id}",
+            message=msg,
             agent_id=agent_id,
         )
         return {
             "agent_id": agent_id,
             "agent_token": token,
+            "package_id": pkg,
             "sleep": float(facts.get("sleep") or DEFAULT_SLEEP),
             "jitter": float(facts.get("jitter") or DEFAULT_JITTER),
         }
@@ -378,10 +625,20 @@ class Store:
             ).fetchall()
         out: list[dict[str, Any]] = []
         qn = (q or "").lower().strip()
+        st_filter = (status or "").lower().strip()
         for r in rows:
             d = self._agent_dict(r)
-            if status and d["status"] != status:
-                continue
+            if st_filter:
+                cur = str(d.get("status") or "").lower()
+                # live = online|idle so desk filter does not thrash membership
+                if st_filter in ("live", "online"):
+                    if cur not in ("online", "idle"):
+                        continue
+                elif st_filter == "idle":
+                    if cur != "idle":
+                        continue
+                elif cur != st_filter:
+                    continue
             if qn:
                 hay = " ".join(
                     [
@@ -391,6 +648,7 @@ class Store:
                         d["os"],
                         d["external_ip"],
                         d["group"],
+                        str(d.get("package_id") or ""),
                     ]
                 ).lower()
                 if qn not in hay:
@@ -424,6 +682,30 @@ class Store:
                     status = "online"
             except ValueError:
                 pass
+        # package_id column may be missing on very old rows / partial migrations
+        try:
+            package_id = r["package_id"] or ""
+        except (IndexError, KeyError):
+            package_id = ""
+        sleep_f = float(r["sleep"] or DEFAULT_SLEEP)
+        # Presence mode (Sliver beacon vs session · Havoc sleep vs interact):
+        # interactive when sleep is in turbo band OR queued desktop/screenshot work.
+        presence = "async"
+        if status != "offline":
+            interactive_pending = False
+            try:
+                with self._lock:
+                    row_n = self._conn.execute(
+                        "SELECT COUNT(*) AS n FROM tasks WHERE agent_id=? AND status "
+                        "IN ('queued','assigned') AND type IN "
+                        "('screenshot','desktop_input','desktop_start','session_start')",
+                        (r["id"],),
+                    ).fetchone()
+                    interactive_pending = bool(row_n and int(row_n["n"] or 0) > 0)
+            except Exception:
+                interactive_pending = False
+            if interactive_pending or sleep_f <= max(INTERACTIVE_SLEEP * 2.5, 0.4):
+                presence = "interactive"
         return {
             "id": r["id"],
             "hostname": r["hostname"] or "",
@@ -436,7 +718,9 @@ class Store:
             "internal_ip": r["internal_ip"] or "",
             "group": r["group_name"] or "",
             "tags": tags if isinstance(tags, list) else [],
-            "sleep": float(r["sleep"] or DEFAULT_SLEEP),
+            "package_id": package_id,
+            "presence": presence,
+            "sleep": sleep_f,
             "jitter": float(r["jitter"] or DEFAULT_JITTER),
         }
 
@@ -448,23 +732,24 @@ class Store:
         payload: dict[str, Any],
         client_request_id: str | None = None,
     ) -> dict[str, Any]:
-        if client_request_id:
-            with self._lock:
+        tid = _new_id("tsk")
+        now = _utc_now()
+        with self._lock:
+            # Idempotency + insert must share one lock (TOCTOU under concurrent desk)
+            if client_request_id:
                 existing = self._conn.execute(
                     "SELECT * FROM tasks WHERE agent_id=? AND client_request_id=?",
                     (agent_id, client_request_id),
                 ).fetchone()
                 if existing:
                     return self._task_dict(existing)
-        tid = _new_id("tsk")
-        now = _utc_now()
-        with self._lock:
             # Live Control: only the newest screenshot matters — drop backlog so
             # desktop_input is not stuck behind a pile of obsolete frames.
             if type_ == "screenshot":
                 self._conn.execute(
                     "UPDATE tasks SET status='cancelled', updated=? "
-                    "WHERE agent_id=? AND type='screenshot' AND status='queued'",
+                    "WHERE agent_id=? AND type='screenshot' AND status IN "
+                    "('queued','assigned')",
                     (now, agent_id),
                 )
             self._conn.execute(
@@ -549,10 +834,30 @@ class Store:
                 return self._task_dict(row)
             if st not in ("queued", "assigned"):
                 raise ValueError(f"cannot cancel status={st}")
-            self._conn.execute(
-                "UPDATE tasks SET status='cancelled', updated=? WHERE id=?",
-                (now, task_id),
-            )
+            # Invalidate rekey secret so a late agent result cannot rotate tokens
+            if str(row["type"] or "") == "rekey":
+                try:
+                    pl = json.loads(row["payload"] or "{}")
+                except json.JSONDecodeError:
+                    pl = {}
+                if isinstance(pl, dict) and pl.get("new_token"):
+                    pl = dict(pl)
+                    pl.pop("new_token", None)
+                    pl["cancelled_before_apply"] = True
+                    self._conn.execute(
+                        "UPDATE tasks SET payload=?, status='cancelled', updated=? WHERE id=?",
+                        (json.dumps(pl), now, task_id),
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE tasks SET status='cancelled', updated=? WHERE id=?",
+                        (now, task_id),
+                    )
+            else:
+                self._conn.execute(
+                    "UPDATE tasks SET status='cancelled', updated=? WHERE id=?",
+                    (now, task_id),
+                )
             self._conn.commit()
             agent_id = row["agent_id"]
         self.add_event(
@@ -677,22 +982,39 @@ class Store:
             ).fetchone()
             if not row:
                 raise KeyError("task_not_found")
-            self._conn.execute(
-                "UPDATE tasks SET status=?, result=?, updated=? WHERE id=?",
-                (st, json.dumps(result), now, task_id),
-            )
-            # Apply rekey only after successful result (agent still used old token)
-            if st == "succeeded" and str(row["type"]) == "rekey":
+            cur = str(row["status"] or "")
+            # Late results must not un-cancel or rewrite terminal tasks
+            if cur in ("cancelled", "succeeded", "failed"):
+                return
+            if cur not in ("queued", "assigned"):
+                raise ValueError(f"cannot post result for status={cur}")
+            # Apply rekey only for still-assigned tasks (cancel race)
+            apply_rekey = st == "succeeded" and str(row["type"]) == "rekey"
+            new_token = ""
+            if apply_rekey:
                 try:
                     pl = json.loads(row["payload"] or "{}")
                 except json.JSONDecodeError:
                     pl = {}
                 new_token = str(pl.get("new_token") or "")
-                if new_token:
+                # Strip secret from stored payload after apply
+                if new_token and "new_token" in pl:
+                    pl = dict(pl)
+                    pl.pop("new_token", None)
+                    pl["rekeyed"] = True
                     self._conn.execute(
-                        "UPDATE agents SET token_hash=? WHERE id=?",
-                        (_hash_token(new_token), agent_id),
+                        "UPDATE tasks SET payload=? WHERE id=?",
+                        (json.dumps(pl), task_id),
                     )
+            self._conn.execute(
+                "UPDATE tasks SET status=?, result=?, updated=? WHERE id=?",
+                (st, json.dumps(result), now, task_id),
+            )
+            if apply_rekey and new_token:
+                self._conn.execute(
+                    "UPDATE agents SET token_hash=? WHERE id=?",
+                    (_hash_token(new_token), agent_id),
+                )
             self._conn.commit()
         self.add_event(
             level="ok" if st == "succeeded" else "error",
@@ -716,19 +1038,40 @@ class Store:
         return self._listener_dict(row) if row else None
 
     def _listener_dict(self, r: sqlite3.Row) -> dict[str, Any]:
+        keys = set(r.keys()) if hasattr(r, "keys") else set()
+
+        def col(name: str, default: str = "") -> str:
+            if name not in keys:
+                return default
+            try:
+                v = r[name]
+            except (IndexError, KeyError):
+                return default
+            return str(v) if v is not None else default
+
+        kind = col("kind") or "other"
+        if kind not in LISTENER_KINDS:
+            kind = "other"
         return {
             "id": r["id"],
-            "name": r["name"] or "",
-            "accept_host": r["accept_host"] or "",
-            "accept_port": r["accept_port"] or "",
-            "proto": r["proto"] or "",
-            "face": r["face"] or "",
-            "agent_id": r["agent_id"] or "",
-            "state": r["state"] or "planned",
-            "evidence": r["evidence"] or "none",
-            "notes": r["notes"] or "",
-            "created": r["created"],
-            "updated": r["updated"],
+            "name": col("name"),
+            "accept_host": col("accept_host"),
+            "accept_port": col("accept_port"),
+            "proto": col("proto"),
+            "face": col("face"),
+            "agent_id": col("agent_id"),
+            "state": col("state", "planned") or "planned",
+            "evidence": col("evidence", "none") or "none",
+            "notes": col("notes"),
+            "kind": kind,
+            "role": col("role"),
+            "last_probe_at": col("last_probe_at"),
+            "last_probe_vantage": col("last_probe_vantage"),
+            "created": col("created"),
+            "updated": col("updated"),
+            # Job-language aliases (Havoc: listener as operational job)
+            "job_id": r["id"],
+            "bind": f"{col('accept_host') or '?'}:{col('accept_port') or '?'}",
         }
 
     def upsert_listener(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -740,6 +1083,21 @@ class Store:
         evidence = str(body.get("evidence") or "none")
         if evidence not in LISTENER_EVIDENCE:
             evidence = "none"
+        kind = str(body.get("kind") or "other").strip().lower()
+        if kind not in LISTENER_KINDS:
+            # Infer from legacy proto when kind omitted
+            proto_l = str(body.get("proto") or "").lower()
+            if "tls" in proto_l or "443" in proto_l:
+                kind = "reverse_tls"
+            elif "tcp" in proto_l:
+                kind = "reverse_tcp"
+            elif "path" in proto_l or "mirage" in proto_l or "prr" in proto_l:
+                kind = "path_wrapped"
+            else:
+                kind = "other"
+        role = str(body.get("role") or "").strip()
+        last_probe_at = str(body.get("last_probe_at") or "").strip()
+        last_probe_vantage = str(body.get("last_probe_vantage") or "").strip()
         with self._lock:
             existing = self._conn.execute(
                 "SELECT id, created FROM listeners WHERE id=?", (lid,)
@@ -747,14 +1105,18 @@ class Store:
             created = existing["created"] if existing else now
             self._conn.execute(
                 "INSERT INTO listeners(id,name,accept_host,accept_port,proto,face,"
-                "agent_id,state,evidence,notes,created,updated) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                "agent_id,state,evidence,notes,kind,role,last_probe_at,"
+                "last_probe_vantage,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(id) DO UPDATE SET "
                 "name=excluded.name, accept_host=excluded.accept_host, "
                 "accept_port=excluded.accept_port, proto=excluded.proto, "
                 "face=excluded.face, agent_id=excluded.agent_id, "
                 "state=excluded.state, evidence=excluded.evidence, "
-                "notes=excluded.notes, updated=excluded.updated",
+                "notes=excluded.notes, kind=excluded.kind, role=excluded.role, "
+                "last_probe_at=excluded.last_probe_at, "
+                "last_probe_vantage=excluded.last_probe_vantage, "
+                "updated=excluded.updated",
                 (
                     lid,
                     str(body.get("name") or ""),
@@ -766,6 +1128,10 @@ class Store:
                     state,
                     evidence,
                     str(body.get("notes") or ""),
+                    kind,
+                    role,
+                    last_probe_at,
+                    last_probe_vantage,
                     created,
                     now,
                 ),
@@ -774,7 +1140,11 @@ class Store:
         self.add_event(
             level="info",
             channel="listener",
-            message=f"listener upsert {lid} state={state} evidence={evidence}",
+            message=(
+                f"listener job {lid} kind={kind} state={state} "
+                f"evidence={evidence} bind="
+                f"{body.get('accept_host') or '?'}:{body.get('accept_port') or '?'}"
+            ),
         )
         return self.get_listener(lid) or {}
 
@@ -816,6 +1186,7 @@ class Store:
                     meta = None
             out.append(
                 {
+                    "id": r["id"],
                     "ts": r["ts"],
                     "level": r["level"],
                     "channel": r["channel"],
@@ -876,6 +1247,8 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     length = int(handler.headers.get("Content-Length") or "0")
     if length <= 0:
         return {}
+    if length > MAX_BODY_BYTES:
+        raise ValueError(f"body too large ({length} > {MAX_BODY_BYTES})")
     raw = handler.rfile.read(length)
     if not raw:
         return {}
@@ -934,12 +1307,54 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
+            # Package canary — open (no auth). Fired by agent on first start;
+            # operator watches events channel=canary or GET …/operator/canaries.
+            if path.startswith("/api/v1/canary/"):
+                label = path[len("/api/v1/canary/") :].strip().strip("/")
+                if method in ("GET", "POST", "HEAD") and label:
+                    # Prefer reverse-proxy client IP when present
+                    xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                    remote = xff or (self.client_address[0] if self.client_address else "")
+                    ua = self.headers.get("User-Agent") or ""
+                    # Drain body on POST so clients don't hang
+                    if method == "POST":
+                        try:
+                            _read_json(self)
+                        except Exception:
+                            pass
+                    hit = store.record_canary_hit(
+                        label,
+                        remote_ip=remote or None,
+                        user_agent=ua or None,
+                        via="http",
+                    )
+                    if method == "HEAD":
+                        self.send_response(204 if hit else 404)
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        return
+                    # Always 204 for known; 404 for unknown (don't help scanners map)
+                    if hit:
+                        _json_response(
+                            self,
+                            200,
+                            {"ok": True, "canary_label": label},
+                        )
+                    else:
+                        _err(self, 404, "not_found", "unknown canary")
+                    return
+                _err(self, 404, "not_found", "canary label required")
+                return
+
             # Agent implant routes — exact /api/v1/agent/… (not /agents)
             if path.startswith("/api/v1/agent/"):
                 if method == "POST" and path == "/api/v1/agent/enroll":
                     body = _read_json(self)
                     secret = str(body.get("enroll_secret") or "").strip()
-                    if not secret or not store.consume_enroll_secret(secret):
+                    consumed = (
+                        store.consume_enroll_secret(secret) if secret else None
+                    )
+                    if not secret or not consumed:
                         _err(self, 403, "forbidden", "invalid enroll secret")
                         return
                     facts = {
@@ -955,9 +1370,21 @@ class Handler(BaseHTTPRequestHandler):
                             "tags",
                             "sleep",
                             "jitter",
+                            "package_id",
                         )
                     }
-                    out = store.enroll_agent(facts)
+                    # Prefer plane-bound package_id from the secret over client claim
+                    pkg = str(consumed.get("package_id") or "").strip()
+                    if pkg:
+                        facts["package_id"] = pkg
+                    out = store.enroll_agent(facts, package_id=pkg or None)
+                    try:
+                        store.bind_enroll_secret_agent(
+                            str(consumed.get("id") or ""),
+                            str(out.get("agent_id") or ""),
+                        )
+                    except Exception:
+                        pass
                     _json_response(self, 201, out)
                     return
 
@@ -1031,7 +1458,9 @@ class Handler(BaseHTTPRequestHandler):
             # Operator routes (/api/v1/agents, tasks, events, enroll-secrets)
             if path.startswith("/api/v1/"):
                 tok = _bearer(self)
-                if not tok or _hash_token(tok) != store.operator_token_hash():
+                want = store.operator_token_hash() or ""
+                got = _hash_token(tok) if tok else ""
+                if not tok or not want or not hmac.compare_digest(got, want):
                     _err(self, 401, "unauthorized", "invalid operator token")
                     return
 
@@ -1142,14 +1571,94 @@ class Handler(BaseHTTPRequestHandler):
                     _json_response(self, 200, {"events": events})
                     return
 
+                # T5 live events — Server-Sent Events (long-lived; poll fallback on desk)
+                if method == "GET" and path == "/api/v1/events/stream":
+                    since = (qs.get("since") or [None])[0]
+                    # Optional max lifetime so lab threads do not stick forever
+                    try:
+                        max_sec = int((qs.get("max_sec") or ["0"])[0])
+                    except ValueError:
+                        max_sec = 0
+                    max_sec = max(0, min(max_sec, 3600)) if max_sec else 0
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache, no-transform")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    cursor = (since or "").strip() or None
+                    started = time.time()
+                    last_hb = started
+                    try:
+                        # Hello — lets clients confirm stream is up
+                        hello = json.dumps(
+                            {
+                                "ok": True,
+                                "stream": "events",
+                                "version": VERSION,
+                                "time": _utc_now(),
+                            }
+                        )
+                        self.wfile.write(f"event: hello\ndata: {hello}\n\n".encode())
+                        self.wfile.flush()
+                        while True:
+                            if max_sec and (time.time() - started) >= max_sec:
+                                bye = json.dumps({"ok": True, "reason": "max_sec"})
+                                self.wfile.write(
+                                    f"event: bye\ndata: {bye}\n\n".encode()
+                                )
+                                self.wfile.flush()
+                                break
+                            batch = store.list_events(
+                                since=cursor, limit=50
+                            )
+                            for ev in batch:
+                                raw = json.dumps(ev, separators=(",", ":"))
+                                eid = ev.get("id")
+                                line = (
+                                    (f"id: {eid}\n" if eid is not None else "")
+                                    + f"event: plane\ndata: {raw}\n\n"
+                                )
+                                self.wfile.write(line.encode("utf-8"))
+                                ts = str(ev.get("ts") or "")
+                                if ts:
+                                    cursor = ts
+                            if batch:
+                                self.wfile.flush()
+                            # Heartbeat comment keeps proxies from idle-closing
+                            now = time.time()
+                            if now - last_hb >= 12.0:
+                                self.wfile.write(b": ping\n\n")
+                                self.wfile.flush()
+                                last_hb = now
+                            time.sleep(0.75)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    return
+
                 if method == "POST" and path == "/api/v1/operator/enroll-secrets":
                     body = _read_json(self)
                     max_uses = int(body.get("max_uses") or 1)
                     ttl = int(body.get("ttl_sec") or 3600)
+                    label = body.get("label")
+                    package_id = body.get("package_id")
+                    canary_label = body.get("canary_label")
                     minted = store.mint_enroll_secret(
-                        max_uses=max(1, max_uses), ttl_sec=max(0, ttl)
+                        max_uses=max(1, max_uses),
+                        ttl_sec=max(0, ttl),
+                        label=str(label).strip() if label else None,
+                        package_id=str(package_id).strip() if package_id else None,
+                        canary_label=(
+                            str(canary_label).strip() if canary_label else None
+                        ),
                     )
                     _json_response(self, 201, minted)
+                    return
+
+                if method == "GET" and path == "/api/v1/operator/canaries":
+                    limit = int((qs.get("limit") or ["50"])[0])
+                    rows = store.list_package_canaries(limit=max(1, min(limit, 200)))
+                    _json_response(self, 200, {"canaries": rows})
                     return
 
                 # Listeners (plane-managed battlements)

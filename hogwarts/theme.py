@@ -38,6 +38,19 @@ HOGWARTS_CSS = """
   color: #c9b27a;
   font-size: 0.82rem;
 }
+/* Sticky policy strip — not dismissible; shown when Reach allows clearnet Operate */
+.hogwarts-policy-warn {
+  background-color: #3d3210;
+  border-bottom: 1px solid #c9a227;
+  padding: 8px 14px;
+  min-height: 0;
+}
+.hogwarts-policy-warn-label {
+  color: #f0d878;
+  font-size: 0.84rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
 .hogwarts-split {
   min-height: 0;
 }
@@ -120,6 +133,25 @@ HOGWARTS_CSS = """
 }
 .hogwarts-dot-off {
   background-color: #e86a6a;
+}
+/* Presence mode chips — async (beacon) vs interactive (session-class) */
+.hogwarts-presence {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 6px;
+  min-width: 0;
+}
+.hogwarts-presence-async {
+  color: #8a9ab0;
+  background-color: #1a2030;
+  border: 1px solid #2a3548;
+}
+.hogwarts-presence-interactive {
+  color: #9ec5f0;
+  background-color: #152030;
+  border: 1px solid #3a5a88;
 }
 .hogwarts-card {
   background-color: #161616;
@@ -234,7 +266,9 @@ HOGWARTS_CSS = """
   /* Own the hit target — children are can_target=false in code */
   outline: none;
 }
-.hogwarts-fleet-btn:hover {
+/* :hover + explicit hogwarts-fleet-btn-hover (EventControllerMotion fallback) */
+.hogwarts-fleet-btn:hover,
+.hogwarts-fleet-btn-hover {
   background-color: #2a2a34;
   border-color: #5b8def;
 }
@@ -249,13 +283,16 @@ HOGWARTS_CSS = """
   background-color: #1e2a3c;
   border-color: #5b8def;
 }
-.hogwarts-fleet-btn-selected:hover {
+.hogwarts-fleet-btn-selected:hover,
+.hogwarts-fleet-btn-selected.hogwarts-fleet-btn-hover {
   background-color: #243348;
   border-color: #6a9af5;
 }
 /* Keep hover visible even if a child label briefly invalidates */
 .hogwarts-fleet-btn:hover .hogwarts-agent-host,
-.hogwarts-fleet-btn:hover .hogwarts-agent-meta {
+.hogwarts-fleet-btn:hover .hogwarts-agent-meta,
+.hogwarts-fleet-btn-hover .hogwarts-agent-host,
+.hogwarts-fleet-btn-hover .hogwarts-agent-meta {
   color: #ffffff;
 }
 .hogwarts-fleet-btn-selected .hogwarts-agent-host {
@@ -290,6 +327,30 @@ HOGWARTS_CSS = """
   padding: 4px 0 8px 0;
   border-bottom: 1px solid #222;
 }
+/* Opening an agent must not paint the whole detail surface as focused/selected */
+.hogwarts-agents-detail:focus,
+.hogwarts-agents-detail:focus-within {
+  outline: none;
+  box-shadow: none;
+}
+.hogwarts-agents-detail .hogwarts-card:focus,
+.hogwarts-agents-detail .hogwarts-card:focus-within {
+  outline: none;
+  border-color: #262626;
+  box-shadow: none;
+}
+.hogwarts-agents-detail label selection,
+.hogwarts-agent-meta selection {
+  background-color: transparent;
+  color: inherit;
+}
+.hogwarts-tab:focus {
+  outline: none;
+  box-shadow: none;
+}
+.hogwarts-tab:focus-visible {
+  border-color: #5b8def;
+}
 .hogwarts-tab-bar {
   padding: 2px 0;
 }
@@ -309,6 +370,36 @@ HOGWARTS_CSS = """
   background-color: #1c1c22;
   color: #f0f0f0;
   border-color: #333;
+}
+/* Files/Desktop tab when work window is open */
+.hogwarts-tab-active-win {
+  color: #a8c4f0;
+}
+.hogwarts-tab-active-win:checked {
+  border-color: #3d5a80;
+}
+.hogwarts-quick-actions {
+  margin-left: 4px;
+}
+.hogwarts-quick-btn {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 0.82rem;
+  color: #a0a0a8;
+}
+.hogwarts-quick-btn:hover {
+  color: #e8e8ec;
+  background-color: #1a1a20;
+}
+.hogwarts-facts-expander {
+  margin: 0 0 2px 0;
+}
+.hogwarts-facts-expander > label {
+  font-size: 0.8rem;
+  color: #8a8a92;
+}
+.hogwarts-action-strip {
+  flex-wrap: wrap;
 }
 .hogwarts-remote-row {
   border-radius: 6px;
@@ -335,10 +426,10 @@ HOGWARTS_CSS = """
   padding: 2px 6px;
 }
 .hogwarts-launch-card {
-  padding: 18px 20px;
+  padding: 14px 16px;
 }
 .hogwarts-launch-title {
-  font-size: 1.15rem;
+  font-size: 1.05rem;
   font-weight: 700;
   color: #f0f0f0;
 }

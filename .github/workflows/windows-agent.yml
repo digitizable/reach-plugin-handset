@@ -1,0 +1,50 @@
+# Build hogwarts-agent.exe on windows-latest (PyInstaller).
+# Trigger: manual or push touching agent/**
+name: Windows agent
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "agent/**"
+      - ".github/workflows/windows-agent.yml"
+      - "scripts/build-windows-agent.sh"
+  pull_request:
+    paths:
+      - "agent/**"
+      - ".github/workflows/windows-agent.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build one-file agent
+        run: |
+          python -m PyInstaller `
+            --onefile --clean --noconfirm `
+            --name hogwarts-agent `
+            --distpath dist/agent-windows `
+            --workpath dist/agent-windows/build `
+            --specpath dist/agent-windows `
+            agent/agent.py
+
+      - name: Smoke --help
+        run: |
+          ./dist/agent-windows/hogwarts-agent.exe --help
+        continue-on-error: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hogwarts-agent-windows
+          path: dist/agent-windows/hogwarts-agent.exe
+          if-no-files-found: error
