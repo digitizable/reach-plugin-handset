@@ -736,8 +736,8 @@ class RemoteDesktopViewer(Gtk.Window):
             now = _time.monotonic()
             ks = self._keepstream
             ks_up = bool(ks is not None and getattr(ks, "connected", False))
-            # ~60 Hz is enough for hover; 120 Hz flooded the host and jittered
-            min_dt = 0.016 if ks_up else 0.04
+            # ~45 Hz + larger deadzone — host SetCursorPos thrash = jitter
+            min_dt = 0.022 if ks_up else 0.04
             if now - self._last_move_flush < min_dt:
                 return
 
@@ -746,10 +746,13 @@ class RemoteDesktopViewer(Gtk.Window):
             if frac is None:
                 return
             fx, fy = frac
-            # Deadzone: ignore sub-pixel noise (~½ px at 1920 / 1 px at 960)
+            # Quantize to ~2px grid on a 1920-wide screen to stop flip-flop
+            q = 0.0012
+            fx = round(fx / q) * q
+            fy = round(fy / q) * q
             prev = self._last_sent_frac
             if prev is not None:
-                if abs(fx - prev[0]) < 0.0007 and abs(fy - prev[1]) < 0.0007:
+                if abs(fx - prev[0]) < q and abs(fy - prev[1]) < q:
                     return
             self._last_move_flush = now
             self._last_sent_frac = (fx, fy)
@@ -1230,28 +1233,20 @@ class RemoteDesktopViewer(Gtk.Window):
                 pass
             self._capturing = False
             self._current_path = None
-            # Prefer Texture paint when available (less work than set_pixbuf path)
-            try:
-                if self._zoom_mode is None:
-                    self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
-                    self.picture.set_can_shrink(True)
-                    tex = Gdk.Texture.new_for_pixbuf(pb)
-                    self.picture.set_paintable(tex)
-                    self._stream_texture = tex  # keep ref
-                else:
-                    self._render()
-            except Exception:
-                self._render()
+            # Stable pixbuf paint only — Texture path caused cursor flicker/"film"
+            self._render()
             # Throttle chrome hard — status/title updates steal frames
             import time as _time
 
             now = _time.monotonic()
             last = float(getattr(self, "_stream_chrome_ts", 0.0) or 0.0)
-            # Session: update status ~1/s so paint stays on the stream
             if now - last >= 1.0:
                 self._stream_chrome_ts = now
-                self._set_status(self._note, ok=ok)
-                self._update_meta()
+                # Don't rewrite status every second if it would flash over mode hints
+                try:
+                    self._update_meta()
+                except Exception:
+                    pass
                 if now - float(getattr(self, "_stream_title_ts", 0.0) or 0.0) >= 3.0:
                     self._stream_title_ts = now
                     self.set_title(
@@ -1409,9 +1404,14 @@ class RemoteDesktopViewer(Gtk.Window):
             self._set_default_pointer(w)
 
     def on_keepstream_up(self) -> None:
-        """Called when HELLO_OK lands — stream only; Control still required for input."""
+        """HELLO_OK: stream is live; stay view-only unless user already chose Control."""
+        try:
+            self.empty_lab.set_visible(False)
+        except Exception:
+            pass
         self._main_stack.set_visible_child_name("view")
         self._apply_session_cursor()
+        # Never auto-enter Control — only report status
         if self._mode == "control":
             self._set_status(
                 "Keepstream up — Control active (mouse/keys → host)",
@@ -1419,19 +1419,27 @@ class RemoteDesktopViewer(Gtk.Window):
             )
         else:
             self._set_status(
-                "Keepstream up — stream only · click 2 · Control to inject input",
+                "Keepstream up — watching only · press 2 · Control to inject",
                 ok=True,
             )
-        # Refresh mode hint without forcing Control
         try:
-            self._set_mode(self._mode)
+            # Refresh hints without changing mode (do not set_active here)
+            if self._mode == "session":
+                self.mode_hint.set_text(
+                    "Session (Keepstream): watching only · "
+                    "press 2 · Control for mouse/keyboard"
+                )
+            elif self._mode == "view":
+                self.mode_hint.set_text(
+                    "View + Keepstream: watching · 2 · Control to inject"
+                )
         except Exception:
             pass
 
     def attach_keepstream(self, client: Any) -> None:
-        """Attach Keepstream client for stream frames (input only in Control)."""
+        """Attach Keepstream for frames only — never force Control mode."""
         self._keepstream = client
-        # Do NOT grab_focus — that stole the window for typing without Control
+        self._last_sent_frac = None  # reset move deadzone
         # Pre-seed local_cursor from profile BEFORE HELLO
         try:
             if self.current_session_profile() in ("gaming", "gaming-lan"):
@@ -1449,30 +1457,25 @@ class RemoteDesktopViewer(Gtk.Window):
             self._session_local_cursor = True
         self.live_badge.set_text("SESSION")
         self.live_badge.add_css_class("rdv-badge-live")
-        # Show stream surface (leave mode as-is if user already chose View/Control)
-        self._main_stack.set_visible_child_name("view")
-        # Prefer Session tab for stream status, but never auto-enable Control
-        if self._mode not in ("control", "view", "session"):
-            self._mode = "session"
-        if self._mode == "session" or not (
-            self._mode_view.get_active()
-            or self._mode_control.get_active()
-            or self._mode_session.get_active()
-        ):
-            if not self._mode_session.get_active():
-                self._mode_session.set_active(True)
-            else:
-                self._set_mode("session")
+        try:
+            self.empty_lab.set_visible(False)
+        except Exception:
+            pass
+        # Force Session (view-only) — deactivates Control via radio group so
+        # connecting never "takes over" with inject/focus steal.
+        self._mode = "session"
+        if not self._mode_session.get_active():
+            self._mode_session.set_active(True)
         else:
-            # Stay on View or Control — only re-apply current mode chrome
-            self._set_mode(self._mode)
+            self._set_mode("session")
+        # Stream surface (setup form hidden while watching)
         self._main_stack.set_visible_child_name("view")
         self._apply_session_cursor()
-        # Stop task-poll Live — Keepstream owns frames now
+        # Stop Live poll — Keepstream owns frames
         if self.btn_live.get_active() and self._on_live:
             self.btn_live.set_active(False)
         self._set_status(
-            "Keepstream stream live — view only · click 2 · Control to use mouse/keys",
+            "Keepstream watching only · press 2 · Control to use mouse/keys",
             ok=True,
         )
 
@@ -2327,12 +2330,12 @@ class RemoteDesktopViewer(Gtk.Window):
         opts["profile"] = prof
         side = self.current_max_side()
         if prof == "gaming-lan":
-            # Buttery LAN: NVENC @ 60 when available (auto), else lean MJPEG.
-            # 1440 + quality 82 sustains smooth UI better than 1600@88 MJPEG.
-            opts["max_side"] = min(max(int(side), 1280), 1440)
+            # MJPEG = no H.264 color film; pure UDP; host cursor off.
+            # 1280@60 q80 sustains smooth motion without encode thrash.
+            opts["max_side"] = min(max(int(side), 960), 1280)
             opts["fps"] = 60
-            opts["quality"] = 82
-            opts["codec"] = "auto"  # NVENC first → MJPEG fallback
+            opts["quality"] = 80
+            opts["codec"] = "jpeg"
             opts["local_cursor"] = True
             opts["draw_mouse"] = False
             opts["transport"] = "udp"

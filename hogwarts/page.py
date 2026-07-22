@@ -2348,13 +2348,13 @@ class HogwartsPage(Gtk.Box):
                         fps = 45.0  # balanced — smooth UI animations
                 except (TypeError, ValueError):
                     fps = 60.0 if profile in ("gaming", "gaming-lan") else 45.0
-                # Honor explicit codec from Session profile (gaming-lan: auto)
+                # Honor explicit codec from Session profile
                 if start_opts.get("codec"):
                     c2 = str(start_opts.get("codec") or "").strip().lower()
                     if c2 in ("jpeg", "h264", "auto"):
                         codec = c2
                 elif profile == "gaming-lan":
-                    codec = "auto"  # NVENC for buttery 60; MJPEG if no GPU
+                    codec = "jpeg"  # avoid H.264 color "film" on LAN path
                 try:
                     quality = int(start_opts.get("quality") or 72)
                 except (TypeError, ValueError):

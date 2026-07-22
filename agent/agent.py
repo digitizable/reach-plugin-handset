@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     from keepstream.server import session_stop as _ks_session_stop
 
 
-VERSION = "0.5.53-lab"
+VERSION = "0.5.54-lab"
 # Keepstream VIDEO codec byte (matches research keepstream-v0)
 _KS_CODEC_JPEG = 1
 _KS_CODEC_H264 = 2
@@ -2303,34 +2303,20 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                 send_wheel(1 if delta > 0 else -1)
             return
         if typ == "move" and xy:
-            # One API only — SendInput ABSOLUTE + SetCursorPos together
-            # causes visible cursor jitter (double step / fight).
-            user32.SetCursorPos(int(xy[0]), int(xy[1]))
-            return
-        if typ in ("click", "dblclick", "down", "up") and xy:
-            # Place cursor once, then button flags without a second absolute move
-            user32.SetCursorPos(int(xy[0]), int(xy[1]))
-            btn = str(ev.get("button") or "left").lower()
-            if btn == "right":
-                down_flag, up_flag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
-            elif btn == "middle":
-                down_flag, up_flag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
-            else:
-                down_flag, up_flag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
-            if typ == "down":
-                send_mouse(down_flag)
-            elif typ == "up":
-                send_mouse(up_flag)
-            elif typ == "dblclick":
-                for _ in range(2):
-                    send_mouse(down_flag)
-                    send_mouse(up_flag)
-            else:
-                send_mouse(down_flag)
-                send_mouse(up_flag)
+            # Pixel-quantize + SetCursorPos only (no SendInput ABSOLUTE).
+            x0, y0 = int(xy[0]), int(xy[1])
+            # Skip no-op moves (deadzone on host side too)
+            last = getattr(win_input, "_last_pos", None)
+            if last is not None and last[0] == x0 and last[1] == y0:
+                return
+            win_input._last_pos = (x0, y0)  # type: ignore[attr-defined]
+            user32.SetCursorPos(x0, y0)
             return
         if typ in ("click", "dblclick", "down", "up"):
-            # No coords — click at current position
+            if xy:
+                x0, y0 = int(xy[0]), int(xy[1])
+                user32.SetCursorPos(x0, y0)
+                win_input._last_pos = (x0, y0)  # type: ignore[attr-defined]
             btn = str(ev.get("button") or "left").lower()
             if btn == "right":
                 down_flag, up_flag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
