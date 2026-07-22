@@ -1312,41 +1312,57 @@ class RemoteDesktopViewer(Gtk.Window):
         except Exception:
             pass
 
+    def _stream_cursor_widgets(self) -> list[Any]:
+        """Only the video surface — never the window chrome (Session/ribbon)."""
+        out: list[Any] = [
+            self.picture,
+            getattr(self, "_stream_overlay", None),
+        ]
+        # Scroll child is the frame; include scroll so letterbox area still has cursor
+        sc = getattr(self, "_scroll", None)
+        if sc is not None:
+            out.append(sc)
+        return out
+
+    def _chrome_cursor_default(self) -> None:
+        """Ensure toolbar / mode / window use the normal OS pointer."""
+        # Critical: never leave set_cursor(none) on the Gtk.Window — that made
+        # Session / ribbon unreachable (cursor vanished outside the viewport).
+        for w in (self,):
+            try:
+                w.set_cursor(None)  # inherit / default
+            except Exception:
+                try:
+                    w.set_cursor_from_name("default")
+                except Exception:
+                    pass
+
     def _apply_session_cursor(self) -> None:
-        """Parsec-class pointer: texture OS cursor (preferred) or transparent DA.
+        """Local pointer over the stream only; normal cursor on all UI chrome.
 
         Never full-frame composite (FPS killer + white/black box artifact).
+        Never hide the cursor on the whole window (blocks Session button etc.).
         """
         local = self._wants_local_cursor()
         self._overlay_cursor_on = bool(local)
         da = getattr(self, "_cursor_da", None)
+        stream = self._stream_cursor_widgets()
+
+        # Always restore default on the window itself first
+        self._chrome_cursor_default()
 
         # Build custom arrow cursor once
         if local and self._texture_cursor is None:
             self._texture_cursor = self._build_arrow_texture_cursor()
             self._use_texture_cursor = self._texture_cursor is not None
 
-        parent = None
-        try:
-            parent = self.picture.get_parent()
-        except Exception:
-            parent = None
-        widgets = [
-            self.picture,
-            getattr(self, "_stream_overlay", None),
-            getattr(self, "_scroll", None),
-            parent,
-            self,
-        ]
-
         if local and self._use_texture_cursor and self._texture_cursor is not None:
-            # Real cursor from texture — no overlay widget, no frame thrash
             if da is not None:
                 try:
                     da.set_visible(False)
                 except Exception:
                     pass
-            for w in widgets:
+            for w in stream:
                 if w is None:
                     continue
                 try:
@@ -1355,14 +1371,14 @@ class RemoteDesktopViewer(Gtk.Window):
                     pass
             return
 
-        # Fallback: transparent DrawingArea arrow
+        # Fallback: transparent DrawingArea arrow over stream only
         if da is not None:
             try:
                 da.set_visible(bool(local))
             except Exception:
                 pass
         if local:
-            for w in widgets:
+            for w in stream:
                 if w is None:
                     continue
                 try:
@@ -1384,7 +1400,7 @@ class RemoteDesktopViewer(Gtk.Window):
                     da.set_visible(False)
                 except Exception:
                     pass
-            for w in widgets:
+            for w in stream:
                 if w is None:
                     continue
                 try:
