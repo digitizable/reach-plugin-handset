@@ -38,9 +38,23 @@ Scripts are **ASCII-only** (avoid en-dashes in comments on WinPS 5.1).
 }
 ```
 
-Requires agent **≥ 0.5.31-lab** (CreateFileW duplex + byte mode; helper server is **In**-only so HELLO write does not hang). Older agents: CPython `open()` ENOENT, or write-only CreateFile hang vs InOut PS servers.
+Requires agent **≥ 0.5.32-lab** for best native `kind=pipe` (CreateFile **WRITE then R|W**). Helper server is **In**-only.
 
-**Supported fallback:** `kind=exec` + a small bridge that uses .NET `NamedPipeClientStream` is fine if native pipe misbehaves on a host.
+**Supported / recommended on flaky hosts:** `kind=exec` + `pipe-bridge.ps1` (.NET `NamedPipeClientStream` forwarder) — proven green on DESKTOP-50LV16L while native pipe was unstable:
+
+```json
+"input_provider": {
+  "enabled": true,
+  "kind": "exec",
+  "command": "powershell.exe",
+  "args": [
+    "-NoProfile", "-ExecutionPolicy", "Bypass",
+    "-File", "C:\\HogwartsInputProvider\\pipe-bridge.ps1"
+  ]
+}
+```
+
+Helper process must still be listening on `\\.\pipe\hogwarts-input`.
 
 Or Remote Viewer → Session → **Use provider** / **Default pipe**.
 
