@@ -1,33 +1,51 @@
 # Hogwarts
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/digitizable/reach-plugin-hogwarts/main/hogwarts.png?v=stars" alt="Hogwarts" width="128" height="128"/>
+  <img src="https://raw.githubusercontent.com/digitizable/reach-plugin-hogwarts/main/hogwarts.png?v=3" alt="Hogwarts" width="128"/>
 </p>
 
-<p align="center">
-  <strong>C2 for Reach</strong> — a well-defended operator desk.<br/>
-  Named for the castle: halls for ops, walls for the keep.
-</p>
+**Hogwarts** is an optional [Reach](https://github.com/digitizable/reach) plugin for **command-and-control** work: agent tasking, control-plane configuration, listeners, egress checks, and operator playbooks.
 
-<p align="center">
-  channel · agents · plane · reverse · egress · playbooks
-</p>
-
-**Hogwarts** is the command-and-control plugin for [Reach](https://github.com/digitizable/reach): path-aware channel status, implant roster against your control plane, reverse listener notes, egress probing (direct vs SOCKS path), interactive console, and session playbooks.
+It does not replace Reach’s path engine ([Spectre](https://github.com/digitizable/spectre)). Hogwarts talks to a **control plane** you host; the desk UI runs inside Reach.
 
 > Unofficial name. Not affiliated with Warner Bros., J.K. Rowling, or the Harry Potter franchise.
 
+**Requires Reach ≥ 0.5** · Plugin id `com.digitizable.hogwarts` · Version 0.5.44
+
+---
+
+## What it is
+
+| Part | Role |
+|------|------|
+| **Reach plugin UI** | GTK pages under Operate (channel, agents, plane, …) |
+| **Plane client** | HTTPS (or localhost) operator API — see [CONTRACT.md](hogwarts/backend/CONTRACT.md) |
+| **Lab plane** | Optional stdlib mock control plane for development (`plane/server.py`) |
+| **Reference agent** | Optional enroll/check-in agent for labs (`agent/agent.py`) |
+
+Hogwarts does **not** embed a production implant server. Point **Plane** at your API and store connection settings under:
+
+```text
+~/.local/share/reach/plugin-data/com__digitizable__hogwarts/plane.json
+```
+
+### Path requirement
+
+By default Reach requires an **active path** (Connect) before opening Operate plugins, including Hogwarts. That reduces clearnet exposure of agent traffic. Override only via **Reach → Settings → Privacy** (confirmation required).
+
+---
+
 ## Install
 
-In Reach → **Plugins** marketplace:
+In Reach: **Operate → Plugins** (marketplace):
 
 ```text
 digitizable/reach-plugin-hogwarts
 ```
 
-Requires Reach ≥ 0.5.
+Enable **Operate** under **Settings → Plugins** if the marketplace rail is hidden.
 
-### Local dev
+### Local development
 
 ```bash
 rsync -a --delete \
@@ -35,81 +53,84 @@ rsync -a --delete \
   ./ ~/.local/share/reach/plugins/com__digitizable__hogwarts/
 ```
 
-Restart Reach after changes.
+Restart Reach after syncing.
 
-## Features
+---
 
-| Panel | What |
-|-------|------|
-| **Channel** | Live path hero, SOCKS / hops / fingerprint / plane |
-| **Agents** | Tasking + shell/FS; **Remote Viewer** window for screenshot / Live / Control |
-| **Agent (lab)** | Stable loop, spool, multi-URL; screenshot + optional x11vnc session |
-| **Listener** | CRUD + evidence LED + TCP probe + plane pull/push |
-| **Egress** | TCP matrix direct vs path SOCKS |
-| **Console** | Ops shell; `pull` / auto-poll; `task …` |
-| **Plane** | Control-plane URL + token + poll interval + health + **Start plane** (local lab) |
-| **Ops kit** | Playbook fields, drills, **export agent zip** (runners + optional PyInstaller) |
+## UI panels
+
+| Panel | Purpose |
+|-------|---------|
+| **Channel** | Path status, SOCKS, hops, plane summary |
+| **Agents** | Roster, tasking, shell/FS; remote viewer for screenshot / live / control |
+| **Listener** | Listener records, probes, plane sync |
+| **Egress** | Connectivity matrix (direct vs path SOCKS) |
+| **Console** | Operator shell and task helpers |
+| **Plane** | Control-plane URL, token, poll interval, health; start local lab plane |
+| **Ops kit** | Playbooks, drills, agent package export |
 | **Session log** | Local activity trail |
 
-## Control plane
+---
 
-Hogwarts does **not** host implants. Point **Plane** at your API — see [hogwarts/backend/CONTRACT.md](hogwarts/backend/CONTRACT.md).
+## Control plane (lab)
 
-```text
-~/.local/share/reach/plugin-data/com__digitizable__hogwarts/plane.json
-```
-
-### Lab plane + agent (stdlib)
+For development only (`PLANE_OPERATOR_TOKEN=dev` is a lab default, not for production):
 
 ```bash
-# terminal 1 — mock plane (T1–T4 + agent routes)
+# terminal 1 — mock plane
 PLANE_OPERATOR_TOKEN=dev PLANE_HTTP_ADDR=127.0.0.1:8080 python3 plane/server.py
 
 # mint enroll secret
 curl -s -X POST http://127.0.0.1:8080/api/v1/operator/enroll-secrets \
   -H "Authorization: Bearer dev" -H "Content-Type: application/json" \
-  -d '{"max_uses":1}' 
+  -d '{"max_uses":1}'
 
-# terminal 2 — reference agent
-python3 agent/agent.py once -c agent.json   # after writing enroll_secret into agent.json
+# terminal 2 — reference agent (after writing enroll_secret into agent.json)
+python3 agent/agent.py once -c agent.json
 ```
 
-Hogwarts **Plane** panel: `http://127.0.0.1:8080` · token `dev` · then **Agents** → shell.
+In Hogwarts **Plane**: base URL `http://127.0.0.1:8080`, token `dev`, then use **Agents**.
 
-### Personal lab (desk config + multi mock agents)
+### Lab helpers
 
 ```bash
-bash lab/personal_setup.sh
+bash lab/personal_setup.sh   # plane config, Docker mock agents, host agent pack
+cd lab && ./run_lab.sh       # build images, smoke enroll/shell, leave containers up
 ```
 
-Writes Hogwarts `plane.json` (`http://127.0.0.1:8080` · token `dev`), starts three Docker agents, a **host** agent on this machine, and a **Win11 pack** under plugin-data `personal/win11-agent` (plane URL `http://192.168.122.1:8080` for libvirt NAT). Restart Reach after running.
+`personal_setup.sh` writes lab `plane.json` and may set a guest plane URL of
+`http://192.168.122.1:8080` (default libvirt NAT gateway). Adjust for your network.
 
-### Docker lab
+API contract: [hogwarts/backend/CONTRACT.md](hogwarts/backend/CONTRACT.md).
 
-```bash
-cd lab && ./run_lab.sh
-# builds plane + agent images, enrolls, shells uname/id, leaves containers up
-# Plane for Hogwarts UI: http://127.0.0.1:8080  token=dev
-# Extra agents:
-#   docker run -d --network hogwarts-lab -e PLANE_URL=http://hogwarts-plane:8080 \
-#     -e PLANE_OPERATOR_TOKEN=dev hogwarts-agent:lab
+---
+
+## Repository layout
+
+```text
+ui.py                 # plugin entry
+hogwarts/             # Reach plugin UI + operator client
+plane/server.py       # lab control plane
+agent/agent.py        # reference agent
+lab/                  # Docker / smoke helpers
 ```
 
-## Layout
+---
 
-```
-ui.py
-hogwarts/          # Reach plugin UI
-  backend/         # operator client + CONTRACT
-  panels/
-plane/server.py    # lab control plane (not shipped in GTK)
-agent/agent.py     # reference agent
-lab/               # docker compose + smoke test
-```
+## Security
 
-## Purple stance
+- Install only from sources you trust. Plugins run in-process with Reach.
+- Use for systems and engagements you are authorized to control.
+- Prefer an active Reach path before agent work (see path gate above).
+- Lab tokens (`dev`) and open enroll secrets are for local testing only.
 
-Operate the tasking loop **and** defend the keep. Whitepaper: [anguish.sh — Hogwarts](https://anguish.sh/studies/hogwarts). Working notes: [/studies/hogwarts/notes](https://anguish.sh/studies/hogwarts/notes).
+---
+
+## Related
+
+- [Reach](https://github.com/digitizable/reach) — desktop UI and plugin host  
+- [Spectre](https://github.com/digitizable/spectre) — path engine  
+- Study notes: [anguish.sh — Hogwarts](https://anguish.sh/studies/hogwarts)
 
 ## License
 
