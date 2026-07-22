@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.40-lab"
+VERSION = "0.5.41-lab"
 # Keepstream VIDEO codec byte (matches research keepstream-v0)
 _KS_CODEC_JPEG = 1
 _KS_CODEC_H264 = 2
@@ -1720,8 +1720,37 @@ class _FfmpegMjpegSource:
         self._buf.clear()
 
 
+def _ffmpeg_has_encoder(name: str) -> bool:
+    """True if ``ffmpeg -encoders`` lists *name* (cached)."""
+    cache: dict[str, bool] = getattr(_ffmpeg_has_encoder, "_cache", {})
+    if name in cache:
+        return cache[name]
+    ok = False
+    try:
+        import shutil
+
+        if not shutil.which("ffmpeg"):
+            cache[name] = False
+            _ffmpeg_has_encoder._cache = cache  # type: ignore[attr-defined]
+            return False
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+        blob = (out.stdout or b"") + (out.stderr or b"")
+        # lines look like: " V....D h264_nvenc ..."
+        ok = name.encode("ascii", "ignore") in blob
+    except Exception:
+        ok = False
+    cache[name] = ok
+    _ffmpeg_has_encoder._cache = cache  # type: ignore[attr-defined]
+    return ok
+
+
 class _FfmpegH264Source:
-    """ffmpeg gdigrab/x11grab → Annex-B H.264 (libx264 or h264_nvenc).
+    """ffmpeg gdigrab/x11grab → Annex-B H.264 (NVENC first, libx264 fallback).
 
     Phase β Keepstream: lower bitrate than MJPEG at similar FPS. Emits one
     access unit (AU) per coded picture for the wire VIDEO payload.
@@ -1843,78 +1872,107 @@ class _FfmpegH264Source:
                 ]
             )
 
-        # libx264 first (reliable software). NVENC as upgrade when available.
-        # Older agents tried NVENC first and a 0.2s probe could discard a slow
-        # but healthy process; we wait longer and keep stderr for diagnostics.
-        encoder_specs: list[tuple[str, str, list[str]]] = [
+        # NVENC first when the binary has h264_nvenc (big glass-to-glass win on
+        # Windows laptops/desktops with NVIDIA). libx264 is the reliable fallback.
+        # Probe list is filtered by ffmpeg -encoders so we don't burn ~0.8s×N on
+        # machines without NVENC.
+        cq = str(max(19, crf - 2))
+        nvenc_ll: list[str] = [
+            "-preset",
+            "p1",
+            "-tune",
+            "ull",  # ultra-low-latency when supported (else next candidates)
+            "-rc",
+            "vbr",
+            "-cq",
+            cq,
+            "-delay",
+            "0",
+            "-zerolatency",
+            "1",
+            "-surfaces",
+            "2",
+            "-bf",
+            "0",
+            "-profile:v",
+            "baseline",
+            "-bsf:v",
+            "dump_extra=freq=keyframe",
+        ]
+        nvenc_ll_alt: list[str] = [
+            "-preset",
+            "p1",
+            "-tune",
+            "ll",
+            "-rc",
+            "vbr",
+            "-cq",
+            cq,
+            "-delay",
+            "0",
+            "-zerolatency",
+            "1",
+            "-surfaces",
+            "2",
+            "-bf",
+            "0",
+            "-bsf:v",
+            "dump_extra=freq=keyframe",
+        ]
+        nvenc_simple: list[str] = [
+            "-preset",
+            "llhp",
+            "-rc",
+            "cbr",
+            "-b:v",
+            "6M",
+            "-delay",
+            "0",
+            "-zerolatency",
+            "1",
+            "-bf",
+            "0",
+            "-bsf:v",
+            "dump_extra=freq=keyframe",
+        ]
+        libx264_opts: list[str] = [
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            str(crf),
+            "-profile:v",
+            "baseline",
+            "-x264-params",
             (
-                "libx264",
-                "libx264",
-                [
-                    "-preset",
-                    "ultrafast",
-                    "-tune",
-                    "zerolatency",
-                    "-crf",
-                    str(crf),
-                    "-profile:v",
-                    "baseline",
-                    # slices=1 + no lookahead; aud for AU boundaries
-                    "-x264-params",
-                    (
-                        f"repeat-headers=1:keyint={gop}:min-keyint={gop}:"
-                        "scenecut=0:slices=1:sliced-threads=0:aud=1:"
-                        "rc-lookahead=0:sync-lookahead=0:bframes=0:"
-                        "force-cfr=1"
-                    ),
-                ],
-            ),
-            (
-                "nvenc",
-                "h264_nvenc",
-                [
-                    "-preset",
-                    "p1",
-                    "-tune",
-                    "ll",
-                    "-rc",
-                    "vbr",
-                    "-cq",
-                    str(max(19, crf - 2)),
-                    "-g",
-                    str(gop),
-                    "-delay",
-                    "0",
-                    "-zerolatency",
-                    "1",
-                    "-surfaces",
-                    "2",
-                    "-bsf:v",
-                    "dump_extra=freq=keyframe",
-                ],
-            ),
-            # Simpler NVENC for drivers that reject p1/ll
-            (
-                "nvenc-simple",
-                "h264_nvenc",
-                [
-                    "-preset",
-                    "llhp",
-                    "-rc",
-                    "cbr",
-                    "-b:v",
-                    "4M",
-                    "-g",
-                    str(gop),
-                    "-delay",
-                    "0",
-                    "-zerolatency",
-                    "1",
-                    "-bsf:v",
-                    "dump_extra=freq=keyframe",
-                ],
+                f"repeat-headers=1:keyint={gop}:min-keyint={gop}:"
+                "scenecut=0:slices=1:sliced-threads=0:aud=1:"
+                "rc-lookahead=0:sync-lookahead=0:bframes=0:"
+                "force-cfr=1"
             ),
         ]
+        # Order: NVENC ultra-ll → NVENC ll → NVENC simple → software
+        encoder_specs: list[tuple[str, str, list[str]]] = [
+            ("nvenc-ull", "h264_nvenc", nvenc_ll),
+            ("nvenc-ll", "h264_nvenc", nvenc_ll_alt),
+            ("nvenc-simple", "h264_nvenc", nvenc_simple),
+            ("libx264", "libx264", libx264_opts),
+        ]
+        has_nvenc = _ffmpeg_has_encoder("h264_nvenc")
+        has_x264 = _ffmpeg_has_encoder("libx264")
+        encoder_specs = [
+            s
+            for s in encoder_specs
+            if (s[1] != "h264_nvenc" or has_nvenc)
+            and (s[1] != "libx264" or has_x264)
+        ]
+        if not encoder_specs:
+            # Last resort: try both names anyway
+            encoder_specs = [
+                ("nvenc-ll", "h264_nvenc", nvenc_ll_alt),
+                ("libx264", "libx264", libx264_opts),
+            ]
 
         # Prefer host cursor in the bitstream (desk hides local cursor).
         # Retry without draw_mouse if legacy ffmpeg rejects the flag.
@@ -2386,7 +2444,7 @@ def _ks_handle_client(conn: Any) -> None:
         thr_r.start()
         thr_s.start()
 
-        # Capture: auto prefers H.264 (libx264/nvenc), else MJPEG, else PIL
+        # Capture: auto prefers H.264 (NVENC first, then libx264), else MJPEG, else PIL
         side = int(_KEEPSTREAM.get("max_side") or 1280)
         q = int(_KEEPSTREAM.get("quality") or 72)
         fps = float(_KEEPSTREAM.get("fps") or 60.0)
@@ -2396,7 +2454,7 @@ def _ks_handle_client(conn: Any) -> None:
 
         started = False
         if use_h264:
-            # Slightly lower default FPS for software x264 CPU load
+            # NVENC handles 30+ fps cheaply; still cap auto at 30 for WAN-ish use
             h264_fps = fps if fps <= 30 else min(fps, 30.0)
             if codec_req == "h264":
                 h264_fps = fps
@@ -2407,7 +2465,8 @@ def _ks_handle_client(conn: Any) -> None:
                 _KEEPSTREAM["codec"] = "h264"
                 print(
                     f"[agent] keepstream capture {ff_h.method} "
-                    f"{side}px @{h264_fps:.0f}fps codec=h264",
+                    f"{side}px @{h264_fps:.0f}fps codec=h264 "
+                    f"(nvenc={_ffmpeg_has_encoder('h264_nvenc')})",
                     flush=True,
                 )
                 try:
@@ -2679,11 +2738,12 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
     codec_hint = planned_codec
     if codec_req == "auto" and has_ff:
         codec_hint = "h264"  # planned; live capture confirms
-    capture_hint = (
-        "ffmpeg-h264-or-mjpeg"
-        if has_ff
-        else "pil-fallback"
-    )
+    if has_ff and _ffmpeg_has_encoder("h264_nvenc"):
+        capture_hint = "ffmpeg-nvenc-or-x264-or-mjpeg"
+    elif has_ff:
+        capture_hint = "ffmpeg-x264-or-mjpeg"
+    else:
+        capture_hint = "pil-fallback"
     # Prefer live method if a session client already negotiated capture
     live_cap = str(_KEEPSTREAM.get("capture") or "").strip()
     if live_cap:
@@ -2692,7 +2752,7 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
     note = (
         f"Keepstream capture={capture_hint} codec={live_codec} "
         f"(req={codec_req}). "
-        "auto/h264: prefer H.264 (libx264/nvenc) then MJPEG; "
+        "auto/h264: prefer NVENC then libx264 then MJPEG; "
         "PIL fallback if ffmpeg missing. Latest-frame drop under load. "
         "Live capture method is set when the desk Keepstream client connects."
     )
