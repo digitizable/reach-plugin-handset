@@ -141,7 +141,8 @@ class RemoteDesktopViewer(Gtk.Window):
         self._keepstream: Any = None  # KeepstreamClient when stream is connected
         self._last_motion_xy: tuple[float, float] | None = None
         self._cursor_frac: tuple[float, float] | None = None  # 0..1 on remote frame
-        self._rel_mouse = False  # relative mouse (gaming / stream)
+        self._rel_mouse = False  # True while RMB/MMB held (camera orbit)
+        self._last_widget_xy: tuple[float, float] | None = None
         self._overlay_cursor_on = False  # drawn pointer (system cursor is unreliable)
         self._cursor_repaint_src: int | None = None
 
@@ -621,6 +622,11 @@ class RemoteDesktopViewer(Gtk.Window):
 
         self._release_all_remote_buttons = _release_all_remote_buttons  # type: ignore[method-assign]
 
+        def _wants_relative_look() -> bool:
+            """RMB/MMB camera orbit — absolute SetCursorPos flails (Parsec/Studio)."""
+            held = getattr(self, "_buttons_held", set()) or set()
+            return "right" in held or "middle" in held
+
         def _remote_button_down(button: str, x: float, y: float) -> None:
             if not self._accepts_remote_input() or self._pixbuf is None:
                 return
@@ -629,11 +635,13 @@ class RemoteDesktopViewer(Gtk.Window):
                 return
             fx, fy = frac
             self._cursor_frac = frac
+            self._last_widget_xy = (x, y)
             # Already held (auto-repeat) — do not re-send down
             if button in self._buttons_held:
                 return
             self._buttons_held.add(button)
             self._drag_active = True
+            self._rel_mouse = _wants_relative_look()
             self._queue_input(
                 {"type": "down", "fx": fx, "fy": fy, "button": button}
             )
@@ -648,6 +656,8 @@ class RemoteDesktopViewer(Gtk.Window):
                 return
             self._buttons_held.discard(button)
             self._drag_active = bool(self._buttons_held)
+            was_rel = self._rel_mouse
+            self._rel_mouse = _wants_relative_look()
             frac = self._widget_xy_to_frac(self.picture, x, y)
             if frac is None:
                 frac = getattr(self, "_cursor_frac", None)
@@ -657,6 +667,11 @@ class RemoteDesktopViewer(Gtk.Window):
             self._queue_input(
                 {"type": "up", "fx": fx, "fy": fy, "button": button}
             )
+            # After orbit, re-sync absolute position for UI hover
+            if was_rel and not self._rel_mouse:
+                self._queue_input({"type": "move", "fx": fx, "fy": fy})
+                self._last_sent_frac = (fx, fy)
+            self._last_widget_xy = (x, y)
             self._flush_input(force=True)
 
         # Left button
@@ -725,7 +740,7 @@ class RemoteDesktopViewer(Gtk.Window):
         mclick.connect("released", on_middle_released)
         self.picture.add_controller(mclick)
 
-        # Hover / drag move: absolute fx/fy only — never synthesizes clicks
+        # Hover: absolute. RMB/MMB hold: relative rmove (Studio camera, no trails).
         motion = Gtk.EventControllerMotion()
 
         def on_motion(_c: Gtk.EventControllerMotion, x: float, y: float) -> None:
@@ -737,14 +752,48 @@ class RemoteDesktopViewer(Gtk.Window):
                 self._last_motion_xy = (x, y)
 
             if not self._accepts_remote_input() or self._pixbuf is None:
+                self._last_widget_xy = (x, y)
                 return
             import time as _time
 
             now = _time.monotonic()
             ks = self._keepstream
             ks_up = bool(ks is not None and getattr(ks, "connected", False))
-            # Snappier while any button held (orbit / select drag)
-            holding = bool(self._buttons_held)
+            rel = _wants_relative_look()
+            self._rel_mouse = rel
+
+            # ── Relative look (RMB/MMB): deltas only — fixes Studio camera flail
+            # Absolute SetCursorPos during orbit makes engines see wild jumps;
+            # mouse trails only paper over that. Parsec-class path = rmove.
+            if rel:
+                prev_xy = self._last_widget_xy
+                self._last_widget_xy = (x, y)
+                if prev_xy is None:
+                    return
+                ddx = float(x) - float(prev_xy[0])
+                ddy = float(y) - float(prev_xy[1])
+                # Ignore sub-pixel noise; no abs quantization
+                if abs(ddx) < 0.15 and abs(ddy) < 0.15:
+                    return
+                # High rate for smooth orbit (~120 Hz cap)
+                if now - self._last_move_flush < 0.008:
+                    # Still accumulate into last_widget_xy (already set) —
+                    # fold missed delta into next sample by restoring prev? 
+                    # Better: apply immediately without rate skip for small rates.
+                    # Only skip if we already sent very recently AND tiny motion.
+                    if now - self._last_move_flush < 0.004:
+                        # Keep last_widget_xy so next event includes this delta
+                        self._last_widget_xy = prev_xy
+                        return
+                dx, dy = self._widget_delta_to_host(ddx, ddy)
+                if dx == 0 and dy == 0:
+                    return
+                self._last_move_flush = now
+                self._queue_input({"type": "rmove", "dx": int(dx), "dy": int(dy)})
+                return
+
+            # ── Absolute hover / LMB drag (UI, select, Studio 2D tools)
+            holding = "left" in (self._buttons_held or set())
             min_dt = (0.012 if holding else 0.022) if ks_up else 0.04
             if now - self._last_move_flush < min_dt:
                 return
@@ -752,29 +801,33 @@ class RemoteDesktopViewer(Gtk.Window):
             if frac is None:
                 frac = self._widget_xy_to_frac(self.picture, x, y)
             if frac is None:
+                self._last_widget_xy = (x, y)
                 return
             fx, fy = frac
-            # Smaller deadzone while dragging for smooth camera
             q = 0.0006 if holding else 0.0012
             fx = round(fx / q) * q
             fy = round(fy / q) * q
             prev = self._last_sent_frac
             if prev is not None:
                 if abs(fx - prev[0]) < q and abs(fy - prev[1]) < q:
+                    self._last_widget_xy = (x, y)
                     return
             self._last_move_flush = now
             self._last_sent_frac = (fx, fy)
-            # move only — button state stays from down/up (no phantom click)
+            self._last_widget_xy = (x, y)
             self._queue_input({"type": "move", "fx": fx, "fy": fy})
 
         def on_leave(_c: Gtk.EventControllerMotion) -> None:
             self._last_motion_xy = None
+            self._last_widget_xy = None
             # Release buttons if pointer leaves while held (avoids stuck LMB drag)
             if self._buttons_held:
                 _release_all_remote_buttons()
+            self._rel_mouse = False
 
         def on_enter(_c: Gtk.EventControllerMotion, x: float, y: float) -> None:
             self._last_motion_xy = (x, y)
+            self._last_widget_xy = (x, y)
             frac = self._widget_xy_to_frac(self.picture, x, y)
             if frac is not None:
                 self._cursor_frac = frac
@@ -1794,15 +1847,23 @@ class RemoteDesktopViewer(Gtk.Window):
         return max(0.0, min(1.0, fx)), max(0.0, min(1.0, fy))
 
     def _widget_delta_to_host(self, ddx: float, ddy: float) -> tuple[int, int]:
-        """Map widget-pixel delta → host primary-screen pixels (relative mouse)."""
+        """Map widget-pixel delta → host pixels (relative mouse / camera orbit).
+
+        Uses content scale (CONTAIN letterbox) so 1px on the stream ≈ the right
+        number of host pixels even when the frame is downscaled.
+        """
         if self._pixbuf is None:
             return 0, 0
         ww = max(1, self.picture.get_width())
         wh = max(1, self.picture.get_height())
         iw = max(1, self._pixbuf.get_width())
         ih = max(1, self._pixbuf.get_height())
+        # Widget px → stream frame px
         scale = min(ww / iw, wh / ih)
-        dw, dh = max(1.0, iw * scale), max(1.0, ih * scale)
+        if scale <= 1e-6:
+            scale = 1.0
+        rdx = float(ddx) / scale
+        rdy = float(ddy) / scale
         ks = self._keepstream
         # Prefer full host screen from HELLO; fall back to stream size
         sw = int(getattr(ks, "screen_w", 0) or 0) if ks is not None else 0
@@ -1811,8 +1872,12 @@ class RemoteDesktopViewer(Gtk.Window):
             sw = int(getattr(ks, "remote_w", 0) or iw) if ks is not None else iw
         if sh <= 0:
             sh = int(getattr(ks, "remote_h", 0) or ih) if ks is not None else ih
-        dx = int(round(ddx / dw * sw))
-        dy = int(round(ddy / dh * sh))
+        # Stream frame may be a scaled capture of the full screen
+        dx = int(round(rdx * (float(sw) / float(iw))))
+        dy = int(round(rdy * (float(sh) / float(ih))))
+        # Soft clamp — one packet shouldn't fling the camera across the sky
+        dx = max(-200, min(200, dx))
+        dy = max(-200, min(200, dy))
         return dx, dy
 
     def _queue_input(self, event: dict[str, Any]) -> None:

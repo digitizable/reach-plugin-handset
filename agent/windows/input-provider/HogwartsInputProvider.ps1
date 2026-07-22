@@ -92,6 +92,17 @@ public static class HogwartsInject {
     SendInput(1, new[] { inp }, Marshal.SizeOf(typeof(INPUT)));
   }
 
+  static void MouseRel(int dx, int dy) {
+    // Relative move — Roblox Studio camera orbit (no absolute flail)
+    if (dx == 0 && dy == 0) return;
+    if (dx > 400) dx = 400; if (dx < -400) dx = -400;
+    if (dy > 400) dy = 400; if (dy < -400) dy = -400;
+    var inp = new INPUT();
+    inp.type = INPUT_MOUSE;
+    inp.U.mi = new MOUSEINPUT { dx = dx, dy = dy, dwFlags = MOUSEEVENTF_MOVE };
+    SendInput(1, new[] { inp }, Marshal.SizeOf(typeof(INPUT)));
+  }
+
   static void Wheel(int notches, bool horizontal) {
     if (notches == 0) return;
     if (notches > 20) notches = 20;
@@ -189,6 +200,12 @@ public static class HogwartsInject {
       px = x ?? 0; py = y ?? 0;
     }
     string typ = (type ?? "click").ToLowerInvariant();
+    if (typ == "rmove" || typ == "rel" || typ == "relative") {
+      // dx/dy passed via x/y slots when type is rmove (see Invoke-Events)
+      int rdx = x ?? 0, rdy = y ?? 0;
+      MouseRel(rdx, rdy);
+      return;
+    }
     if ((typ == "move" || typ == "click" || typ == "dblclick" || typ == "down" || typ == "up" || typ == "wheel" || typ == "wheel_h" || typ == "hwheel") && px.HasValue && py.HasValue) {
       Mouse(0, px, py);
       SetCursorPos(px.Value, py.Value);
@@ -292,8 +309,17 @@ function Invoke-Events($obj) {
         }
         $delta = 0
         if ($null -ne $ev.delta) { try { $delta = [int]$ev.delta } catch { $delta = 0 } }
-        elseif ($null -ne $ev.dy) { try { $delta = [int]$ev.dy } catch { $delta = 0 } }
-        elseif ($null -ne $ev.dx) { try { $delta = [int]$ev.dx } catch { $delta = 0 } }
+        elseif ($null -ne $ev.dy -and $type -ne "rmove" -and $type -ne "rel" -and $type -ne "relative") {
+            try { $delta = [int]$ev.dy } catch { $delta = 0 }
+        }
+        elseif ($null -ne $ev.dx -and $type -ne "rmove" -and $type -ne "rel" -and $type -ne "relative") {
+            try { $delta = [int]$ev.dx } catch { $delta = 0 }
+        }
+        # rmove: pass dx/dy through x/y integer slots
+        if ($type -eq "rmove" -or $type -eq "rel" -or $type -eq "relative") {
+            if ($null -ne $ev.dx) { try { $x = [int]$ev.dx } catch { $x = 0 } }
+            if ($null -ne $ev.dy) { try { $y = [int]$ev.dy } catch { $y = 0 } }
+        }
         try {
             [HogwartsInject]::ApplyEventFull($type, $fx, $fy, $x, $y, $button, $key, $text, $mods, $delta)
             $n++
