@@ -99,7 +99,8 @@ def presence_mode_key(agent: AgentDTO | None) -> str:
     """Beacon-class async vs session-class interactive (Sliver/Havoc lesson)."""
     if agent is None:
         return "async"
-    if fleet_status_key(agent.status) == "offline":
+    # Archived / offline are not interactive — don't paint INTER from leftover sleep
+    if fleet_status_key(agent.status) in ("offline", "archived"):
         return "async"
     p = (agent.presence or "").lower().strip()
     if p in ("async", "interactive"):
@@ -230,6 +231,11 @@ class AgentsPanel(Gtk.Box):
 
         self.status_filter = Gtk.DropDown.new_from_strings(_STATUS_FILTERS)
         self.status_filter.set_selected(0)
+        # Filter change must invalidate fleet + refresh — otherwise stale polls
+        # (or a soft-patch path) leave dead rows that no longer accept hover/click.
+        self.status_filter.connect(
+            "notify::selected", lambda *_: self._on_status_filter_changed()
+        )
         bar.append(self.status_filter)
 
         refresh = Gtk.Button(label="Refresh")
@@ -711,13 +717,45 @@ class AgentsPanel(Gtk.Box):
         ``All`` → active (excludes archived). ``live`` → online|idle.
         ``archived`` → archive-only.
         """
-        i = int(self.status_filter.get_selected())
-        if i <= 0:
+        try:
+            i = int(self.status_filter.get_selected())
+        except (TypeError, ValueError):
+            return None
+        # GTK_INVALID_LIST_POSITION is a huge guint; treat as All
+        if i <= 0 or i >= len(_STATUS_FILTERS):
             return None  # plane default = active (no archived)
         return _STATUS_FILTERS[i]
 
     def query(self) -> str:
         return self.search.get_text().strip()
+
+    def invalidate_fleet(self) -> None:
+        """Force next set_agents() to hard-rebuild rows (filter/search changed).
+
+        Also bumps ``_fleet_gen`` so in-flight polls/refreshes with the old
+        filter cannot paint a dead roster after the user switched back to All.
+        """
+        self._fleet_gen = int(getattr(self, "_fleet_gen", 0)) + 1
+        self._agents_fp = None
+        self._fleet_paint_fp = None
+
+    def _on_status_filter_changed(self) -> None:
+        """Dropdown changed — drop selection paint, rebuild on next payload."""
+        self.invalidate_fleet()
+        # Leave detail if the open agent may disappear under a new filter
+        try:
+            if self._view_stack.get_visible_child_name() == "detail":
+                self._selected = None
+                self._selected_soft_key = None
+                self._set_tasking_sensitive(False)
+                self._show_fleet()
+        except Exception:
+            pass
+        self.status_lab.set_text("Loading…")
+        try:
+            self._on_refresh()
+        except Exception:
+            pass
 
     def selected_agent_id(self) -> str | None:
         return self._selected.id if self._selected else None
@@ -817,7 +855,7 @@ class AgentsPanel(Gtk.Box):
                 pm = presence_mode_key(a)
                 presence_counts[pm] = presence_counts.get(pm, 0) + 1
         parts = [f"{len(agents)} agent" + ("s" if len(agents) != 1 else "")]
-        for st in ("online", "offline"):
+        for st in ("online", "offline", "archived"):
             if st in counts:
                 label = "live" if st == "online" else st
                 parts.append(f"{counts[st]} {label}")
@@ -835,9 +873,19 @@ class AgentsPanel(Gtk.Box):
         membership = self._fleet_membership(agents)
         paint_fp = self._fleet_paint_key(agents)
         # Soft path only when row map is intact and matches membership
-        rows_ok = bool(self._fleet_rows) and set(self._fleet_rows.keys()) == set(
-            membership
-        )
+        row_ids = set(self._fleet_rows.keys())
+        mem_ids = set(membership)
+        rows_ok = bool(self._fleet_rows) and row_ids == mem_ids
+        # Also require every row widget still has a live button (desync after filter)
+        if rows_ok:
+            try:
+                rows_ok = all(
+                    isinstance(w.get("btn"), Gtk.Button)
+                    and w["btn"].get_parent() is not None
+                    for w in self._fleet_rows.values()
+                )
+            except Exception:
+                rows_ok = False
         if membership == self._agents_fp and rows_ok:
             by_id = {a.id: a for a in agents}
             # Skip all GTK label/CSS writes when nothing user-visible changed
@@ -861,6 +909,8 @@ class AgentsPanel(Gtk.Box):
                     self._set_tasking_sensitive(False)
                     self._mark_fleet_selected(None)
                     self._show_fleet()
+            # Re-assert hover after any soft paint (filter thrash can drop :hover)
+            self._sync_fleet_pointer_hover()
             return
 
         # Hard rebuild when agents join/leave OR row map was wiped/desynced
@@ -871,8 +921,16 @@ class AgentsPanel(Gtk.Box):
         self._clear_list()
         for agent in agents:
             self.list_box.append(self._row(agent))
+        # Ensure fleet list accepts pointer after rebuild
+        try:
+            self.list_box.set_sensitive(True)
+            self.list_box.set_can_target(True)
+        except Exception:
+            pass
         # Pointer may still sit on a row after rebuild — re-assert motion hover
         self._sync_fleet_pointer_hover()
+        # Idle re-sync: DropDown popover close can steal pointer events for a tick
+        GLib.idle_add(self._sync_fleet_pointer_hover_idle)
         if keep_id:
             match = next((a for a in agents if a.id == keep_id), None)
             if match:
@@ -1031,6 +1089,14 @@ class AgentsPanel(Gtk.Box):
                 btn.add_css_class("hogwarts-fleet-btn-hover")
             else:
                 btn.remove_css_class("hogwarts-fleet-btn-hover")
+
+    def _sync_fleet_pointer_hover_idle(self) -> bool:
+        """GLib.idle_add wrapper — always return False (one-shot)."""
+        try:
+            self._sync_fleet_pointer_hover()
+        except Exception:
+            pass
+        return False
 
     def _select_fleet_row(self, agent_id: str) -> None:
         self._mark_fleet_selected(agent_id)
@@ -1960,12 +2026,13 @@ class AgentsPanel(Gtk.Box):
 
         # Explicit motion hover class — GTK4 :hover can stick off after many
         # refresh rebuilds / child label invalidations even with can_target=False.
+        # enter(controller, x, y) — accept *args so signature never drops events.
         motion = Gtk.EventControllerMotion()
 
-        def _enter(_c: Gtk.EventControllerMotion) -> None:
+        def _enter(*_a: Any) -> None:
             btn.add_css_class("hogwarts-fleet-btn-hover")
 
-        def _leave(_c: Gtk.EventControllerMotion) -> None:
+        def _leave(*_a: Any) -> None:
             btn.remove_css_class("hogwarts-fleet-btn-hover")
 
         motion.connect("enter", _enter)

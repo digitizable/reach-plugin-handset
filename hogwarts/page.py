@@ -709,6 +709,12 @@ class HogwartsPage(Gtk.Box):
         want_tasks = bool(agent_id) and nav == "agents" and on_detail
         want_channel = self._poll_gen % 3 == 1
 
+        # Snapshot filter + gen so a mid-flight filter switch cannot paint a
+        # dead archived roster (or wipe hover targets) after user picks All.
+        fleet_status = self._agents.filter_status() if want_fleet else None
+        fleet_q = self._agents.query() if want_fleet else None
+        fleet_gen = int(getattr(self._agents, "_fleet_gen", 0)) if want_fleet else 0
+
         def work() -> None:
             events_out: list[Any] = []
             agents = None
@@ -720,8 +726,8 @@ class HogwartsPage(Gtk.Box):
                     events_out = client.poll_events(since=since, limit=20)
                 if want_fleet:
                     agents = client.list_agents(
-                        status=self._agents.filter_status(),
-                        q=self._agents.query() or None,
+                        status=fleet_status,
+                        q=fleet_q or None,
                     )
                 if want_tasks and agent_id:
                     try:
@@ -748,6 +754,9 @@ class HogwartsPage(Gtk.Box):
                 if events_out:
                     self._ingest_events(events_out, source="poll")
                 if agents is not None:
+                    # Stale fleet poll (filter changed while HTTP in flight)
+                    if fleet_gen != int(getattr(self._agents, "_fleet_gen", fleet_gen)):
+                        return True
                     self._agents.set_agents(agents, quiet=True)
                 if want_tasks and agent_id and tasks is not None:
                     if self._agents.selected_agent_id() == agent_id:
