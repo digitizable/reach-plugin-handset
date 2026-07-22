@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.31-lab"
+VERSION = "0.5.32-lab"
 MIN_SLEEP = 0.12  # Control needs sub-200ms check-ins
 # Set by main(); when False, loop only logs enroll/errors/tasks>0 (less disk thrash)
 _AGENT_VERBOSE = False
@@ -2411,12 +2411,17 @@ def _input_provider_start(
                 if stream is None:
                     hint = (
                         f"pipe not open: {target!r}. "
-                        "Start High-IL helper first: "
+                        "Start helper first (must be listening): "
                         "schtasks /Run /TN HogwartsInputProvider "
-                        "or agent/windows/input-provider/start-input-provider-silent.ps1"
+                        "or C:\\HogwartsInputProvider\\HogwartsInputProvider.ps1. "
+                        "Fallback: kind=exec + pipe-bridge.ps1 (.NET). "
+                        "Agent >=0.5.32 tries WRITE then R|W CreateFileW."
                     )
                     raise RuntimeError(hint)
                 try:
+                    # Binary-safe write; ensure newline for StreamReader.ReadLine
+                    if not hello.endswith("\n"):
+                        hello = hello + "\n"
                     stream.write(hello)
                     stream.flush()
                 except Exception as exc:
@@ -2549,62 +2554,69 @@ def _win_open_named_pipe_write(target: str, *, timeout_s: float = 6.0):
         GENERIC_WRITE = 0x40000000
         OPEN_EXISTING = 3
         FILE_ATTRIBUTE_NORMAL = 0x80
+        FILE_FLAG_OVERLAPPED = 0x40000000
         PIPE_READMODE_BYTE = 0x00000000
         INVALID = ctypes.c_void_p(-1).value
 
-        while time.monotonic() < deadline:
-            try:
-                # Wait up to 500ms per loop for a free pipe instance
-                WaitNamedPipeW(target, 500)
-                # Duplex access: GENERIC_WRITE-only clients hang writing HELLO
-                # against PowerShell NamedPipeServerStream (InOut) on some hosts.
-                handle = CreateFileW(
-                    target,
-                    GENERIC_READ | GENERIC_WRITE,
-                    0,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    None,
-                )
-                if handle is None or handle == INVALID or int(handle) == -1:
-                    err = ctypes.get_last_error()
-                    last = OSError(err, f"CreateFileW failed winerr={err}")
-                    time.sleep(0.15)
-                    continue
-                mode = wintypes.DWORD(PIPE_READMODE_BYTE)
+        class _PipeText:
+            def __init__(self, r: Any) -> None:
+                self._r = r
+
+            def write(self, s: str) -> int:
+                data = s.encode("utf-8") if isinstance(s, str) else s
+                self._r.write(data)
+                return len(data)
+
+            def flush(self) -> None:
                 try:
-                    SetNamedPipeHandleState(handle, ctypes.byref(mode), None, None)
+                    self._r.flush()
                 except Exception:
                     pass
-                # O_RDWR so write path is not half-open against duplex servers
-                fd = msvcrt.open_osfhandle(int(handle), os.O_RDWR)
-                # Unbuffered binary-backed text wrapper — avoid flush stalls
-                raw = open(fd, "rb+", buffering=0)  # noqa: SIM115
 
-                class _PipeText:
-                    def __init__(self, r: Any) -> None:
-                        self._r = r
+            def close(self) -> None:
+                try:
+                    self._r.close()
+                except Exception:
+                    pass
 
-                    def write(self, s: str) -> int:
-                        data = s.encode("utf-8") if isinstance(s, str) else s
-                        # WriteFile in chunks; do not hold GIL forever on hang
-                        self._r.write(data)
-                        return len(data)
+        def _try_create(access: int, fd_flags: int, mode: str) -> Any | None:
+            nonlocal last
+            WaitNamedPipeW(target, 500)
+            handle = CreateFileW(
+                target,
+                access,
+                0,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+            if handle is None or handle == INVALID or int(handle) == -1:
+                err = ctypes.get_last_error()
+                last = OSError(err, f"CreateFileW access=0x{access:x} winerr={err}")
+                return None
+            try:
+                pmode = wintypes.DWORD(PIPE_READMODE_BYTE)
+                SetNamedPipeHandleState(handle, ctypes.byref(pmode), None, None)
+            except Exception:
+                pass
+            fd = msvcrt.open_osfhandle(int(handle), fd_flags)
+            raw = open(fd, mode, buffering=0)  # noqa: SIM115
+            return _PipeText(raw)
 
-                    def flush(self) -> None:
-                        try:
-                            self._r.flush()
-                        except Exception:
-                            pass
-
-                    def close(self) -> None:
-                        try:
-                            self._r.close()
-                        except Exception:
-                            pass
-
-                return _PipeText(raw)
+        while time.monotonic() < deadline:
+            try:
+                # 1) WRITE-only — matches helper PipeDirection.In (clients write)
+                stream = _try_create(GENERIC_WRITE, os.O_WRONLY, "wb")
+                if stream is not None:
+                    return stream
+                # 2) Duplex — some InOut servers require R|W
+                stream = _try_create(
+                    GENERIC_READ | GENERIC_WRITE, os.O_RDWR, "rb+"
+                )
+                if stream is not None:
+                    return stream
+                time.sleep(0.15)
             except OSError as exc:
                 last = exc
                 time.sleep(0.15)
