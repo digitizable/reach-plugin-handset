@@ -171,6 +171,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self._zoom_mode: float | None = None
         self._max_side = max_side
         self._fullscreen = False
+        self._focus_mode = False  # stream-only chrome hide (not WM fullscreen)
         self._current_path: Path | None = None
         # Archive entries: newest first
         self._items: list[dict[str, Any]] = []
@@ -183,6 +184,27 @@ class RemoteDesktopViewer(Gtk.Window):
         root.set_hexpand(True)
         root.set_vexpand(True)
         self.set_child(root)
+        self._root = root
+
+        # ── Focus strip (visible only in focus mode) — restore full UI ──
+        self._focus_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._focus_bar.add_css_class("rdv-focus-bar")
+        self._focus_bar.set_visible(False)
+        focus_lab = Gtk.Label(
+            label="Focus · stream only",
+            xalign=0,
+        )
+        focus_lab.add_css_class("rdv-focus-label")
+        focus_lab.set_hexpand(True)
+        self._focus_bar.append(focus_lab)
+        self.btn_show_ui = Gtk.Button(label="Show UI")
+        self.btn_show_ui.add_css_class("rdv-focus-toggle")
+        self.btn_show_ui.set_tooltip_text(
+            "Show title, toolbar, archive, and status again (F9 or Esc)"
+        )
+        self.btn_show_ui.connect("clicked", lambda *_: self._set_focus_mode(False))
+        self._focus_bar.append(self.btn_show_ui)
+        root.append(self._focus_bar)
 
         # ── Title ────────────────────────────────────────────────────
         title_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -202,6 +224,7 @@ class RemoteDesktopViewer(Gtk.Window):
         tcol.append(self._subtitle)
         title_bar.append(tcol)
         root.append(title_bar)
+        self._title_bar = title_bar
 
         # ── Mode: View | Control | Session (remote desktop ladder) ───
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -246,6 +269,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self.live_badge.add_css_class("rdv-badge")
         mode_row.append(self.live_badge)
         root.append(mode_row)
+        self._mode_row = mode_row
 
         # ── Capture ribbon ───────────────────────────────────────────
         ribbon = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -355,6 +379,30 @@ class RemoteDesktopViewer(Gtk.Window):
         rsp.set_hexpand(True)
         ribbon.append(rsp)
 
+        self.btn_focus = _icon_btn(
+            "view-fullscreen-symbolic",
+            "Focus mode (F9): hide chrome, stream only — not OS fullscreen",
+        )
+        try:
+            img_f = self.btn_focus.get_child()
+            if isinstance(img_f, Gtk.Image):
+                img_f.set_from_icon_name("media-playback-start-symbolic")
+        except Exception:
+            pass
+        # Prefer a “view” style icon when present
+        try:
+            img_f = self.btn_focus.get_child()
+            if isinstance(img_f, Gtk.Image):
+                img_f.set_from_icon_name("view-conceal-symbolic")
+        except Exception:
+            pass
+        self.btn_focus.set_tooltip_text(
+            "Focus mode (F9): hide UI chrome · stream only in this window · "
+            "top bar toggles UI back"
+        )
+        self.btn_focus.connect("clicked", lambda *_: self._set_focus_mode(True))
+        ribbon.append(self.btn_focus)
+
         self.btn_max = _icon_btn(
             "window-maximize-symbolic",
             "Maximize window (F10) — free-floating; not tied to Reach",
@@ -378,6 +426,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self.btn_fs.connect("clicked", lambda *_: self._toggle_fullscreen())
         ribbon.append(self.btn_fs)
         root.append(ribbon)
+        self._ribbon = ribbon
 
         # ── Zoom + after-capture actions (ShareX-like) ───────────────
         tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
@@ -483,18 +532,21 @@ class RemoteDesktopViewer(Gtk.Window):
         self.btn_refresh.connect("clicked", lambda *_: self._do_shot())
         tools.append(self.btn_refresh)
         root.append(tools)
+        self._tools = tools
 
         # ── Body: archive sidebar + image ────────────────────────────
         body = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         body.set_hexpand(True)
         body.set_vexpand(True)
         body.add_css_class("rdv-body")
+        self._body = body
 
         # Archive panel (ShareX history)
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         side.add_css_class("rdv-archive")
         side.set_size_request(200, -1)
         side.set_hexpand(False)
+        self._archive_side = side
 
         side_head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         side_head.add_css_class("rdv-archive-head")
@@ -531,6 +583,7 @@ class RemoteDesktopViewer(Gtk.Window):
 
         vdiv = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
         body.append(vdiv)
+        self._body_vdiv = vdiv
 
         # Image pane
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -910,6 +963,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self.meta_lab.add_css_class("rdv-meta")
         status_bar.append(self.meta_lab)
         root.append(status_bar)
+        self._status_bar = status_bar
 
         # Keys
         key = Gtk.EventControllerKey()
@@ -921,8 +975,16 @@ class RemoteDesktopViewer(Gtk.Window):
             state: Gdk.ModifierType,
         ) -> bool:
             ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
-            if keyval == Gdk.KEY_Escape and self._fullscreen:
-                self._toggle_fullscreen()
+            # Esc: exit focus chrome → then unfullscreen
+            if keyval == Gdk.KEY_Escape:
+                if self._focus_mode:
+                    self._set_focus_mode(False)
+                    return True
+                if self._fullscreen:
+                    self._toggle_fullscreen()
+                    return True
+            if keyval == Gdk.KEY_F9:
+                self._set_focus_mode(not self._focus_mode)
                 return True
             if keyval == Gdk.KEY_F10:
                 self._toggle_maximize()
@@ -2507,6 +2569,71 @@ class RemoteDesktopViewer(Gtk.Window):
         self.picture.set_can_shrink(False)
         self.picture.set_pixbuf(scaled)
         self.picture.set_size_request(tw, th)
+
+    def _set_focus_mode(self, on: bool) -> None:
+        """Stream-only layout inside the window (not OS fullscreen).
+
+        Hides title, modes, ribbon, tools, archive, status. Leaves a thin top
+        bar with **Show UI** to restore everything. Window stays maximized if
+        the user already maximized it.
+        """
+        on = bool(on)
+        if bool(getattr(self, "_focus_mode", False)) == on:
+            # Still ensure stack shows the picture (not session setup form)
+            if on:
+                try:
+                    self._main_stack.set_visible_child_name("view")
+                except Exception:
+                    pass
+            return
+        self._focus_mode = on
+        # Chrome to hide (everything except stream + focus bar)
+        chrome = [
+            getattr(self, "_title_bar", None),
+            getattr(self, "_mode_row", None),
+            getattr(self, "_ribbon", None),
+            getattr(self, "_tools", None),
+            getattr(self, "_archive_side", None),
+            getattr(self, "_body_vdiv", None),
+            getattr(self, "_status_bar", None),
+        ]
+        for w in chrome:
+            if w is None:
+                continue
+            try:
+                w.set_visible(not on)
+            except Exception:
+                pass
+        try:
+            self._focus_bar.set_visible(on)
+        except Exception:
+            pass
+        if on:
+            # Prefer stream surface over Session setup form
+            try:
+                self._main_stack.set_visible_child_name("view")
+            except Exception:
+                pass
+            # Ensure normal pointer on the focus strip
+            try:
+                self._focus_bar.set_cursor(None)
+                self.btn_show_ui.set_cursor(None)
+            except Exception:
+                pass
+            self._set_status(
+                "Focus mode — stream only · Show UI (top) or F9 / Esc to restore",
+                ok=True,
+            )
+            try:
+                self.add_css_class("rdv-focus")
+            except Exception:
+                pass
+        else:
+            try:
+                self.remove_css_class("rdv-focus")
+            except Exception:
+                pass
+            self._set_status("UI restored", ok=None)
 
     def _toggle_maximize(self) -> None:
         """Maximize / unmaximize via GTK (WM title-bar maximize also works)."""

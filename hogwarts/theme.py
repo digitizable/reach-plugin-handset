@@ -922,6 +922,25 @@ HOGWARTS_CSS = """
   min-width: 18px;
   min-height: 22px;
 }
+/* Focus mode: thin top strip to restore chrome (not OS fullscreen) */
+.rdv-focus-bar {
+  background-color: #1e1e1e;
+  border-bottom: 1px solid #3c3c3c;
+  padding: 4px 10px;
+  min-height: 28px;
+}
+.rdv-focus-label {
+  font-size: 0.78rem;
+  color: #cccccc;
+}
+.rdv-focus-toggle {
+  font-size: 0.78rem;
+  padding: 2px 12px;
+  min-height: 24px;
+}
+.rdv-focus .rdv-body {
+  /* stream uses full remaining window */
+}
 .rdv-statusbar {
   background-color: #007acc;
   padding: 3px 10px;
