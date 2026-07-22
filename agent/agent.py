@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.37-lab"
+VERSION = "0.5.38-lab"
 # Keepstream VIDEO codec byte (matches research keepstream-v0)
 _KS_CODEC_JPEG = 1
 _KS_CODEC_H264 = 2
@@ -1796,17 +1796,27 @@ class _FfmpegH264Source:
             return g, "x11grab"
 
         def _cmd(grab: list[str], encoder: str, extra: list[str]) -> list[str]:
+            # Low-latency demux: don't probe/buffer the live grab
             return (
                 [
                     "ffmpeg",
                     "-hide_banner",
                     "-loglevel",
                     "error",
+                    "-fflags",
+                    "nobuffer",
+                    "-flags",
+                    "low_delay",
+                    "-probesize",
+                    "32",
+                    "-analyzeduration",
+                    "0",
                 ]
                 + grab
                 + [
                     "-vf",
-                    f"scale={ow}:{oh}:flags=lanczos,format=yuv420p",
+                    # fast bilinear scale — lanczos adds free latency
+                    f"scale={ow}:{oh}:flags=fast_bilinear,format=yuv420p",
                     "-c:v",
                     encoder,
                 ]
@@ -1818,6 +1828,8 @@ class _FfmpegH264Source:
                     str(gop),
                     "-bf",
                     "0",
+                    "-flush_packets",
+                    "1",
                     "-f",
                     "h264",
                     "-",
@@ -1840,13 +1852,13 @@ class _FfmpegH264Source:
                     str(crf),
                     "-profile:v",
                     "baseline",
-                    # slices=1: multi-slice AUs were painted as green slabs on desk
-                    # (each slice emitted as its own incomplete picture).
-                    # repeat-headers: SPS/PPS on every keyframe for mid-stream join.
+                    # slices=1 + no lookahead; aud for AU boundaries
                     "-x264-params",
                     (
                         f"repeat-headers=1:keyint={gop}:min-keyint={gop}:"
-                        "scenecut=0:slices=1:sliced-threads=0:aud=1"
+                        "scenecut=0:slices=1:sliced-threads=0:aud=1:"
+                        "rc-lookahead=0:sync-lookahead=0:bframes=0:"
+                        "force-cfr=1"
                     ),
                 ],
             ),
@@ -1864,9 +1876,12 @@ class _FfmpegH264Source:
                     str(max(19, crf - 2)),
                     "-g",
                     str(gop),
-                    # Prefer a single slice when the driver allows it
+                    "-delay",
+                    "0",
+                    "-zerolatency",
+                    "1",
                     "-surfaces",
-                    "4",
+                    "2",
                     "-bsf:v",
                     "dump_extra=freq=keyframe",
                 ],
@@ -1884,6 +1899,10 @@ class _FfmpegH264Source:
                     "4M",
                     "-g",
                     str(gop),
+                    "-delay",
+                    "0",
+                    "-zerolatency",
+                    "1",
                     "-bsf:v",
                     "dump_extra=freq=keyframe",
                 ],
@@ -2040,12 +2059,20 @@ class _FfmpegH264Source:
             au = self._param_sets + au
         return au, is_key
 
+    def _peek_next_nal(self) -> bytes | None:
+        """Return the next complete NAL in the buffer without consuming it."""
+        positions = self._start_code_positions(self._buf)
+        if len(positions) < 2:
+            return None
+        return bytes(self._buf[positions[0] : positions[1]])
+
     def read_au(self, timeout_s: float = 0.5) -> tuple[bytes, bool] | None:
         """Return (annex_b_access_unit, is_keyframe) or None.
 
-        Access unit boundary = next VCL with first_mb_in_slice==0 (or AUD), so
-        multi-slice pictures stay together. Emitting each slice as its own AU
-        produced green rectangular slabs on the desk after GStreamer decode.
+        Multi-slice safe: continuation slices (first_mb!=0) stay with the
+        picture. Low latency: once a VCL is complete and the next NAL is not a
+        continuation (or nothing is buffered), emit immediately — do not wait
+        for the following frame (that added ~1 frame of glass-to-glass lag).
         """
         proc = self._proc
         if proc is None or proc.stdout is None or proc.poll() is not None:
@@ -2076,16 +2103,37 @@ class _FfmpegH264Source:
                 if is_vcl:
                     new_pic = self._first_mb_in_slice_zero(nal)
                     if new_pic and self._have_vcl and self._pending:
-                        # Start of next picture — emit the completed AU
+                        # Start of next picture — emit the completed AU first
                         emitted = self._emit_au(self._pending)
                         self._pending = [nal]
                         self._have_vcl = True
                         if emitted is not None:
                             return emitted
                     else:
-                        # Continuation slice or first VCL of a new AU
                         self._pending.append(nal)
                         self._have_vcl = True
+                    # Low-latency flush: if this VCL completes the picture
+                    # (no continuation slice waiting), emit now.
+                    if self._have_vcl and self._pending:
+                        nxt = self._peek_next_nal()
+                        cont = False
+                        if nxt is not None:
+                            nt2 = self._nal_type(nxt)
+                            if nt2 in (1, 5) and not self._first_mb_in_slice_zero(
+                                nxt
+                            ):
+                                cont = True  # more slices of same picture
+                        if not cont:
+                            # No continuation (or no next NAL yet). For
+                            # slices=1 this is the full picture — emit.
+                            # If a continuation arrives late, rare green;
+                            # we force slices=1 in libx264 to avoid that.
+                            if nxt is None or not cont:
+                                emitted = self._emit_au(self._pending)
+                                self._pending.clear()
+                                self._have_vcl = False
+                                if emitted is not None:
+                                    return emitted
                 else:
                     # SPS/PPS/SEI — attach to next picture
                     self._pending.append(nal)
@@ -2093,8 +2141,17 @@ class _FfmpegH264Source:
             try:
                 import select
 
-                r, _, _ = select.select([proc.stdout], [], [], 0.05)
+                # Short poll — don't sit 50ms when a frame is almost ready
+                r, _, _ = select.select([proc.stdout], [], [], 0.005)
                 if not r:
+                    # If we already have a complete VCL and nothing more arrived,
+                    # flush it (single-slice / end of picture).
+                    if self._have_vcl and self._pending:
+                        emitted = self._emit_au(self._pending)
+                        self._pending.clear()
+                        self._have_vcl = False
+                        if emitted is not None:
+                            return emitted
                     continue
                 chunk = proc.stdout.read(65536)
             except Exception:

@@ -2324,7 +2324,7 @@ class HogwartsPage(Gtk.Box):
                     "port": 0,
                     "max_side": max_side,
                     "codec": codec,
-                    # software x264 is heavy at 60; 30 is a good Session default
+                    # H.264: 30fps is enough; lower glass-to-glass than 60 encode
                     "fps": 60 if codec == "jpeg" else 30,
                     "quality": 72,
                 }
@@ -2427,8 +2427,8 @@ class HogwartsPage(Gtk.Box):
                     # Schedule at most one paint (~40fps cap); drop intermediates
                     if getattr(self, "_ks_paint_src", None) is not None:
                         return
-                    # 24ms ≈ 42fps max UI paint — leaves main loop for input
-                    self._ks_paint_src = GLib.timeout_add(24, _ks_paint_tick)
+                    # 8ms coalesce — low display lag, still leaves room for input
+                    self._ks_paint_src = GLib.timeout_add(8, _ks_paint_tick)
 
                 def on_status(msg: str, ok: bool | None) -> None:
                     def ui() -> bool:
