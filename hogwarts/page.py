@@ -2284,12 +2284,16 @@ class HogwartsPage(Gtk.Box):
             else:
                 max_side = int(self._agents.shot_max_side())
             profile = str(start_opts.get("profile") or "balanced").lower()
-            if profile == "gaming":
+            if profile in ("gaming", "gaming-lan"):
                 max_side = max(640, min(max_side, 960))
             else:
                 max_side = max(960, min(max_side, 1280))
         except Exception:
-            max_side = 960 if str(start_opts.get("profile") or "") == "gaming" else 1280
+            max_side = (
+                960
+                if str(start_opts.get("profile") or "") in ("gaming", "gaming-lan")
+                else 1280
+            )
         # Stash for paint/input tuning while Session is up
         self._ks_profile = str(start_opts.get("profile") or "balanced").lower()
 
@@ -2328,12 +2332,17 @@ class HogwartsPage(Gtk.Box):
                 profile = str(start_opts.get("profile") or "balanced").strip().lower()
                 if profile in ("game", "gameing", "lowlat", "esports"):
                     profile = "gaming"
+                if profile in ("lan", "mjpeg", "ultra", "gaming_lan"):
+                    profile = "gaming-lan"
                 try:
-                    fps = float(start_opts.get("fps") or (60 if profile == "gaming" else 30))
+                    fps = float(
+                        start_opts.get("fps")
+                        or (60 if profile in ("gaming", "gaming-lan") else 30)
+                    )
                 except (TypeError, ValueError):
-                    fps = 60.0 if profile == "gaming" else 30.0
-                if codec == "jpeg" and profile != "gaming":
-                    fps = max(fps, 60.0)
+                    fps = 60.0 if profile in ("gaming", "gaming-lan") else 30.0
+                if profile == "gaming-lan":
+                    codec = "jpeg"
                 try:
                     quality = int(start_opts.get("quality") or 72)
                 except (TypeError, ValueError):
@@ -2463,7 +2472,7 @@ class HogwartsPage(Gtk.Box):
                         return
                     # Gaming: 4ms paint coalesce; balanced: 8ms
                     prof = str(getattr(self, "_ks_profile", "") or "").lower()
-                    paint_ms = 2 if prof == "gaming" else 6
+                    paint_ms = 2 if prof in ("gaming", "gaming-lan") else 6
                     self._ks_paint_src = GLib.timeout_add(paint_ms, _ks_paint_tick)
 
                 def on_status(msg: str, ok: bool | None) -> None:

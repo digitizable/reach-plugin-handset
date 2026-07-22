@@ -43,8 +43,9 @@ _QUALITY: list[tuple[str, int]] = [
 
 # Session latency profiles (sent as session_start.profile + fps/max_side)
 _SESSION_PROFILES: list[tuple[str, str]] = [
-    ("Gaming", "gaming"),  # ≤960 @ 60fps H.264 — casual play target
-    ("Balanced", "balanced"),  # 1280 @ 30fps
+    ("Gaming LAN", "gaming-lan"),  # ≤960 @ 60 MJPEG — lowest felt lag on LAN
+    ("Gaming", "gaming"),  # ≤960 @ 60 H.264/NVENC — WAN/path friendly
+    ("Balanced", "balanced"),  # 1280 @ 30 H.264
     ("Quality", "quality"),  # sharper / slower
 ]
 
@@ -311,10 +312,11 @@ class RemoteDesktopViewer(Gtk.Window):
         self.session_profile_dd = Gtk.DropDown.new_from_strings(
             [lab for lab, _ in _SESSION_PROFILES]
         )
-        self.session_profile_dd.set_selected(0)  # Gaming default for playability
+        self.session_profile_dd.set_selected(0)  # Gaming LAN default
         self.session_profile_dd.set_tooltip_text(
-            "Gaming: ≤960px @ 60fps H.264 (NVENC) — snappiest for light play.\n"
-            "Balanced: 1280 @ 30fps.\n"
+            "Gaming LAN: ≤960 @ 60fps MJPEG — lowest felt lag on lab LAN.\n"
+            "Gaming: ≤960 @ 60fps H.264/NVENC — better when path/bandwidth matters.\n"
+            "Balanced: 1280 @ 30 H.264.\n"
             "Quality: sharper / higher lag."
         )
         self.session_profile_dd.connect(
@@ -1245,7 +1247,10 @@ class RemoteDesktopViewer(Gtk.Window):
             # Gaming Session: flush next main-loop tick (0ms). Balanced: 4ms.
             if ks_up:
                 try:
-                    gaming = self.current_session_profile() == "gaming"
+                    gaming = self.current_session_profile() in (
+                        "gaming",
+                        "gaming-lan",
+                    )
                 except Exception:
                     gaming = True
                 delay_ms = 0 if gaming else 4
@@ -1854,28 +1859,33 @@ class RemoteDesktopViewer(Gtk.Window):
         )
 
     def current_session_profile(self) -> str:
-        """gaming | balanced | quality."""
+        """gaming-lan | gaming | balanced | quality."""
         try:
             i = int(self.session_profile_dd.get_selected())
             if 0 <= i < len(_SESSION_PROFILES):
                 return _SESSION_PROFILES[i][1]
         except Exception:
             pass
-        return "gaming"
+        return "gaming-lan"
 
     def _on_session_profile_changed(self) -> None:
         prof = self.current_session_profile()
-        if prof == "gaming":
-            # Nudge quality dropdown to Fast 960 if currently higher
+        if prof in ("gaming", "gaming-lan"):
             try:
                 if self.current_max_side() > 960:
                     self.quality_dd.set_selected(0)  # Fast 960
             except Exception:
                 pass
-            self._set_status(
-                "Session profile: Gaming (≤960 @ 60fps H.264 / NVENC)",
-                ok=None,
-            )
+            if prof == "gaming-lan":
+                self._set_status(
+                    "Session profile: Gaming LAN (≤960 @ 60fps MJPEG — lowest lag)",
+                    ok=None,
+                )
+            else:
+                self._set_status(
+                    "Session profile: Gaming (≤960 @ 60fps H.264 / NVENC)",
+                    ok=None,
+                )
         elif prof == "quality":
             self._set_status("Session profile: Quality (sharper, more lag)", ok=None)
         else:
@@ -1888,7 +1898,12 @@ class RemoteDesktopViewer(Gtk.Window):
         prof = self.current_session_profile()
         opts["profile"] = prof
         side = self.current_max_side()
-        if prof == "gaming":
+        if prof == "gaming-lan":
+            opts["max_side"] = min(int(side), 960)
+            opts["fps"] = 60
+            opts["quality"] = 68
+            opts["codec"] = "jpeg"  # MJPEG — snappiest on LAN
+        elif prof == "gaming":
             opts["max_side"] = min(int(side), 960)
             opts["fps"] = 60
             opts["quality"] = 70

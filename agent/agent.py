@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     from keepstream.server import session_stop as _ks_session_stop
 
 
-VERSION = "0.5.43-lab"
+VERSION = "0.5.44-lab"
 # Keepstream VIDEO codec byte (matches research keepstream-v0)
 _KS_CODEC_JPEG = 1
 _KS_CODEC_H264 = 2
@@ -1549,11 +1549,19 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
     if "agent_id" not in pl:
         pl["agent_id"] = agent_id
     # Pre-resolve input provider after we have session_id from result — two-phase:
+    def _on_input(events: list) -> None:
+        try:
+            _desktop_input({"events": events})
+        except Exception:
+            pass
+
     res = _ks_session_start(
         pl,
         agent_id=agent_id,
+        agent_version=VERSION,
         elevated=elev,
         screenshot_fn=_shot,
+        input_handler=_on_input,
     )
     if not res.get("started"):
         return res
@@ -1567,6 +1575,7 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
         ip_spec["psk"] = psk
     ip_status = _input_provider_start(ip_spec, session_id=sid, psk=psk)
     res["input_provider"] = ip_status
+    res["agent_version"] = VERSION
     if elev is not None:
         res["elevated"] = elev
     note = str(res.get("note") or "")
