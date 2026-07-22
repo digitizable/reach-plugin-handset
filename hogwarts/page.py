@@ -2305,22 +2305,13 @@ class HogwartsPage(Gtk.Box):
                 max_side = int(start_opts.get("max_side") or 1280)
             else:
                 max_side = int(self._agents.shot_max_side())
-            profile = str(start_opts.get("profile") or "balanced").lower()
-            if profile == "gaming-lan":
-                # Lab LAN: 1440 sweet spot for smooth 60fps
-                max_side = max(960, min(max_side, 1440))
-            elif profile == "gaming":
-                max_side = max(640, min(max_side, 1280))
-            else:
-                max_side = max(960, min(max_side, 1280))
+            profile = str(start_opts.get("profile") or "default").lower()
+            # Single default stream mode — allow sharp res
+            max_side = max(960, min(max_side, 1920))
         except Exception:
-            max_side = (
-                1440
-                if str(start_opts.get("profile") or "") == "gaming-lan"
-                else 1280
-            )
+            max_side = 1600
         # Stash for paint/input tuning while Session is up
-        self._ks_profile = str(start_opts.get("profile") or "balanced").lower()
+        self._ks_profile = "default"
 
         # Init GStreamer on the GTK main thread before any worker uses it.
         # Gst.init from the Keepstream thread freezes Control/Session UI.
@@ -2354,33 +2345,25 @@ class HogwartsPage(Gtk.Box):
                         codec = "jpeg"
                 if codec not in ("jpeg", "h264", "auto"):
                     codec = "jpeg"
-                profile = str(start_opts.get("profile") or "balanced").strip().lower()
-                if profile in ("game", "gameing", "lowlat", "esports"):
-                    profile = "gaming"
-                if profile in ("lan", "mjpeg", "ultra", "gaming_lan"):
-                    profile = "gaming-lan"
+                profile = "default"
                 try:
-                    if start_opts.get("fps") is not None:
-                        fps = float(start_opts.get("fps"))
-                    elif profile in ("gaming", "gaming-lan"):
-                        fps = 60.0
-                    elif profile == "quality":
-                        fps = 45.0
-                    else:
-                        fps = 45.0  # balanced — smooth UI animations
+                    fps = float(start_opts.get("fps") or 60)
                 except (TypeError, ValueError):
-                    fps = 60.0 if profile in ("gaming", "gaming-lan") else 45.0
-                # Honor explicit codec from Session profile
+                    fps = 60.0
+                fps = max(30.0, min(fps, 60.0))
+                # Default stream: MJPEG pure UDP (best feel)
                 if start_opts.get("codec"):
                     c2 = str(start_opts.get("codec") or "").strip().lower()
                     if c2 in ("jpeg", "h264", "auto"):
                         codec = c2
-                elif profile == "gaming-lan":
-                    codec = "jpeg"  # avoid H.264 color "film" on LAN path
+                    else:
+                        codec = "jpeg"
+                else:
+                    codec = "jpeg"
                 try:
-                    quality = int(start_opts.get("quality") or 72)
+                    quality = int(start_opts.get("quality") or 86)
                 except (TypeError, ValueError):
-                    quality = 72
+                    quality = 86
                 payload: dict = {
                     "mode": "keepstream",
                     "face": face if face != "path" else "loopback",
@@ -2395,18 +2378,17 @@ class HogwartsPage(Gtk.Box):
                 # Parsec-class local cursor (gaming profiles default True server-side)
                 if "local_cursor" in start_opts:
                     payload["local_cursor"] = bool(start_opts.get("local_cursor"))
-                elif profile in ("gaming", "gaming-lan"):
+                else:
                     payload["local_cursor"] = True
-                # Host draw_mouse: off for gaming (OS cursor on desk only).
                 if "draw_mouse" in start_opts:
                     payload["draw_mouse"] = bool(start_opts.get("draw_mouse"))
-                elif profile in ("gaming", "gaming-lan"):
+                else:
                     payload["draw_mouse"] = False
                 if "transport" in start_opts:
                     tr = str(start_opts.get("transport") or "").strip().lower()
                     if tr in ("tcp", "udp"):
                         payload["transport"] = tr
-                elif profile in ("gaming", "gaming-lan"):
+                else:
                     payload["transport"] = "udp"
                 ip = start_opts.get("input_provider")
                 if isinstance(ip, dict) and (
@@ -2515,19 +2497,10 @@ class HogwartsPage(Gtk.Box):
                     # One paint scheduled; always paints *latest* frame (smooth).
                     if getattr(self, "_ks_paint_src", None) is not None:
                         return
-                    prof = str(getattr(self, "_ks_profile", "") or "").lower()
-                    # PRIORITY_DEFAULT beats DEFAULT_IDLE so 60fps isn't starved
-                    # by other GTK idle work (chrome, archive, etc.).
-                    if prof in ("gaming", "gaming-lan"):
-                        self._ks_paint_src = GLib.idle_add(
-                            _ks_paint_tick, priority=GLib.PRIORITY_DEFAULT
-                        )
-                    elif prof in ("balanced", "quality"):
-                        self._ks_paint_src = GLib.idle_add(
-                            _ks_paint_tick, priority=GLib.PRIORITY_DEFAULT_IDLE
-                        )
-                    else:
-                        self._ks_paint_src = GLib.timeout_add(4, _ks_paint_tick)
+                    # Always high-priority paint for Default stream @ 60
+                    self._ks_paint_src = GLib.idle_add(
+                        _ks_paint_tick, priority=GLib.PRIORITY_DEFAULT
+                    )
 
                 def on_status(msg: str, ok: bool | None) -> None:
                     def ui() -> bool:

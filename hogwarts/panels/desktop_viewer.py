@@ -41,13 +41,8 @@ _QUALITY: list[tuple[str, int]] = [
     ("Native 4096", 4096),
 ]
 
-# Session latency profiles (sent as session_start.profile + fps/max_side)
-_SESSION_PROFILES: list[tuple[str, str]] = [
-    ("Gaming LAN", "gaming-lan"),  # ≤1600 @ 60 sharp MJPEG + pure UDP
-    ("Gaming", "gaming"),  # ≤1280 @ 60 H.264/NVENC + UDP
-    ("Balanced", "balanced"),  # 1280 @ 45 H.264 — smooth UI animations
-    ("Quality", "quality"),  # sharper / slower
-]
+# Single Keepstream mode (formerly gaming / gaming-lan)
+_SESSION_DEFAULT_PROFILE = "default"
 
 _ARCHIVE_CAP = 250  # max shots kept per agent folder
 _THUMB = 72
@@ -332,40 +327,27 @@ class RemoteDesktopViewer(Gtk.Window):
         sep.set_margin_end(4)
         ribbon.append(sep)
 
-        qlab = Gtk.Label(label="Quality", xalign=0)
+        qlab = Gtk.Label(label="Res", xalign=0)
         qlab.add_css_class("rdv-field")
         ribbon.append(qlab)
         self.quality_dd = Gtk.DropDown.new_from_strings([lab for lab, _ in _QUALITY])
-        qi = 2  # FHD 1920 default
+        # Default HD 1280 for Capture/Live; stream uses up to 1600/1920 itself
+        qi = 1  # HD 1280
         for i, (_, side) in enumerate(_QUALITY):
             if side == max_side:
                 qi = i
                 break
         self.quality_dd.set_selected(qi)
         self.quality_dd.set_tooltip_text(
-            "Capture / Live max side. Gaming LAN Session uses its own profile cap."
+            "Capture / Live max side. Stream mode uses high-res low-latency defaults "
+            "(up to 1600–1920 @ 60 MJPEG UDP)."
         )
         self.quality_dd.connect(
             "notify::selected", lambda *_: self._on_quality_changed()
         )
         ribbon.append(self.quality_dd)
-
-        plab = Gtk.Label(label="Profile", xalign=0)
-        plab.add_css_class("rdv-field")
-        ribbon.append(plab)
-        self.session_profile_dd = Gtk.DropDown.new_from_strings(
-            [lab for lab, _ in _SESSION_PROFILES]
-        )
-        self.session_profile_dd.set_selected(0)  # Gaming LAN default
-        self.session_profile_dd.set_tooltip_text(
-            "Gaming LAN: ≤1280 @ 60 MJPEG · pure UDP.\n"
-            "Gaming: ≤1280 @ 60 H.264/NVENC · UDP.\n"
-            "Balanced / Quality: H.264 TCP."
-        )
-        self.session_profile_dd.connect(
-            "notify::selected", lambda *_: self._on_session_profile_changed()
-        )
-        ribbon.append(self.session_profile_dd)
+        # No multi-profile dropdown — single Default stream mode only
+        self.session_profile_dd = None
 
         self.chk_archive_live = Gtk.CheckButton(label="Archive stream")
         self.chk_archive_live.add_css_class("rdv-check")
@@ -1356,11 +1338,19 @@ class RemoteDesktopViewer(Gtk.Window):
         if ks is not None and bool(getattr(ks, "local_cursor", False)):
             return True
         try:
-            if self.current_session_profile() in ("gaming", "gaming-lan"):
+            # Single default stream mode always uses local cursor path
+            if self.current_session_profile() in (
+                "default",
+                "gaming",
+                "gaming-lan",
+            ):
                 return True
         except Exception:
             pass
         if bool(getattr(self, "_session_local_cursor", False)):
+            return True
+        # Keepstream stream sessions default to local cursor
+        if self._keepstream is not None:
             return True
         return False
 
@@ -1502,17 +1492,12 @@ class RemoteDesktopViewer(Gtk.Window):
         self._last_sent_frac = None  # reset move deadzone
         # Pre-seed local_cursor from profile BEFORE HELLO
         try:
-            if self.current_session_profile() in ("gaming", "gaming-lan"):
-                self._session_local_cursor = True
-                if not bool(getattr(client, "local_cursor", False)):
-                    try:
-                        client.local_cursor = True
-                    except Exception:
-                        pass
-            else:
-                self._session_local_cursor = bool(
-                    getattr(client, "local_cursor", False)
-                )
+            self._session_local_cursor = True
+            if not bool(getattr(client, "local_cursor", False)):
+                try:
+                    client.local_cursor = True
+                except Exception:
+                    pass
         except Exception:
             self._session_local_cursor = True
         self.live_badge.set_text("SESSION")
@@ -2359,76 +2344,29 @@ class RemoteDesktopViewer(Gtk.Window):
         )
 
     def current_session_profile(self) -> str:
-        """gaming-lan | gaming | balanced | quality."""
-        try:
-            i = int(self.session_profile_dd.get_selected())
-            if 0 <= i < len(_SESSION_PROFILES):
-                return _SESSION_PROFILES[i][1]
-        except Exception:
-            pass
-        return "gaming-lan"
+        """Always default — multi-profile UI removed."""
+        return _SESSION_DEFAULT_PROFILE
 
     def _on_session_profile_changed(self) -> None:
-        prof = self.current_session_profile()
-        if prof in ("gaming", "gaming-lan"):
-            try:
-                # Prefer HD 1280 for playable quality (was Fast 960 — too soft)
-                if self.current_max_side() > 1280:
-                    self.quality_dd.set_selected(1)  # HD 1280
-                elif self.current_max_side() < 960:
-                    self.quality_dd.set_selected(1)
-            except Exception:
-                pass
-            if prof == "gaming-lan":
-                self._set_status(
-                    "Session: Gaming LAN (≤1280 @ 60 MJPEG · pure UDP · no film)",
-                    ok=None,
-                )
-            else:
-                self._set_status(
-                    "Session: Gaming (≤1280 @ 60 H.264/NVENC · UDP)",
-                    ok=None,
-                )
-        elif prof == "quality":
-            self._set_status("Session profile: Quality (sharper, more lag)", ok=None)
-        else:
-            self._set_status("Session profile: Balanced (1280 @ 30fps)", ok=None)
+        self._set_status(
+            "Stream: Default · ≤1600–1920 @ 60 MJPEG · pure UDP · low latency",
+            ok=None,
+        )
 
     def session_start_options(self) -> dict[str, Any]:
-        """Extra session_start payload fields (profile + optional input_provider)."""
+        """Single Default stream mode (ex-gaming): quality + low latency."""
         self._save_input_provider_prefs()
         opts: dict[str, Any] = {}
-        prof = self.current_session_profile()
-        opts["profile"] = prof
+        opts["profile"] = _SESSION_DEFAULT_PROFILE
         side = self.current_max_side()
-        if prof == "gaming-lan":
-            # MJPEG = no H.264 color film; pure UDP; host cursor off.
-            # 1280@60 q80 sustains smooth motion without encode thrash.
-            opts["max_side"] = min(max(int(side), 960), 1280)
-            opts["fps"] = 60
-            opts["quality"] = 80
-            opts["codec"] = "jpeg"
-            opts["local_cursor"] = True
-            opts["draw_mouse"] = False
-            opts["transport"] = "udp"
-        elif prof == "gaming":
-            opts["max_side"] = min(int(side), 1280)
-            opts["fps"] = 60
-            opts["quality"] = 75
-            opts["codec"] = "h264"
-            opts["local_cursor"] = True
-            opts["draw_mouse"] = False
-            opts["transport"] = "udp"
-        elif prof == "quality":
-            opts["max_side"] = max(int(side), 1280)
-            opts["fps"] = 45  # smoother than 30 for window animations
-            opts["quality"] = 80
-            opts["codec"] = "h264"
-        else:
-            opts["max_side"] = min(max(int(side), 960), 1280)
-            opts["fps"] = 45  # UI animations / hover feedback
-            opts["quality"] = 74
-            opts["codec"] = "h264"
+        # Prefer sharp stream; floor 1280, allow up to 1920 from Res dropdown
+        opts["max_side"] = min(max(int(side), 1280), 1920)
+        opts["fps"] = 60
+        opts["quality"] = 86  # crisp UI (q:v ~2–3)
+        opts["codec"] = "jpeg"  # pure UDP MJPEG — path that felt best
+        opts["local_cursor"] = True
+        opts["draw_mouse"] = False
+        opts["transport"] = "udp"
         if not hasattr(self, "input_provider_entry"):
             return opts
         cmd = self.input_provider_entry.get_text().strip()
