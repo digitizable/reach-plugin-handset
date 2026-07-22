@@ -1343,6 +1343,70 @@ class RemoteDesktopViewer(Gtk.Window):
             self._frame_source = "live"
 
         pf = (pixel_format or "jpeg").lower()
+        note_u_early = (note or "").upper()
+        is_stream_hint = (
+            (not record_history)
+            or note_u_early.startswith(("LIVE", "SESSION", "STREAM", "KEEPSTREAM"))
+            or " · #" in (note or "")
+            or pf == "rgb24"
+        )
+        # Stream Fit: Gdk.Texture path (faster than PixbufLoader; same pixels)
+        if (
+            is_stream_hint
+            and not self._archive_live
+            and pf == "jpeg"
+            and self._zoom_mode is None
+        ):
+            try:
+                gbytes = GLib.Bytes.new(data)
+                tex = Gdk.Texture.new_from_bytes(gbytes)
+                if tex is None:
+                    raise RuntimeError("no texture")
+                self._texture_ref = tex
+                self._rgb_bytes_ref = gbytes
+                self._raw = data
+                w = int(tex.get_width())
+                h = int(tex.get_height())
+                self._frame_w, self._frame_h = w, h
+                # Lightweight stand-in so hit-testing still has size without
+                # a full software pixbuf decode every frame.
+                if (
+                    self._pixbuf is None
+                    or self._pixbuf.get_width() != w
+                    or self._pixbuf.get_height() != h
+                ):
+                    self._pixbuf = GdkPixbuf.Pixbuf.new(
+                        GdkPixbuf.Colorspace.RGB, False, 8, max(1, w), max(1, h)
+                    )
+                self._note = note or f"{w}×{h} · {_fmt_bytes(len(data))}"
+                if getattr(self, "empty_lab", None) is not None:
+                    try:
+                        if self.empty_lab.get_visible():
+                            self.empty_lab.set_visible(False)
+                    except Exception:
+                        pass
+                self._capturing = False
+                self._current_path = None
+                self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+                self.picture.set_can_shrink(True)
+                self.picture.set_paintable(tex)
+                self.picture.set_size_request(-1, -1)
+                import time as _time
+
+                now = _time.monotonic()
+                last = float(getattr(self, "_stream_chrome_ts", 0.0) or 0.0)
+                if now - last >= 2.0:
+                    self._stream_chrome_ts = now
+                    try:
+                        self.meta_lab.set_text(
+                            f"{w}×{h}  ·  {_fmt_bytes(len(data))}"
+                        )
+                    except Exception:
+                        pass
+                return
+            except Exception:
+                pass  # fall through to Pixbuf path
+
         try:
             if pf == "rgb24":
                 w = int(width or 0)
@@ -1380,6 +1444,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self._raw = data if pf != "rgb24" else b""
         self._pixbuf = pb
         w, h = pb.get_width(), pb.get_height()
+        self._frame_w, self._frame_h = w, h
         self._note = note or f"{w}×{h} · {_fmt_bytes(len(data))}"
         # Never write to disk unless user checked "Save to disk" (_archive_live)
         note_u = self._note.upper()

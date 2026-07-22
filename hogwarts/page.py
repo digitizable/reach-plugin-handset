@@ -2452,29 +2452,30 @@ class HogwartsPage(Gtk.Box):
 
                 from hogwarts.keepstream import KeepstreamClient
 
-                # Coalesce paints on a timer (not idle_add): idle floods at 30fps
-                # starve GTK input and freeze Control. Always show newest frame.
+                # Steady paint pump (~120 Hz try) — always pops *latest* frame.
+                # More reliable for LAN 60 than idle_add (which starves under load).
                 self._ks_paint_src = None
+                self._ks_paint_n = 0
 
                 def _ks_paint_tick() -> bool:
-                    self._ks_paint_src = None
                     if not self._agents.desktop_viewer_open():
+                        self._ks_paint_src = None
                         return False
                     ks_ref = getattr(self, "_keepstream", None)
+                    if ks_ref is None or not getattr(ks_ref, "connected", False):
+                        # Keep timer until disconnect handler clears it
+                        return True
                     item = None
-                    if ks_ref is not None:
-                        try:
-                            item = ks_ref.pop_latest_frame()
-                        except Exception:
-                            item = None
+                    try:
+                        item = ks_ref.pop_latest_frame()
+                    except Exception:
+                        item = None
                     if item is None:
-                        return False
+                        return True  # no new frame; try again next tick
                     data, meta = item
-                    # Throttle STREAM note strings — building them every frame
-                    # steals main-thread time from GdkPixbuf decode @ 60.
                     n = int(getattr(self, "_ks_paint_n", 0) or 0) + 1
                     self._ks_paint_n = n
-                    if n == 1 or n % 45 == 0:
+                    if n == 1 or n % 60 == 0:
                         rtt = meta.get("rtt_ms")
                         rtt_s = (
                             f" · rtt {rtt:.0f}ms"
@@ -2494,6 +2495,23 @@ class HogwartsPage(Gtk.Box):
                         )
                     else:
                         note = "STREAM"
+                    # Paint straight into the viewer — skip Agents status thrash
+                    dv = getattr(self._agents, "_desktop_viewer", None)
+                    if dv is not None:
+                        try:
+                            dv.apply_frame(
+                                data,
+                                note=note,
+                                ok=True,
+                                record_history=False,
+                                pixel_format=str(meta.get("pixel_format") or "")
+                                or None,
+                                width=meta.get("width"),
+                                height=meta.get("height"),
+                            )
+                            return True
+                        except Exception:
+                            pass
                     self._agents.set_desktop_frame(
                         data,
                         note=note,
@@ -2503,16 +2521,14 @@ class HogwartsPage(Gtk.Box):
                         width=meta.get("width"),
                         height=meta.get("height"),
                     )
-                    return False
+                    return True
 
                 def on_frame(_data: bytes, _meta: dict) -> None:
-                    # One paint scheduled; always paints *latest* frame (smooth).
+                    # Ensure paint pump is running (idempotent)
                     if getattr(self, "_ks_paint_src", None) is not None:
                         return
-                    # HIGH_IDLE: after events, before low-priority GTK work
-                    self._ks_paint_src = GLib.idle_add(
-                        _ks_paint_tick, priority=GLib.PRIORITY_HIGH_IDLE
-                    )
+                    # 8ms ≈ 125 Hz pull; still latest-frame-only (drops intermediates)
+                    self._ks_paint_src = GLib.timeout_add(8, _ks_paint_tick)
 
                 def on_status(msg: str, ok: bool | None) -> None:
                     def ui() -> bool:
