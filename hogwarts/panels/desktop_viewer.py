@@ -133,9 +133,8 @@ class RemoteDesktopViewer(Gtk.Window):
         # Input batching (Control mode latency)
         self._input_queue: list[dict[str, Any]] = []
         self._input_flush_src: int | None = None
-        self._drag_active = False
-        self._drag_sent_down = False
-        self._drag_start: tuple[float, float] | None = None
+        self._drag_active = False  # True while any mouse button held for remote
+        self._buttons_held: set[str] = set()  # {"left","right","middle"}
         self._last_move_flush = 0.0
         self._last_sent_frac: tuple[float, float] | None = None
         self._live_interval_sec = 1.0  # float seconds; Control drops to 0.5
@@ -596,139 +595,137 @@ class RemoteDesktopViewer(Gtk.Window):
         self.picture.set_vexpand(True)
         self.picture.add_css_class("rdv-picture")
 
-        # Watch: click toggles zoom / double-click fullscreen
-        click = Gtk.GestureClick()
-        click.set_button(1)
+        # ── Mouse: explicit button down/up (no GestureDrag) ──────────
+        # GestureDrag was auto-firing left-down after tiny motion, so Roblox
+        # Studio treated every move as a left drag (broke RMB orbit + WASD).
+        # Model: press → down, release → up, motion → move only (OS keeps hold).
 
-        def on_img_click(
+        def _release_all_remote_buttons() -> None:
+            held = list(getattr(self, "_buttons_held", set()) or [])
+            self._buttons_held = set()
+            self._drag_active = False
+            if not held:
+                return
+            frac = getattr(self, "_cursor_frac", None)
+            fx = float(frac[0]) if isinstance(frac, tuple) else 0.5
+            fy = float(frac[1]) if isinstance(frac, tuple) else 0.5
+            try:
+                self._send_input(
+                    [
+                        {"type": "up", "fx": fx, "fy": fy, "button": b}
+                        for b in held
+                    ]
+                )
+            except Exception:
+                pass
+
+        self._release_all_remote_buttons = _release_all_remote_buttons  # type: ignore[method-assign]
+
+        def _remote_button_down(button: str, x: float, y: float) -> None:
+            if not self._accepts_remote_input() or self._pixbuf is None:
+                return
+            frac = self._widget_xy_to_frac(self.picture, x, y)
+            if frac is None:
+                return
+            fx, fy = frac
+            self._cursor_frac = frac
+            # Already held (auto-repeat) — do not re-send down
+            if button in self._buttons_held:
+                return
+            self._buttons_held.add(button)
+            self._drag_active = True
+            self._queue_input(
+                {"type": "down", "fx": fx, "fy": fy, "button": button}
+            )
+            self._flush_input(force=True)
+            try:
+                self.picture.grab_focus()
+            except Exception:
+                pass
+
+        def _remote_button_up(button: str, x: float, y: float) -> None:
+            if button not in self._buttons_held:
+                return
+            self._buttons_held.discard(button)
+            self._drag_active = bool(self._buttons_held)
+            frac = self._widget_xy_to_frac(self.picture, x, y)
+            if frac is None:
+                frac = getattr(self, "_cursor_frac", None)
+            if not isinstance(frac, tuple):
+                frac = (0.5, 0.5)
+            fx, fy = float(frac[0]), float(frac[1])
+            self._queue_input(
+                {"type": "up", "fx": fx, "fy": fy, "button": button}
+            )
+            self._flush_input(force=True)
+
+        # Left button
+        lclick = Gtk.GestureClick()
+        lclick.set_button(1)
+
+        def on_left_pressed(
             _g: Gtk.GestureClick, n_press: int, x: float, y: float
         ) -> None:
             if self._accepts_remote_input():
-                # Control mode only — claim focus for host typing
-                try:
-                    self.picture.grab_focus()
-                except Exception:
-                    pass
-                return  # drag gesture owns left button when controlling
-            # Watch: stream is look-only; optional zoom on click
+                _remote_button_down("left", x, y)
+                return
+            # Watch: zoom / fullscreen only
             if n_press == 1 and self._pixbuf is not None:
                 self._set_zoom(1.0 if self._zoom_mode is None else None)
             elif n_press >= 2:
                 self._toggle_fullscreen()
 
-        click.connect("pressed", on_img_click)
-        self.picture.add_controller(click)
+        def on_left_released(
+            _g: Gtk.GestureClick, n_press: int, x: float, y: float
+        ) -> None:
+            if self._accepts_remote_input() or "left" in self._buttons_held:
+                _remote_button_up("left", x, y)
 
-        # Control: left drag = click or drag (down/move/up)
-        drag = Gtk.GestureDrag()
-        drag.set_button(1)
+        lclick.connect("pressed", on_left_pressed)
+        lclick.connect("released", on_left_released)
+        self.picture.add_controller(lclick)
 
-        def on_drag_begin(_g: Gtk.GestureDrag, x: float, y: float) -> None:
-            if not self._accepts_remote_input() or self._pixbuf is None:
-                return
-            frac = self._widget_xy_to_frac(self.picture, x, y)
-            if frac is None:
-                self._drag_active = False
-                return
-            self._drag_active = True
-            self._drag_sent_down = False
-            self._drag_start = frac
-
-        def on_drag_update(_g: Gtk.GestureDrag, x: float, y: float) -> None:
-            if not self._drag_active or not self._accepts_remote_input():
-                return
-            ok, ox, oy = _g.get_start_point()
-            if not ok:
-                return
-            frac = self._widget_xy_to_frac(self.picture, ox + x, oy + y)
-            if frac is None:
-                return
-            fx, fy = frac
-            # Distance in widget px
-            dist = (x * x + y * y) ** 0.5
-            if not self._drag_sent_down:
-                if dist < 6:
-                    return  # still a potential click
-                # Begin drag
-                sx, sy = self._drag_start or (fx, fy)
-                self._queue_input({"type": "down", "fx": sx, "fy": sy, "button": "left"})
-                self._drag_sent_down = True
-            self._queue_input({"type": "move", "fx": fx, "fy": fy})
-
-        def on_drag_end(_g: Gtk.GestureDrag, x: float, y: float) -> None:
-            if not self._drag_active or not self._accepts_remote_input():
-                self._drag_active = False
-                return
-            ok, ox, oy = _g.get_start_point()
-            self._drag_active = False
-            if not ok:
-                return
-            frac = self._widget_xy_to_frac(self.picture, ox + x, oy + y)
-            if frac is None:
-                frac = self._drag_start
-            if frac is None:
-                return
-            fx, fy = frac
-            if self._drag_sent_down:
-                self._queue_input({"type": "up", "fx": fx, "fy": fy, "button": "left"})
-                self._set_status(f"Drag end @ ({fx:.2f}, {fy:.2f})", ok=True)
-            else:
-                # Click (no meaningful drag)
-                self._queue_input(
-                    {"type": "click", "fx": fx, "fy": fy, "button": "left"}
-                )
-            self._drag_sent_down = False
-            self._flush_input(force=True)
-
-        drag.connect("drag-begin", on_drag_begin)
-        drag.connect("drag-update", on_drag_update)
-        drag.connect("drag-end", on_drag_end)
-        self.picture.add_controller(drag)
-
-        # Right click in Control mode
+        # Right button — hold + move = orbit camera (Roblox Studio)
         rclick = Gtk.GestureClick()
         rclick.set_button(3)
 
-        def on_right(
+        def on_right_pressed(
             _g: Gtk.GestureClick, n_press: int, x: float, y: float
         ) -> None:
-            if not self._accepts_remote_input() or self._pixbuf is None:
-                return
-            frac = self._widget_xy_to_frac(self.picture, x, y)
-            if frac is None:
-                return
-            fx, fy = frac
-            self._queue_input(
-                {"type": "click", "fx": fx, "fy": fy, "button": "right"}
-            )
-            self._flush_input(force=True)
+            if self._accepts_remote_input():
+                _remote_button_down("right", x, y)
 
-        rclick.connect("pressed", on_right)
+        def on_right_released(
+            _g: Gtk.GestureClick, n_press: int, x: float, y: float
+        ) -> None:
+            if self._accepts_remote_input() or "right" in self._buttons_held:
+                _remote_button_up("right", x, y)
+
+        rclick.connect("pressed", on_right_pressed)
+        rclick.connect("released", on_right_released)
         self.picture.add_controller(rclick)
 
-        # Middle click in Control mode
+        # Middle button
         mclick = Gtk.GestureClick()
         mclick.set_button(2)
 
-        def on_middle(
+        def on_middle_pressed(
             _g: Gtk.GestureClick, n_press: int, x: float, y: float
         ) -> None:
-            if not self._accepts_remote_input() or self._pixbuf is None:
-                return
-            frac = self._widget_xy_to_frac(self.picture, x, y)
-            if frac is None:
-                return
-            fx, fy = frac
-            self._queue_input(
-                {"type": "click", "fx": fx, "fy": fy, "button": "middle"}
-            )
-            self._flush_input(force=True)
+            if self._accepts_remote_input():
+                _remote_button_down("middle", x, y)
 
-        mclick.connect("pressed", on_middle)
+        def on_middle_released(
+            _g: Gtk.GestureClick, n_press: int, x: float, y: float
+        ) -> None:
+            if self._accepts_remote_input() or "middle" in self._buttons_held:
+                _remote_button_up("middle", x, y)
+
+        mclick.connect("pressed", on_middle_pressed)
+        mclick.connect("released", on_middle_released)
         self.picture.add_controller(mclick)
 
-        # Hover move: absolute fx/fy — rate-limited + deadzone to stop host
-        # cursor jitter (double SetCursorPos + sub-pixel flip-flop).
+        # Hover / drag move: absolute fx/fy only — never synthesizes clicks
         motion = Gtk.EventControllerMotion()
 
         def on_motion(_c: Gtk.EventControllerMotion, x: float, y: float) -> None:
@@ -739,19 +736,16 @@ class RemoteDesktopViewer(Gtk.Window):
                     self._cursor_frac = frac
                 self._last_motion_xy = (x, y)
 
-            if (
-                not self._accepts_remote_input()
-                or self._pixbuf is None
-                or self._drag_active
-            ):
+            if not self._accepts_remote_input() or self._pixbuf is None:
                 return
             import time as _time
 
             now = _time.monotonic()
             ks = self._keepstream
             ks_up = bool(ks is not None and getattr(ks, "connected", False))
-            # ~45 Hz + larger deadzone — host SetCursorPos thrash = jitter
-            min_dt = 0.022 if ks_up else 0.04
+            # Snappier while any button held (orbit / select drag)
+            holding = bool(self._buttons_held)
+            min_dt = (0.012 if holding else 0.022) if ks_up else 0.04
             if now - self._last_move_flush < min_dt:
                 return
 
@@ -760,8 +754,8 @@ class RemoteDesktopViewer(Gtk.Window):
             if frac is None:
                 return
             fx, fy = frac
-            # Quantize to ~2px grid on a 1920-wide screen to stop flip-flop
-            q = 0.0012
+            # Smaller deadzone while dragging for smooth camera
+            q = 0.0006 if holding else 0.0012
             fx = round(fx / q) * q
             fy = round(fy / q) * q
             prev = self._last_sent_frac
@@ -770,11 +764,14 @@ class RemoteDesktopViewer(Gtk.Window):
                     return
             self._last_move_flush = now
             self._last_sent_frac = (fx, fy)
+            # move only — button state stays from down/up (no phantom click)
             self._queue_input({"type": "move", "fx": fx, "fy": fy})
 
         def on_leave(_c: Gtk.EventControllerMotion) -> None:
             self._last_motion_xy = None
-            # Keep last_sent_frac — re-enter shouldn't snap host cursor
+            # Release buttons if pointer leaves while held (avoids stuck LMB drag)
+            if self._buttons_held:
+                _release_all_remote_buttons()
 
         def on_enter(_c: Gtk.EventControllerMotion, x: float, y: float) -> None:
             self._last_motion_xy = (x, y)
@@ -1712,7 +1709,7 @@ class RemoteDesktopViewer(Gtk.Window):
         prev = self._mode
         self._mode = mode
         self._control_on = mode == "control"
-        # Leaving Control: release any held game keys (WASD stuck walk)
+        # Leaving Control: release held keys + mouse buttons (no stuck LMB/WASD)
         if prev == "control" and mode != "control":
             try:
                 rel = getattr(self, "_release_all_remote_keys", None)
@@ -1720,6 +1717,13 @@ class RemoteDesktopViewer(Gtk.Window):
                     rel()
             except Exception:
                 self._keys_held = set()
+            try:
+                rbtn = getattr(self, "_release_all_remote_buttons", None)
+                if callable(rbtn):
+                    rbtn()
+            except Exception:
+                self._buttons_held = set()
+                self._drag_active = False
         ks_up = bool(
             self._keepstream is not None
             and getattr(self._keepstream, "connected", False)
@@ -1821,6 +1825,7 @@ class RemoteDesktopViewer(Gtk.Window):
         ks_up = bool(ks is not None and getattr(ks, "connected", False))
         et = str(event.get("type") or "")
         # Immediate path for hover + typing (no GLib delay)
+        # Immediate path: moves, buttons, keys (no GLib delay — games need this)
         if ks_up and et in (
             "move",
             "rmove",
@@ -1830,6 +1835,9 @@ class RemoteDesktopViewer(Gtk.Window):
             "key_down",
             "key_up",
             "type",
+            "down",
+            "up",
+            "click",
         ):
             try:
                 if et == "move" and not self._input_queue:
@@ -1843,6 +1851,9 @@ class RemoteDesktopViewer(Gtk.Window):
                     "key_down",
                     "key_up",
                     "type",
+                    "down",
+                    "up",
+                    "click",
                 ):
                     ks.send_input([event])
                     return
@@ -2803,6 +2814,12 @@ class RemoteDesktopViewer(Gtk.Window):
             rel = getattr(self, "_release_all_remote_keys", None)
             if callable(rel):
                 rel()
+        except Exception:
+            pass
+        try:
+            rbtn = getattr(self, "_release_all_remote_buttons", None)
+            if callable(rbtn):
+                rbtn()
         except Exception:
             pass
         if self._input_flush_src is not None:
