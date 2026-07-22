@@ -1821,9 +1821,8 @@ class AgentsPanel(Gtk.Box):
             on_live_interval=on_live_interval,
             on_closed=on_closed,
         )
-        parent = self.get_root()
-        if isinstance(parent, Gtk.Window):
-            win.set_transient_for(parent)
+        # Do NOT set_transient_for(Reach) — transient dialogs often cannot
+        # maximize and stay stacked under the main window on some WMs.
         self._desktop_viewer = win
         self.desktop_status.set_text(
             "Remote Viewer open — use Capture / Live / Session in that window."
@@ -1831,6 +1830,15 @@ class AgentsPanel(Gtk.Box):
         self.desktop_status.remove_css_class("hogwarts-fail")
         self.desktop_status.add_css_class("hogwarts-ok")
         win.present()
+        # Offer a maximized canvas by default (Session is the main use case)
+        def _max_once() -> bool:
+            try:
+                win.maximize()
+            except Exception:
+                pass
+            return False
+
+        GLib.idle_add(_max_once)
         self._sync_work_tab_labels()
         if auto_shot:
             # Density: Open + Capture from Desktop tab

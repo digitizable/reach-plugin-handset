@@ -110,7 +110,14 @@ class RemoteDesktopViewer(Gtk.Window):
         super().__init__(title=f"Remote Viewer - {agent_label}")
         self.set_default_size(1180, 740)
         self.set_modal(False)
+        # Must stay resizable and non-transient so the WM maximize button works
+        # (set_transient_for parent makes many WMs refuse maximize).
+        try:
+            self.set_resizable(True)
+        except Exception:
+            pass
         self.add_css_class("rdv-win")
+        self._maximized = False
 
         self._agent_id = agent_id
         self._agent_label = agent_label
@@ -347,6 +354,25 @@ class RemoteDesktopViewer(Gtk.Window):
         rsp = Gtk.Box()
         rsp.set_hexpand(True)
         ribbon.append(rsp)
+
+        self.btn_max = _icon_btn(
+            "window-maximize-symbolic",
+            "Maximize window (F10) — free-floating; not tied to Reach",
+        )
+        # Fallback icon if theme lacks window-maximize-symbolic
+        try:
+            self.btn_max.set_icon_name("view-fullscreen-symbolic")
+        except Exception:
+            pass
+        # Prefer maximize icon when available
+        try:
+            img = self.btn_max.get_child()
+            if isinstance(img, Gtk.Image):
+                img.set_from_icon_name("window-maximize-symbolic")
+        except Exception:
+            pass
+        self.btn_max.connect("clicked", lambda *_: self._toggle_maximize())
+        ribbon.append(self.btn_max)
 
         self.btn_fs = _icon_btn("view-fullscreen", "Fullscreen (F11)")
         self.btn_fs.connect("clicked", lambda *_: self._toggle_fullscreen())
@@ -892,6 +918,9 @@ class RemoteDesktopViewer(Gtk.Window):
             ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
             if keyval == Gdk.KEY_Escape and self._fullscreen:
                 self._toggle_fullscreen()
+                return True
+            if keyval == Gdk.KEY_F10:
+                self._toggle_maximize()
                 return True
             if keyval == Gdk.KEY_F11:
                 self._toggle_fullscreen()
@@ -2509,9 +2538,35 @@ class RemoteDesktopViewer(Gtk.Window):
         self.picture.set_pixbuf(scaled)
         self.picture.set_size_request(tw, th)
 
+    def _toggle_maximize(self) -> None:
+        """Maximize / unmaximize via GTK (WM title-bar maximize also works)."""
+        try:
+            if self.is_fullscreen():
+                self.unfullscreen()
+                self._fullscreen = False
+        except Exception:
+            pass
+        try:
+            if self.is_maximized():
+                self.unmaximize()
+                self._maximized = False
+                self._set_status("Window restored", ok=None)
+            else:
+                self.maximize()
+                self._maximized = True
+                self._set_status("Window maximized — drag edges or F10 to restore", ok=True)
+        except Exception as exc:
+            self._set_status(f"Maximize failed: {exc}", ok=False)
+
     def _toggle_fullscreen(self) -> None:
         self._fullscreen = not self._fullscreen
         if self._fullscreen:
+            try:
+                if self.is_maximized():
+                    self.unmaximize()
+                    self._maximized = False
+            except Exception:
+                pass
             self.fullscreen()
         else:
             self.unfullscreen()
