@@ -22,37 +22,65 @@ Write-Host "=== Hogwarts Windows agent build ==="
 Write-Host "Root: $Root"
 Write-Host "Out:  $OutDir"
 
+# Prefer full python.exe over Windows `py` launcher (py often has no SDK / -3 fails).
+function Test-PythonExe([string]$cmd) {
+    try {
+        $out = & $cmd -c "import sys; print(sys.version)" 2>$null
+        return ($LASTEXITCODE -eq 0 -and $out)
+    } catch { return $false }
+}
+
 $py = $null
-foreach ($c in @("py", "python", "python3")) {
-    if (Get-Command $c -ErrorAction SilentlyContinue) {
+$usePyLauncherArgs = $false
+foreach ($c in @("python", "python3", "py")) {
+    if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { continue }
+    if ($c -eq "py") {
+        # Only use py if `py -3` works
+        try {
+            $v = & py -3 -c "import sys; print(sys.version)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $v) {
+                $py = "py"
+                $usePyLauncherArgs = $true
+                break
+            }
+        } catch {}
+        continue
+    }
+    if (Test-PythonExe $c) {
         $py = $c
         break
     }
 }
-if (-not $py) { throw "Python 3.10+ not on PATH (py/python)" }
+if (-not $py) { throw "Python 3.10+ not on PATH (python/python3; py -3 also ok)" }
+Write-Host "Using interpreter: $py$(if ($usePyLauncherArgs) { ' -3' })"
 
-& $py -3 -m pip install -q "pyinstaller>=6.0"
+function Invoke-Py([string[]]$PyArgs) {
+    if ($usePyLauncherArgs) {
+        & $py -3 @PyArgs
+    } else {
+        & $py @PyArgs
+    }
+}
+
+Invoke-Py @("-m", "pip", "install", "-q", "pyinstaller>=6.0")
 if ($LASTEXITCODE -ne 0) {
-    & $py -m pip install -q "pyinstaller>=6.0"
+    Invoke-Py @("-m", "pip", "install", "-q", "pyinstaller>=6.0")
 }
 
 $work = Join-Path $OutDir "build"
 $spec = $OutDir
-& $py -3 -m PyInstaller `
-    --onefile --clean --noconfirm `
-    --name $Name `
-    --distpath $OutDir `
-    --workpath $work `
-    --specpath $spec `
+$piArgs = @(
+    "-m", "PyInstaller",
+    "--onefile", "--clean", "--noconfirm",
+    "--name", $Name,
+    "--distpath", $OutDir,
+    "--workpath", $work,
+    "--specpath", $spec,
     $AgentPy
+)
+Invoke-Py $piArgs
 if ($LASTEXITCODE -ne 0) {
-    & $py -m PyInstaller `
-        --onefile --clean --noconfirm `
-        --name $Name `
-        --distpath $OutDir `
-        --workpath $work `
-        --specpath $spec `
-        $AgentPy
+    Invoke-Py $piArgs
 }
 
 $exe = Join-Path $OutDir "$Name.exe"
