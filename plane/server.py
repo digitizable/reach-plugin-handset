@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlparse
 # Max JSON body (operator + agent). Aligns with RESULT_CAP / upload chunks.
 MAX_BODY_BYTES = 4_000_000
 
-VERSION = "0.5.20-lab"
+VERSION = "0.5.21-lab"
 DEFAULT_ADDR = "127.0.0.1:8080"
 DEFAULT_SLEEP = 1.0  # lab default — snappier task round-trips
 DEFAULT_JITTER = 0.1

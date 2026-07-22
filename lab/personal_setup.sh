@@ -25,10 +25,18 @@ docker build -t "$AGENT_IMG" -f lab/Dockerfile.agent . -q
 echo "==> network + plane"
 docker network create "$NET" >/dev/null 2>&1 || true
 docker rm -f hogwarts-plane hogwarts-agent hogwarts-agent-2 hogwarts-agent-3 2>/dev/null || true
+# Persist SQLite on the host so rebuilds keep fleet / packages / canaries
+PLANE_DB_HOST="${PLANE_DB_HOST:-$PERSONAL/plane.db}"
+mkdir -p "$(dirname "$PLANE_DB_HOST")"
+# Seed from a running container once if host DB is empty
+if [ ! -s "$PLANE_DB_HOST" ] && docker ps -a --format '{{.Names}}' | grep -qx hogwarts-plane; then
+  docker cp hogwarts-plane:/data/plane.db "$PLANE_DB_HOST" 2>/dev/null || true
+fi
 docker run -d --name hogwarts-plane --network "$NET" \
   -e PLANE_OPERATOR_TOKEN="$TOKEN" \
   -e PLANE_HTTP_ADDR=0.0.0.0:8080 \
   -e PLANE_DB=/data/plane.db \
+  -v "$PLANE_DB_HOST:/data/plane.db" \
   -p 8080:8080 \
   "$PLANE_IMG" >/dev/null
 

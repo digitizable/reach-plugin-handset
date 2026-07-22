@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.24-lab"
+VERSION = "0.5.25-lab"
 MIN_SLEEP = 0.12  # Control needs sub-200ms check-ins
 # Set by main(); when False, loop only logs enroll/errors/tasks>0 (less disk thrash)
 _AGENT_VERBOSE = False
@@ -2082,8 +2082,23 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
     ip_status = _input_provider_start(ip_spec, session_id=session_id, psk=psk)
 
     elev = _process_elevated()
+    # Capture method is set when the first Keepstream client connects; until then
+    # advertise capability (ffmpeg on PATH vs PIL-only).
+    import shutil as _shutil
+
+    has_ff = bool(_shutil.which("ffmpeg"))
+    capture_hint = (
+        "ffmpeg-gdigrab-mjpeg"
+        if has_ff and os.name == "nt"
+        else ("ffmpeg-x11grab-mjpeg" if has_ff else "pil-fallback")
+    )
+    # Prefer live method if a session client already negotiated capture
+    live_cap = str(_KEEPSTREAM.get("capture") or "").strip()
+    if live_cap:
+        capture_hint = live_cap
     note = (
-        "Keepstream 60fps target via ffmpeg MJPEG (x11grab/gdigrab); "
+        f"Keepstream capture={capture_hint}. "
+        "60fps target via ffmpeg MJPEG (x11grab/gdigrab); "
         "PIL fallback if ffmpeg missing. Latest-frame drop under load."
     )
     if ip_status.get("active"):
@@ -2107,7 +2122,8 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
         "max_side": max_side,
         "fps": fps,
         "quality": quality,
-        "capture": "ffmpeg-mjpeg-or-pil",
+        "capture": capture_hint,
+        "agent_version": VERSION,
         "note": note,
         "input_provider": ip_status,
     }
