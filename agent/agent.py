@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.39-lab"
+VERSION = "0.5.40-lab"
 # Keepstream VIDEO codec byte (matches research keepstream-v0)
 _KS_CODEC_JPEG = 1
 _KS_CODEC_H264 = 2
@@ -1814,8 +1814,16 @@ class _FfmpegH264Source:
                 + grab
                 + [
                     "-vf",
-                    # fast bilinear scale — lanczos adds free latency
-                    f"scale={ow}:{oh}:flags=fast_bilinear,format=yuv420p",
+                    # fast scale + explicit limited-range bt709 (less filmy cast)
+                    f"scale={ow}:{oh}:flags=fast_bilinear,format=yuv420p,setsar=1",
+                    "-colorspace",
+                    "bt709",
+                    "-color_primaries",
+                    "bt709",
+                    "-color_trc",
+                    "bt709",
+                    "-color_range",
+                    "tv",
                     "-c:v",
                     encoder,
                 ]

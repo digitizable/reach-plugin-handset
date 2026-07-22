@@ -890,25 +890,52 @@ class RemoteDesktopViewer(Gtk.Window):
         ok: bool | None = True,
         record_history: bool = True,
         path: Path | None = None,
+        pixel_format: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
     ) -> None:
         """Decode and display a frame; archive new captures to disk.
 
-        Keepstream / Live stream frames take a **fast path**: JPEG→pixbuf→paint
-        only. Skipping history/title/status thrash every frame is what keeps
-        Control + Session responsive under 20–30 fps H.264.
+        Keepstream / Live stream frames take a **fast path**: RGB24 or JPEG →
+        pixbuf → paint only (no history thrash). H.264 Session uses RGB24 from
+        GStreamer (skips filmy JPEG recompress, lower latency).
         """
+        pf = (pixel_format or "jpeg").lower()
         try:
-            loader = GdkPixbuf.PixbufLoader()
-            loader.write(data)
-            loader.close()
-            pb = loader.get_pixbuf()
-            if pb is None:
-                raise RuntimeError("no pixbuf")
+            if pf == "rgb24":
+                w = int(width or 0)
+                h = int(height or 0)
+                if w <= 0 or h <= 0 or len(data) < w * h * 3:
+                    raise RuntimeError("bad rgb24 frame")
+                # GLib.Bytes keeps backing store for the pixbuf lifetime
+                gbytes = GLib.Bytes.new(data[: w * h * 3])
+                pb = GdkPixbuf.Pixbuf.new_from_bytes(
+                    gbytes,
+                    GdkPixbuf.Colorspace.RGB,
+                    False,
+                    8,
+                    w,
+                    h,
+                    w * 3,
+                )
+                if pb is None:
+                    raise RuntimeError("no pixbuf from rgb24")
+                # Keep a ref so GC doesn't drop pixels early
+                self._rgb_bytes_ref = gbytes
+            else:
+                loader = GdkPixbuf.PixbufLoader()
+                loader.write(data)
+                loader.close()
+                pb = loader.get_pixbuf()
+                if pb is None:
+                    raise RuntimeError("no pixbuf")
+                self._rgb_bytes_ref = None
         except Exception as exc:
             self._set_status(f"Decode failed: {exc}", ok=False)
             return
 
-        self._raw = data
+        # For stream RGB we don't keep JPEG bytes for export; still set _raw
+        self._raw = data if pf != "rgb24" else b""
         self._pixbuf = pb
         w, h = pb.get_width(), pb.get_height()
         self._note = note or f"{w}×{h} · {_fmt_bytes(len(data))}"
@@ -918,6 +945,7 @@ class RemoteDesktopViewer(Gtk.Window):
             (not record_history)
             or note_u.startswith(("LIVE", "SESSION", "STREAM", "KEEPSTREAM"))
             or " · #" in self._note  # Keepstream frame_id notes
+            or pf == "rgb24"
         )
 
         if is_stream and not self._archive_live:

@@ -288,31 +288,38 @@ class KeepstreamClient:
                     bitstream = payload[off:]
                     if not bitstream:
                         continue
-                    # Wire: 1=jpeg 2=h264 — decode H.264 AUs to JPEG for GTK paint
+                    # Wire: 1=jpeg 2=h264
+                    # H.264 → RGB24 on desk (no jpegenc — less lag, less filmy cast)
                     paint = bitstream
                     codec_name = "jpeg"
+                    pixel_format = "jpeg"
+                    pw, ph = int(w), int(h)
                     if int(codec) == 2:
                         codec_name = "h264"
                         try:
-                            from hogwarts.h264dec import decode_h264_au_to_jpeg
+                            from hogwarts.h264dec import decode_h264_au_to_rgb
 
-                            jpg = decode_h264_au_to_jpeg(bitstream)
-                            if not jpg:
+                            rgb = decode_h264_au_to_rgb(bitstream)
+                            if rgb is None:
                                 continue
-                            paint = jpg
+                            paint = rgb.data
+                            pw, ph = rgb.width, rgb.height
+                            pixel_format = "rgb24"
                         except Exception as exc:
                             self._status(f"Keepstream H.264 decode: {exc}", False)
                             continue
                     elif int(codec) == 1:
                         codec_name = "jpeg"
+                        pixel_format = "jpeg"
                     self.frames += 1
                     meta = {
                         "frame_id": frame_id,
                         "pts_ms": pts_ms,
-                        "width": w,
-                        "height": h,
+                        "width": pw,
+                        "height": ph,
                         "codec": codec,
                         "codec_name": codec_name,
+                        "pixel_format": pixel_format,
                         "keyframe": bool(is_key),
                         "bytes": len(bitstream),
                         "paint_bytes": len(paint),

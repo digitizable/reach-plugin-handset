@@ -2419,7 +2419,13 @@ class HogwartsPage(Gtk.Box):
                         f"{rtt_s}{drop_s}"
                     )
                     self._agents.set_desktop_frame(
-                        data, note=note, ok=True, record_history=False
+                        data,
+                        note=note,
+                        ok=True,
+                        record_history=False,
+                        pixel_format=str(meta.get("pixel_format") or "") or None,
+                        width=meta.get("width"),
+                        height=meta.get("height"),
                     )
                     return False
 

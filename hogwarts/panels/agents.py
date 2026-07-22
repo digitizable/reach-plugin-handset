@@ -1850,11 +1850,15 @@ class AgentsPanel(Gtk.Box):
         note: str = "",
         ok: bool | None = True,
         record_history: bool | None = None,
+        pixel_format: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
     ) -> None:
         """Cache frame and push into Remote Viewer window (only image UI).
 
         Stream frames (Live / Keepstream) default to not writing ~/Pictures.
         Explicit Capture keeps record_history=True.
+        ``pixel_format``: ``jpeg`` (default) or ``rgb24`` (Keepstream H.264).
         """
         self._frame_bytes = data
         self._frame_note = note or f"Frame {len(data)} bytes"
@@ -1877,7 +1881,13 @@ class AgentsPanel(Gtk.Box):
         if self._desktop_viewer is not None:
             try:
                 self._desktop_viewer.apply_frame(
-                    data, note=msg, ok=ok, record_history=bool(record_history)
+                    data,
+                    note=msg,
+                    ok=ok,
+                    record_history=bool(record_history),
+                    pixel_format=pixel_format,
+                    width=width,
+                    height=height,
                 )
             except Exception:
                 pass
