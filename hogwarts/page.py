@@ -2191,6 +2191,12 @@ class HogwartsPage(Gtk.Box):
             except Exception:
                 pass
         self._keepstream = None
+        try:
+            from hogwarts.h264dec import stop_h264_decoder
+
+            stop_h264_decoder()
+        except Exception:
+            pass
 
     def _desktop_session(
         self, agent_id: str, action: str, options: dict | None = None
@@ -2284,13 +2290,26 @@ class HogwartsPage(Gtk.Box):
                 bind = str(start_opts.get("bind") or "").strip()
                 if not bind:
                     bind = "127.0.0.1" if face in ("loopback", "path") else "0.0.0.0"
+                # P7: prefer H.264 when desk can decode (GStreamer); else JPEG
+                codec = str(start_opts.get("codec") or "").strip().lower()
+                if not codec or codec == "auto":
+                    try:
+                        from hogwarts.h264dec import H264ToJpeg
+
+                        codec = "h264" if H264ToJpeg().available else "jpeg"
+                    except Exception:
+                        codec = "jpeg"
+                if codec not in ("jpeg", "h264", "auto"):
+                    codec = "jpeg"
                 payload: dict = {
                     "mode": "keepstream",
                     "face": face if face != "path" else "loopback",
                     "bind": bind,
                     "port": 0,
                     "max_side": max_side,
-                    "fps": 60,
+                    "codec": codec,
+                    # software x264 is heavy at 60; 30 is a good Session default
+                    "fps": 60 if codec == "jpeg" else 30,
                     "quality": 72,
                 }
                 ip = start_opts.get("input_provider")
@@ -2374,9 +2393,13 @@ class HogwartsPage(Gtk.Box):
                         rtt_s = f" · rtt {rtt:.0f}ms" if isinstance(rtt, (int, float)) else ""
                         drop = meta.get("dropped") or 0
                         drop_s = f" · drop {drop}" if drop else ""
+                        cname = meta.get("codec_name") or (
+                            "h264" if meta.get("codec") == 2 else "jpeg"
+                        )
                         note = (
                             f"SESSION {meta.get('width')}×{meta.get('height')} · "
-                            f"#{meta.get('frame_id')} · {meta.get('bytes')} B"
+                            f"{cname} · #{meta.get('frame_id')} · "
+                            f"{meta.get('bytes')} B"
                             f"{rtt_s}{drop_s}"
                         )
                         self._agents.set_desktop_frame(

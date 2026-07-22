@@ -153,7 +153,8 @@ Body: {
 1. **View** — `screenshot` / Live poll (no input).  
 2. **Control** — Live frame + `desktop_input` click/key (agent: xdotool / Win32).  
 3. **Session (Keepstream — research → build)** — continuous media face, not task-poll. Draft tasks:
-   - `session_start` `{mode: keepstream, face: reverse|forward, port?, max_side?, codec?, input_provider?}` → `{session_id, face, host, port, psk, codec, width?, height?, elevated?, input_provider?}`
+   - `session_start` `{mode: keepstream, face: reverse|forward, port?, max_side?, codec?: auto|jpeg|h264, fps?, quality?, input_provider?}` → `{session_id, face, host, port, psk, codec, codec_req?, capture?, width?, height?, elevated?, input_provider?}`
+   - Keepstream VIDEO: `codec` byte `1=jpeg` `2=h264` (Annex B AU). Desk paints JPEG (native or GStreamer decode of H.264).
    - `session_stop` `{session_id}` → `{stopped}`
    - Wire: see Anguish notes `research/keepstream-v0` (TCP HELLO + length-prefixed VIDEO/INPUT/CTRL). Plane stores **metadata only**, never frames.
    - **`input_provider` (optional plug-in):** operator-supplied elevated-input / UAC helper. Hogwarts does **not** ship a bypass. Shape:

@@ -285,9 +285,26 @@ class KeepstreamClient:
                         rect_count,
                     ) = struct.unpack_from(">IIHHBBH", payload, 0)
                     off = 16 + int(rect_count) * 8
-                    jpeg = payload[off:]
-                    if not jpeg:
+                    bitstream = payload[off:]
+                    if not bitstream:
                         continue
+                    # Wire: 1=jpeg 2=h264 — decode H.264 AUs to JPEG for GTK paint
+                    paint = bitstream
+                    codec_name = "jpeg"
+                    if int(codec) == 2:
+                        codec_name = "h264"
+                        try:
+                            from hogwarts.h264dec import decode_h264_au_to_jpeg
+
+                            jpg = decode_h264_au_to_jpeg(bitstream)
+                            if not jpg:
+                                continue
+                            paint = jpg
+                        except Exception as exc:
+                            self._status(f"Keepstream H.264 decode: {exc}", False)
+                            continue
+                    elif int(codec) == 1:
+                        codec_name = "jpeg"
                     self.frames += 1
                     meta = {
                         "frame_id": frame_id,
@@ -295,12 +312,14 @@ class KeepstreamClient:
                         "width": w,
                         "height": h,
                         "codec": codec,
+                        "codec_name": codec_name,
                         "keyframe": bool(is_key),
-                        "bytes": len(jpeg),
+                        "bytes": len(bitstream),
+                        "paint_bytes": len(paint),
                         "rtt_ms": self.last_rtt_ms,
                         "dropped": self.dropped,
                     }
-                    self._store_frame(jpeg, meta)
+                    self._store_frame(paint, meta)
                 elif typ == TYPE_PONG:
                     if len(payload) >= 8:
                         sent = struct.unpack(">Q", payload[:8])[0]

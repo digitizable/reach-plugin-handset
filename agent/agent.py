@@ -30,7 +30,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.32-lab"
+VERSION = "0.5.33-lab"
+# Keepstream VIDEO codec byte (matches research keepstream-v0)
+_KS_CODEC_JPEG = 1
+_KS_CODEC_H264 = 2
 MIN_SLEEP = 0.12  # Control needs sub-200ms check-ins
 # Set by main(); when False, loop only logs enroll/errors/tasks>0 (less disk thrash)
 _AGENT_VERBOSE = False
@@ -1716,6 +1719,272 @@ class _FfmpegMjpegSource:
         self._buf.clear()
 
 
+class _FfmpegH264Source:
+    """ffmpeg gdigrab/x11grab → Annex-B H.264 (libx264 or h264_nvenc).
+
+    Phase β Keepstream: lower bitrate than MJPEG at similar FPS. Emits one
+    access unit (AU) per coded picture for the wire VIDEO payload.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_side: int = 1280,
+        fps: float = 30.0,
+        quality: int = 72,
+    ) -> None:
+        self.max_side = max(320, min(int(max_side), 2560))
+        self.fps = max(5.0, min(float(fps), 60.0))
+        self.quality = max(28, min(int(quality), 95))
+        self._proc: subprocess.Popen | None = None
+        self._buf = bytearray()
+        self._out_w = 0
+        self._out_h = 0
+        self.method = "ffmpeg-h264"
+        self._pending: list[bytes] = []
+        self._have_vcl = False
+
+    @property
+    def size(self) -> tuple[int, int]:
+        return self._out_w, self._out_h
+
+    def start(self) -> bool:
+        import shutil
+
+        if not shutil.which("ffmpeg"):
+            return False
+        display, sw, sh = _display_geometry()
+        scale = min(1.0, float(self.max_side) / max(sw, sh, 1))
+        ow = max(2, int(sw * scale) // 2 * 2)
+        oh = max(2, int(sh * scale) // 2 * 2)
+        self._out_w, self._out_h = ow, oh
+        fps_i = max(5, min(60, int(round(self.fps))))
+        # Map quality 28–95 → CRF 28–18 (lower CRF = higher quality)
+        crf = int(max(18, min(28, 33 - (self.quality - 28) * 10 / 67)))
+        gop = max(15, min(60, fps_i))  # keyframe interval ~1s
+
+        grab: list[str]
+        if os.name == "nt":
+            grab = [
+                "-f",
+                "gdigrab",
+                "-framerate",
+                str(fps_i),
+                "-draw_mouse",
+                "1",
+                "-i",
+                "desktop",
+            ]
+            tag = "gdigrab"
+        else:
+            grab = [
+                "-f",
+                "x11grab",
+                "-framerate",
+                str(fps_i),
+                "-video_size",
+                f"{sw}x{sh}",
+                "-draw_mouse",
+                "1",
+                "-i",
+                display,
+            ]
+            tag = "x11grab"
+
+        def _cmd(encoder: str, extra: list[str]) -> list[str]:
+            return (
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                ]
+                + grab
+                + [
+                    "-vf",
+                    f"scale={ow}:{oh}:flags=lanczos,format=yuv420p",
+                    "-c:v",
+                    encoder,
+                ]
+                + extra
+                + [
+                    "-g",
+                    str(gop),
+                    "-keyint_min",
+                    str(gop),
+                    "-bf",
+                    "0",
+                    "-f",
+                    "h264",
+                    "-",
+                ]
+            )
+
+        candidates: list[tuple[str, list[str]]] = [
+            (
+                f"ffmpeg-{tag}-nvenc",
+                _cmd(
+                    "h264_nvenc",
+                    [
+                        "-preset",
+                        "p1",
+                        "-tune",
+                        "ll",
+                        "-rc",
+                        "vbr",
+                        "-cq",
+                        str(max(19, crf - 2)),
+                    ],
+                ),
+            ),
+            (
+                f"ffmpeg-{tag}-libx264",
+                _cmd(
+                    "libx264",
+                    [
+                        "-preset",
+                        "ultrafast",
+                        "-tune",
+                        "zerolatency",
+                        "-crf",
+                        str(crf),
+                        "-profile:v",
+                        "baseline",
+                    ],
+                ),
+            ),
+        ]
+
+        for method, cmd in candidates:
+            try:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+            except OSError:
+                self._proc = None
+                continue
+            time.sleep(0.2)
+            if self._proc is not None and self._proc.poll() is None:
+                self.method = method
+                return True
+            try:
+                if self._proc:
+                    self._proc.kill()
+            except Exception:
+                pass
+            self._proc = None
+        return False
+
+    @staticmethod
+    def _start_code_positions(buf: bytes | bytearray) -> list[int]:
+        pos: list[int] = []
+        i = 0
+        n = len(buf)
+        while i < n - 3:
+            if buf[i] == 0 and buf[i + 1] == 0:
+                if buf[i + 2] == 1:
+                    pos.append(i)
+                    i += 3
+                    continue
+                if i + 3 < n and buf[i + 2] == 0 and buf[i + 3] == 1:
+                    pos.append(i)
+                    i += 4
+                    continue
+            i += 1
+        return pos
+
+    @staticmethod
+    def _nal_type(nal: bytes) -> int:
+        # Skip start code
+        i = 0
+        if len(nal) >= 4 and nal[0:4] == b"\x00\x00\x00\x01":
+            i = 4
+        elif len(nal) >= 3 and nal[0:3] == b"\x00\x00\x01":
+            i = 3
+        if i >= len(nal):
+            return 0
+        return nal[i] & 0x1F
+
+    def read_au(self, timeout_s: float = 0.5) -> tuple[bytes, bool] | None:
+        """Return (annex_b_access_unit, is_keyframe) or None."""
+        proc = self._proc
+        if proc is None or proc.stdout is None or proc.poll() is not None:
+            return None
+        deadline = time.monotonic() + max(0.05, timeout_s)
+        while time.monotonic() < deadline:
+            positions = self._start_code_positions(self._buf)
+            # Need at least 2 start codes to carve one complete NAL
+            if len(positions) >= 2:
+                for pi in range(len(positions) - 1):
+                    start = positions[pi]
+                    end = positions[pi + 1]
+                    nal = bytes(self._buf[start:end])
+                    del self._buf[:end]
+                    nt = self._nal_type(nal)
+                    is_vcl = nt in (1, 5)
+                    if is_vcl and self._have_vcl and self._pending:
+                        # New primary picture — emit previous AU
+                        au = b"".join(self._pending)
+                        is_key = any(self._nal_type(x) == 5 for x in self._pending)
+                        self._pending = [nal]
+                        self._have_vcl = True
+                        return au, is_key
+                    self._pending.append(nal)
+                    if is_vcl:
+                        self._have_vcl = True
+                    # Re-scan after delete
+                    break
+                continue
+            try:
+                import select
+
+                r, _, _ = select.select([proc.stdout], [], [], 0.05)
+                if not r:
+                    continue
+                chunk = proc.stdout.read(65536)
+            except Exception:
+                chunk = proc.stdout.read(65536)
+            if not chunk:
+                if proc.poll() is not None:
+                    if self._pending:
+                        au = b"".join(self._pending)
+                        is_key = any(self._nal_type(x) == 5 for x in self._pending)
+                        self._pending.clear()
+                        self._have_vcl = False
+                        return au, is_key
+                    return None
+                continue
+            self._buf.extend(chunk)
+            if len(self._buf) > 12_000_000:
+                self._buf.clear()
+                self._pending.clear()
+                self._have_vcl = False
+        return None
+
+    def stop(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1.5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._buf.clear()
+        self._pending.clear()
+        self._have_vcl = False
+
+
 def _ks_recv_exact(conn: Any, n: int) -> bytes:
     buf = b""
     while len(buf) < n:
@@ -1792,7 +2061,21 @@ def _ks_handle_client(conn: Any) -> None:
         except Exception:
             ow, oh = sw, sh
         aid = str(_KEEPSTREAM.get("agent_id") or "agent")
-        conn.sendall(f"HELLO_OK {aid} {ow} {oh} jpeg\n".encode("utf-8"))
+        # Prefer codec for HELLO before capture thread sets live method
+        import shutil as _sh
+
+        creq = str(_KEEPSTREAM.get("codec_req") or "auto").lower()
+        live = str(_KEEPSTREAM.get("codec") or "").lower()
+        if live in ("jpeg", "h264"):
+            codec_name = live
+        elif creq == "jpeg":
+            codec_name = "jpeg"
+        elif creq in ("h264", "auto") and _sh.which("ffmpeg"):
+            codec_name = "h264"  # will fall back to jpeg if encoder missing
+        else:
+            codec_name = "jpeg"
+        _KEEPSTREAM["codec"] = codec_name
+        conn.sendall(f"HELLO_OK {aid} {ow} {oh} {codec_name}\n".encode("utf-8"))
         _KEEPSTREAM["clients"] = int(_KEEPSTREAM.get("clients") or 0) + 1
 
         def reader() -> None:
@@ -1849,7 +2132,12 @@ def _ks_handle_client(conn: Any) -> None:
                     latest["frame"] = None
                 if not item:
                     continue
-                jpeg, w, h = item
+                # (bitstream, w, h, codec_id, is_key)
+                if len(item) == 5:
+                    bitstream, w, h, codec_id, is_key = item
+                else:
+                    bitstream, w, h = item[0], item[1], item[2]
+                    codec_id, is_key = _KS_CODEC_JPEG, 1
                 try:
                     fid = int(_KEEPSTREAM.get("frame_id") or 0) + 1
                     _KEEPSTREAM["frame_id"] = fid
@@ -1860,11 +2148,11 @@ def _ks_handle_client(conn: Any) -> None:
                         pts,
                         max(0, min(int(w), 65535)),
                         max(0, min(int(h), 65535)),
-                        1,
-                        1,
+                        int(codec_id) & 0xFF,
+                        1 if is_key else 0,
                         0,
                     )
-                    _ks_send(conn, 0x01, head + jpeg)
+                    _ks_send(conn, 0x01, head + bitstream)
                 except Exception:
                     stop_reader["v"] = True
                     break
@@ -1874,30 +2162,76 @@ def _ks_handle_client(conn: Any) -> None:
         thr_r.start()
         thr_s.start()
 
-        # Prefer ffmpeg MJPEG @ up to 60fps; fall back to PIL (≤~15fps)
+        # Capture: auto prefers H.264 (libx264/nvenc), else MJPEG, else PIL
         side = int(_KEEPSTREAM.get("max_side") or 1280)
         q = int(_KEEPSTREAM.get("quality") or 72)
         fps = float(_KEEPSTREAM.get("fps") or 60.0)
-        ff = _FfmpegMjpegSource(max_side=side, fps=fps, quality=q)
-        use_ff = ff.start()
-        if use_ff:
-            _KEEPSTREAM["capture"] = ff.method
-            print(f"[agent] keepstream capture {ff.method} {side}px @{fps:.0f}fps", flush=True)
-            try:
-                while not stop_reader["v"] and not _KEEPSTREAM.get("stop"):
-                    jpeg = ff.read_jpeg(timeout_s=0.25)
-                    if not jpeg:
-                        if ff._proc is not None and ff._proc.poll() is not None:
-                            break
-                        continue
-                    w, h = ff.size
-                    with latest["lock"]:
-                        latest["frame"] = (jpeg, w, h)
-                    send_wake.set()
-            finally:
-                ff.stop()
-        else:
+        codec_req = str(_KEEPSTREAM.get("codec_req") or "auto").lower()
+        use_h264 = codec_req in ("auto", "h264")
+        use_jpeg = codec_req in ("auto", "jpeg")
+
+        started = False
+        if use_h264:
+            # Slightly lower default FPS for software x264 CPU load
+            h264_fps = fps if fps <= 30 else min(fps, 30.0)
+            if codec_req == "h264":
+                h264_fps = fps
+            ff_h = _FfmpegH264Source(max_side=side, fps=h264_fps, quality=q)
+            if ff_h.start():
+                started = True
+                _KEEPSTREAM["capture"] = ff_h.method
+                _KEEPSTREAM["codec"] = "h264"
+                print(
+                    f"[agent] keepstream capture {ff_h.method} "
+                    f"{side}px @{h264_fps:.0f}fps codec=h264",
+                    flush=True,
+                )
+                try:
+                    while not stop_reader["v"] and not _KEEPSTREAM.get("stop"):
+                        got = ff_h.read_au(timeout_s=0.25)
+                        if not got:
+                            if ff_h._proc is not None and ff_h._proc.poll() is not None:
+                                break
+                            continue
+                        au, is_key = got
+                        w, h = ff_h.size
+                        with latest["lock"]:
+                            latest["frame"] = (
+                                au,
+                                w,
+                                h,
+                                _KS_CODEC_H264,
+                                1 if is_key else 0,
+                            )
+                        send_wake.set()
+                finally:
+                    ff_h.stop()
+        if not started and use_jpeg:
+            ff = _FfmpegMjpegSource(max_side=side, fps=fps, quality=q)
+            if ff.start():
+                started = True
+                _KEEPSTREAM["capture"] = ff.method
+                _KEEPSTREAM["codec"] = "jpeg"
+                print(
+                    f"[agent] keepstream capture {ff.method} {side}px @{fps:.0f}fps",
+                    flush=True,
+                )
+                try:
+                    while not stop_reader["v"] and not _KEEPSTREAM.get("stop"):
+                        jpeg = ff.read_jpeg(timeout_s=0.25)
+                        if not jpeg:
+                            if ff._proc is not None and ff._proc.poll() is not None:
+                                break
+                            continue
+                        w, h = ff.size
+                        with latest["lock"]:
+                            latest["frame"] = (jpeg, w, h, _KS_CODEC_JPEG, 1)
+                        send_wake.set()
+                finally:
+                    ff.stop()
+        if not started:
             _KEEPSTREAM["capture"] = "pil-fallback"
+            _KEEPSTREAM["codec"] = "jpeg"
             print(
                 "[agent] keepstream ffmpeg unavailable — PIL fallback (<<60fps)",
                 flush=True,
@@ -1925,7 +2259,7 @@ def _ks_handle_client(conn: Any) -> None:
                     w = int(shot.get("width") or 0)
                     h = int(shot.get("height") or 0)
                     with latest["lock"]:
-                        latest["frame"] = (jpeg, w, h)
+                        latest["frame"] = (jpeg, w, h, _KS_CODEC_JPEG, 1)
                     send_wake.set()
                 except Exception:
                     break
@@ -2018,6 +2352,11 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         quality = 72
     quality = max(28, min(quality, 92))
+    codec_req = str(payload.get("codec") or "auto").strip().lower()
+    if codec_req not in ("auto", "jpeg", "h264", "jpg", "mjpeg"):
+        codec_req = "auto"
+    if codec_req in ("jpg", "mjpeg"):
+        codec_req = "jpeg"
     try:
         port = int(payload.get("port") or 0)
     except (TypeError, ValueError):
@@ -2051,6 +2390,8 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
             "max_side": max_side,
             "fps": fps,
             "quality": quality,
+            "codec_req": codec_req,
+            "codec": "jpeg",  # filled when capture starts
             "agent_id": agent_id,
             "frame_id": 0,
             "clients": 0,
@@ -2095,18 +2436,21 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
     import shutil as _shutil
 
     has_ff = bool(_shutil.which("ffmpeg"))
+    codec_hint = str(_KEEPSTREAM.get("codec") or codec_req or "auto")
+    if codec_hint == "auto":
+        codec_hint = "h264|jpeg"
     capture_hint = (
-        "ffmpeg-gdigrab-mjpeg"
-        if has_ff and os.name == "nt"
-        else ("ffmpeg-x11grab-mjpeg" if has_ff else "pil-fallback")
+        "ffmpeg-h264-or-mjpeg"
+        if has_ff
+        else "pil-fallback"
     )
     # Prefer live method if a session client already negotiated capture
     live_cap = str(_KEEPSTREAM.get("capture") or "").strip()
     if live_cap:
         capture_hint = live_cap
     note = (
-        f"Keepstream capture={capture_hint}. "
-        "60fps target via ffmpeg MJPEG (x11grab/gdigrab); "
+        f"Keepstream capture={capture_hint} codec={codec_hint}. "
+        "auto: prefer H.264 (libx264/nvenc) then MJPEG; "
         "PIL fallback if ffmpeg missing. Latest-frame drop under load."
     )
     if ip_status.get("active"):
@@ -2130,7 +2474,8 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
         "port": listen_port,
         "host": connect_host,
         "connect_host": connect_host,
-        "codec": "jpeg",
+        "codec": str(_KEEPSTREAM.get("codec") or "jpeg"),
+        "codec_req": codec_req,
         "max_side": max_side,
         "fps": fps,
         "quality": quality,
