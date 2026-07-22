@@ -2372,8 +2372,8 @@ class HogwartsPage(Gtk.Box):
                     "max_side": max_side,
                     "codec": codec,
                     "profile": profile,
-                    "fps": max(5.0, min(fps, 60.0)),
-                    "quality": max(28, min(quality, 92)),
+                    "fps": max(30.0, min(fps, 60.0)),
+                    "quality": max(50, min(quality, 95)),
                 }
                 # Parsec-class local cursor (gaming profiles default True server-side)
                 if "local_cursor" in start_opts:

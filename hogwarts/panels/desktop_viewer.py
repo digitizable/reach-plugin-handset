@@ -828,9 +828,9 @@ class RemoteDesktopViewer(Gtk.Window):
         session.append(stitle)
         sdesc = Gtk.Label(
             label=(
-                "Use ribbon Start stream / Stop stream (or profile dropdown). "
-                "Stream is watch-only — press 2 · Control for mouse and keyboard. "
-                "Optional helpers below for SOCKS / elevated input."
+                "Use ribbon Start stream / Stop stream. "
+                "Single Default mode: ≤1600–1920 @ 60 MJPEG · pure UDP. "
+                "Watch-only until 2 · Control. Optional SOCKS / elevated input below."
             ),
             xalign=0,
             wrap=True,
