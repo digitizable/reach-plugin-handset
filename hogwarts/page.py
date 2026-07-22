@@ -2302,18 +2302,21 @@ class HogwartsPage(Gtk.Box):
             except Exception:
                 start_opts = {}
 
+        profile = "path"
         try:
             if start_opts.get("max_side") is not None:
                 max_side = int(start_opts.get("max_side") or 1280)
             else:
                 max_side = int(self._agents.shot_max_side())
-            profile = str(start_opts.get("profile") or "default").lower()
-            # LAN 60: hard cap 1600 (desk default 1440)
-            max_side = max(960, min(max_side, 1600))
+            profile = str(start_opts.get("profile") or "path").lower()
+            # LAN 60 can go higher; Path stays lean for SOCKS/TCP
+            cap = 1600 if profile in ("lan60", "lan", "gaming", "gaming-lan") else 1440
+            max_side = max(640, min(max_side, cap))
         except Exception:
-            max_side = 1440
+            max_side = 1280
+            profile = "path"
         # Stash for paint/input tuning while Session is up
-        self._ks_profile = "default"
+        self._ks_profile = profile
 
         # Init GStreamer on the GTK main thread before any worker uses it.
         # Gst.init from the Keepstream thread freezes Control/Session UI.

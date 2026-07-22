@@ -41,8 +41,12 @@ _QUALITY: list[tuple[str, int]] = [
     ("Native 4096", 4096),
 ]
 
-# Single Keepstream mode (formerly gaming / gaming-lan)
-_SESSION_DEFAULT_PROFILE = "default"
+# Stream profiles (C2-aware): Path is default; LAN 60 is opt-in for direct LAN.
+_STREAM_PROFILES: list[tuple[str, str]] = [
+    ("Path", "path"),  # SOCKS / remote — TCP, smaller frames
+    ("LAN 60", "lan60"),  # Direct LAN — UDP MJPEG ~60fps
+]
+_SESSION_DEFAULT_PROFILE = "path"
 
 _ARCHIVE_CAP = 250  # max shots kept per agent folder
 _THUMB = 72
@@ -338,15 +342,30 @@ class RemoteDesktopViewer(Gtk.Window):
                 break
         self.quality_dd.set_selected(qi)
         self.quality_dd.set_tooltip_text(
-            "Capture / Live max side only. Stream uses LAN 60 defaults "
-            "(≤1440 @ 60 MJPEG UDP q80) independent of this dropdown."
+            "Capture / Live max side only. Stream size comes from the Stream profile."
         )
         self.quality_dd.connect(
             "notify::selected", lambda *_: self._on_quality_changed()
         )
         ribbon.append(self.quality_dd)
-        # No multi-profile dropdown — single Default stream mode only
-        self.session_profile_dd = None
+
+        plab = Gtk.Label(label="Stream", xalign=0)
+        plab.add_css_class("rdv-field")
+        ribbon.append(plab)
+        self.session_profile_dd = Gtk.DropDown.new_from_strings(
+            [lab for lab, _ in _STREAM_PROFILES]
+        )
+        # Default Path (C2 / SOCKS-safe); LAN 60 is explicit opt-in
+        self.session_profile_dd.set_selected(0)
+        self.session_profile_dd.set_tooltip_text(
+            "Path — remote / SOCKS / C2 (TCP, ≤1280 @ 45, safer on path).\n"
+            "LAN 60 — direct LAN only (UDP MJPEG ≤1440 @ 60). "
+            "UDP does not run through path SOCKS."
+        )
+        self.session_profile_dd.connect(
+            "notify::selected", lambda *_: self._on_session_profile_changed()
+        )
+        ribbon.append(self.session_profile_dd)
 
         self.chk_archive_live = Gtk.CheckButton(label="Save to disk")
         self.chk_archive_live.add_css_class("rdv-check")
@@ -1028,6 +1047,7 @@ class RemoteDesktopViewer(Gtk.Window):
         root.append(adv)
         self._adv_expander = adv
         self._load_input_provider_prefs()
+        self._load_stream_profile_pref()
 
         # Status
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
@@ -2574,28 +2594,88 @@ class RemoteDesktopViewer(Gtk.Window):
         )
 
     def current_session_profile(self) -> str:
-        """Always default — multi-profile UI removed."""
+        """Active stream profile id: path | lan60."""
+        try:
+            i = int(self.session_profile_dd.get_selected())
+            if 0 <= i < len(_STREAM_PROFILES):
+                return _STREAM_PROFILES[i][1]
+        except Exception:
+            pass
         return _SESSION_DEFAULT_PROFILE
 
     def _on_session_profile_changed(self) -> None:
-        self._set_status(
-            "Stream: LAN 60 · ≤1440 @ 60 MJPEG · q80 · pure UDP",
-            ok=None,
-        )
+        pid = self.current_session_profile()
+        if pid == "lan60":
+            self._set_status(
+                "Stream profile: LAN 60 · UDP ≤1440@60 q80 · direct LAN only "
+                "(not for path SOCKS)",
+                ok=None,
+            )
+        else:
+            self._set_status(
+                "Stream profile: Path · TCP ≤1280@45 q72 · C2 / SOCKS safe",
+                ok=None,
+            )
+        self._save_stream_profile_pref()
+
+    def _stream_profile_prefs_path(self) -> Path:
+        base = Path.home() / ".config" / "hogwarts"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return base / "stream_profile.json"
+
+    def _load_stream_profile_pref(self) -> None:
+        try:
+            path = self._stream_profile_prefs_path()
+            if not path.is_file():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            want = str(data.get("profile") or "").strip().lower()
+            for i, (_, pid) in enumerate(_STREAM_PROFILES):
+                if pid == want:
+                    self.session_profile_dd.set_selected(i)
+                    break
+        except Exception:
+            pass
+
+    def _save_stream_profile_pref(self) -> None:
+        try:
+            path = self._stream_profile_prefs_path()
+            path.write_text(
+                json.dumps({"profile": self.current_session_profile()}, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     def session_start_options(self) -> dict[str, Any]:
-        """LAN 60 stream: sustained ~60fps over maximum still sharpness."""
+        """C2 Path (default) or LAN 60 (direct) stream knobs."""
         self._save_input_provider_prefs()
+        self._save_stream_profile_pref()
         opts: dict[str, Any] = {}
-        opts["profile"] = _SESSION_DEFAULT_PROFILE
-        # Fixed LAN 60 knobs (Res dropdown is Capture/Live only)
-        opts["max_side"] = 1440
-        opts["fps"] = 60
-        opts["quality"] = 80  # q:v ~4 — encode headroom for 60 under load
-        opts["codec"] = "jpeg"  # pure UDP MJPEG
+        profile = self.current_session_profile()
+        opts["profile"] = profile
+        if profile == "lan60":
+            # Direct LAN / lab — pure UDP MJPEG, sustained ~60
+            opts["max_side"] = 1440
+            opts["fps"] = 60
+            opts["quality"] = 80
+            opts["codec"] = "jpeg"
+            opts["transport"] = "udp"
+        else:
+            # Path / SOCKS / C2 — TCP video (UDP cannot traverse path SOCKS)
+            opts["max_side"] = 1280
+            opts["fps"] = 45
+            opts["quality"] = 72
+            opts["codec"] = "jpeg"
+            opts["transport"] = "tcp"
         opts["local_cursor"] = True
         opts["draw_mouse"] = False
-        opts["transport"] = "udp"
         if not hasattr(self, "input_provider_entry"):
             return opts
         cmd = self.input_provider_entry.get_text().strip()
