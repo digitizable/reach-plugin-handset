@@ -1013,9 +1013,12 @@ HOGWARTS_CSS = """
   padding: 12px;
 }
 .rdv-empty-overlay {
-  font-size: 0.9rem;
-  color: #6a6a6a;
-  padding: 24px;
+  font-size: 0.95rem;
+  color: #e0e0e0;
+  padding: 28px 36px;
+  background-color: rgba(20, 20, 20, 0.92);
+  border-radius: 8px;
+  border: 1px solid #3e3e42;
 }
 """
 

@@ -1885,6 +1885,23 @@ class AgentsPanel(Gtk.Box):
                 ("LIVE", "SESSION", "STREAM", "KEEPSTREAM")
             )
             record_history = not is_stream
+        # While Keepstream owns the surface, never push Capture/Live stills
+        nu = msg.upper()
+        looks_ks = (
+            nu.startswith(("SESSION", "STREAM", "KEEPSTREAM"))
+            or " · #" in msg
+            or (pixel_format or "").lower() == "rgb24"
+        )
+        if self._desktop_viewer is not None:
+            try:
+                if (
+                    getattr(self._desktop_viewer, "_frame_source", None)
+                    == "keepstream"
+                    and not looks_ks
+                ):
+                    return
+            except Exception:
+                pass
         # Frames only display in the Remote Viewer window (not embedded)
         if self._desktop_viewer is not None:
             try:

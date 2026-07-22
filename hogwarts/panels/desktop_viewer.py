@@ -302,25 +302,28 @@ class RemoteDesktopViewer(Gtk.Window):
         self.btn_live.connect("toggled", lambda *_: self._do_live())
         ribbon.append(self.btn_live)
 
+        # Single Start/Stop for Keepstream (no duplicate on Session panel)
         self.btn_sess_on = Gtk.Button()
         sb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         sb.append(_img("video-display", 16))
-        sb.append(Gtk.Label(label="Session"))
+        sb.append(Gtk.Label(label="Start stream"))
         self.btn_sess_on.set_child(sb)
         self.btn_sess_on.add_css_class("flat")
         self.btn_sess_on.add_css_class("rdv-tool-btn")
-        self.btn_sess_on.set_tooltip_text("Start Keepstream Session (continuous stream)")
+        self.btn_sess_on.set_tooltip_text(
+            "Start Keepstream (continuous stream). Watch-only until Control."
+        )
         self.btn_sess_on.connect("clicked", lambda *_: self._do_session("start"))
         ribbon.append(self.btn_sess_on)
 
         self.btn_sess_off = Gtk.Button()
         se = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         se.append(_img("media-playback-stop", 16))
-        se.append(Gtk.Label(label="Stop"))
+        se.append(Gtk.Label(label="Stop stream"))
         self.btn_sess_off.set_child(se)
         self.btn_sess_off.add_css_class("flat")
         self.btn_sess_off.add_css_class("rdv-tool-btn")
-        self.btn_sess_off.set_tooltip_text("desktop_stop")
+        self.btn_sess_off.set_tooltip_text("Stop Keepstream session")
         self.btn_sess_off.connect("clicked", lambda *_: self._do_session("stop"))
         ribbon.append(self.btn_sess_off)
 
@@ -340,15 +343,14 @@ class RemoteDesktopViewer(Gtk.Window):
                 break
         self.quality_dd.set_selected(qi)
         self.quality_dd.set_tooltip_text(
-            "Capture resolution (long side). Live uses this up to a soft cap "
-            "(HD/FHD) so Control stays responsive. Gaming Session caps at 960."
+            "Capture / Live max side. Gaming LAN Session uses its own profile cap."
         )
         self.quality_dd.connect(
             "notify::selected", lambda *_: self._on_quality_changed()
         )
         ribbon.append(self.quality_dd)
 
-        plab = Gtk.Label(label="Session", xalign=0)
+        plab = Gtk.Label(label="Profile", xalign=0)
         plab.add_css_class("rdv-field")
         ribbon.append(plab)
         self.session_profile_dd = Gtk.DropDown.new_from_strings(
@@ -356,10 +358,9 @@ class RemoteDesktopViewer(Gtk.Window):
         )
         self.session_profile_dd.set_selected(0)  # Gaming LAN default
         self.session_profile_dd.set_tooltip_text(
-            "Gaming LAN: ≤960 @ 60 MJPEG over UDP (lowest lag on LAN).\n"
-            "Gaming: ≤960 @ 60 H.264/NVENC+DXGI over UDP (Parsec-class path).\n"
-            "Balanced: 1280 @ 30 H.264 TCP.\n"
-            "Quality: sharper / higher lag TCP."
+            "Gaming LAN: ≤1280 @ 60 MJPEG · pure UDP.\n"
+            "Gaming: ≤1280 @ 60 H.264/NVENC · UDP.\n"
+            "Balanced / Quality: H.264 TCP."
         )
         self.session_profile_dd.connect(
             "notify::selected", lambda *_: self._on_session_profile_changed()
@@ -797,8 +798,7 @@ class RemoteDesktopViewer(Gtk.Window):
         scroll_c.connect("scroll", on_scroll)
         self.picture.add_controller(scroll_c)
 
-        # Stream surface only — use the normal OS cursor (no custom stamp/DA).
-        # Custom texture + DrawingArea produced a white/black box artifact.
+        # Stream surface: picture + connecting overlay (covers any residual still)
         self._stream_overlay = Gtk.Overlay()
         self._stream_overlay.set_hexpand(True)
         self._stream_overlay.set_vexpand(True)
@@ -807,6 +807,19 @@ class RemoteDesktopViewer(Gtk.Window):
         self._texture_cursor = None
         self._use_texture_cursor = False
         self._overlay_cursor_on = False
+
+        self.empty_lab = Gtk.Label(
+            label="Capture or enable Live to see the remote desktop",
+            xalign=0.5,
+        )
+        self.empty_lab.add_css_class("rdv-empty-overlay")
+        self.empty_lab.set_halign(Gtk.Align.CENTER)
+        self.empty_lab.set_valign(Gtk.Align.CENTER)
+        self.empty_lab.set_wrap(True)
+        # On top of picture so stills cannot show through while connecting
+        self.empty_lab.set_can_target(False)
+        self._stream_overlay.add_overlay(self.empty_lab)
+        self.empty_lab.set_visible(initial_bytes is None)
 
         frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         frame.add_css_class("rdv-frame")
@@ -822,31 +835,20 @@ class RemoteDesktopViewer(Gtk.Window):
         self._scroll.add_css_class("rdv-scroll")
         main.append(self._scroll)
 
-        # Empty / control overlay hint
-        self.empty_lab = Gtk.Label(
-            label="Capture or enable Live to see the remote desktop",
-            xalign=0.5,
-        )
-        self.empty_lab.add_css_class("rdv-empty-overlay")
-        self.empty_lab.set_visible(initial_bytes is None)
-        main.append(self.empty_lab)
-
-        # Session mode panel (VNC / SOCKS ladder)
+        # Session mode panel — settings only (Start/Stop live on the ribbon)
         session = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         session.add_css_class("rdv-session")
         session.set_margin_top(12)
         session.set_margin_start(16)
         session.set_margin_end(16)
-        stitle = Gtk.Label(label="Keepstream Session (level 3)", xalign=0)
+        stitle = Gtk.Label(label="Keepstream Session", xalign=0)
         stitle.add_css_class("rdv-title")
         session.append(stitle)
         sdesc = Gtk.Label(
             label=(
-                "Spike 1: continuous JPEG stream + input over a dedicated TCP face "
-                "(not plane task-poll). Agent reverse-accepts; desk connects to "
-                "host:port with a one-time PSK. Use Control mode gestures while "
-                "Session is connected — input rides Keepstream. "
-                "Legacy VNC (x11vnc) remains available via SOCKS if needed."
+                "Use ribbon Start stream / Stop stream (or profile dropdown). "
+                "Stream is watch-only — press 2 · Control for mouse and keyboard. "
+                "Optional helpers below for SOCKS / elevated input."
             ),
             xalign=0,
             wrap=True,
@@ -854,19 +856,6 @@ class RemoteDesktopViewer(Gtk.Window):
         sdesc.add_css_class("rdv-mode-hint")
         session.append(sdesc)
         srow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.btn_sess_start2 = Gtk.Button(label="Start Keepstream")
-        self.btn_sess_start2.add_css_class("rdv-primary")
-        self.btn_sess_start2.connect(
-            "clicked", lambda *_: self._do_session("start")
-        )
-        srow.append(self.btn_sess_start2)
-        self.btn_sess_stop2 = Gtk.Button(label="Stop Session")
-        self.btn_sess_stop2.add_css_class("flat")
-        self.btn_sess_stop2.add_css_class("rdv-tool-btn")
-        self.btn_sess_stop2.connect(
-            "clicked", lambda *_: self._do_session("stop")
-        )
-        srow.append(self.btn_sess_stop2)
         self.btn_socks = Gtk.Button(label="SOCKS start (tunnel)")
         self.btn_socks.add_css_class("flat")
         self.btn_socks.add_css_class("rdv-tool-btn")
@@ -1455,30 +1444,49 @@ class RemoteDesktopViewer(Gtk.Window):
             pass
 
     def prepare_keepstream_connect(self) -> None:
-        """Call when Start Keepstream is pressed — clear stills before stream."""
+        """Call when Start stream is pressed — blank the surface before live frames."""
         self._frame_source = "keepstream"
         self._last_sent_frac = None
-        # Drop last Capture/Live still so it cannot "take over" the window
+        # Drop last Capture/Live still completely
         self._raw = None
         self._pixbuf = None
         self._rgb_bytes_ref = None
         try:
             self.picture.set_paintable(None)
-            self.picture.set_pixbuf(None)  # type: ignore[attr-defined]
         except Exception:
-            try:
-                self.picture.set_paintable(None)
-            except Exception:
-                pass
+            pass
         try:
-            self.empty_lab.set_label("Connecting Keepstream…")
+            self.picture.set_pixbuf(None)
+        except Exception:
+            pass
+        # Solid black placeholder so no residual still can show through
+        try:
+            blank = GdkPixbuf.Pixbuf.new(
+                GdkPixbuf.Colorspace.RGB, False, 8, 64, 36
+            )
+            if blank is not None:
+                blank.fill(0x000000FF)
+                self.picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+                self.picture.set_pixbuf(blank)
+                self._blank_ref = blank
+        except Exception:
+            pass
+        # Cover the whole stream area (overlay on picture, not below it)
+        try:
+            self.empty_lab.set_label("Connecting Keepstream…\n(last screenshot cleared)")
             self.empty_lab.set_visible(True)
+            self.empty_lab.set_opacity(1.0)
+        except Exception:
+            pass
+        # Show stream stack immediately (not the settings form alone)
+        try:
+            self._main_stack.set_visible_child_name("view")
         except Exception:
             pass
         # Stop Live immediately (button + callback)
         if self.btn_live.get_active():
             self.btn_live.set_active(False)
-        elif self._on_live:
+        if self._on_live:
             try:
                 self._on_live(False)
             except Exception:
