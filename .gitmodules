@@ -1,0 +1,4 @@
+[submodule "third_party/keepstream"]
+	path = third_party/keepstream
+	url = git@github.com:digitizable/keepstream.git
+	branch = main
