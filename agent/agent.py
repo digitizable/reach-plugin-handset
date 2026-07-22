@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
-VERSION = "0.5.27-lab"
+VERSION = "0.5.28-lab"
 MIN_SLEEP = 0.12  # Control needs sub-200ms check-ins
 # Set by main(); when False, loop only logs enroll/errors/tasks>0 (less disk thrash)
 _AGENT_VERBOSE = False
@@ -2399,17 +2399,30 @@ def _input_provider_start(
 
         if kind == "pipe":
             # Connect to an already-running helper (user started elevated).
+            # Retry briefly — Highest task / logon helper can lag Session start.
             target = pipe or command
             if not target:
                 raise RuntimeError("input_provider.pipe empty")
             if os.name == "nt" and not target.startswith("\\\\.\\pipe\\"):
-                target = f"\\\\.\\pipe\\{target.lstrip('\\/')}"
-            # Windows named pipe as file; Unix domain socket path as connect
+                target = f"\\\\.\\pipe\\{target.lstrip(chr(92) + '/')}"
+            last_err: Exception | None = None
             if os.name == "nt":
-                # open for write line protocol
-                stream = open(target, "w", encoding="utf-8", buffering=1)  # noqa: SIM115
-                stream.write(hello)
-                stream.flush()
+                stream = None
+                for attempt in range(12):
+                    try:
+                        # open for write line protocol
+                        stream = open(  # noqa: SIM115
+                            target, "w", encoding="utf-8", buffering=1
+                        )
+                        stream.write(hello)
+                        stream.flush()
+                        last_err = None
+                        break
+                    except OSError as exc:
+                        last_err = exc
+                        time.sleep(0.2 * (1 + attempt // 3))
+                if stream is None:
+                    raise last_err or RuntimeError("pipe_connect_failed")
                 with _ip_lock():
                     _INPUT_PROVIDER["stream"] = stream
                     _INPUT_PROVIDER["spec"] = spec
@@ -2425,9 +2438,25 @@ def _input_provider_start(
             # Unix: treat as AF_UNIX path
             import socket as _socket
 
-            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            sock.settimeout(2.0)
-            sock.connect(target)
+            sock = None
+            for attempt in range(12):
+                try:
+                    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                    sock.settimeout(2.0)
+                    sock.connect(target)
+                    last_err = None
+                    break
+                except OSError as exc:
+                    last_err = exc
+                    try:
+                        if sock is not None:
+                            sock.close()
+                    except Exception:
+                        pass
+                    sock = None
+                    time.sleep(0.2 * (1 + attempt // 3))
+            if sock is None:
+                raise last_err or RuntimeError("unix_pipe_connect_failed")
             sock.sendall(hello.encode("utf-8"))
             f = sock.makefile("rwb", buffering=0)
 

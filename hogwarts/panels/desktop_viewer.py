@@ -717,12 +717,11 @@ class RemoteDesktopViewer(Gtk.Window):
         ip_box.append(ip_title)
         ip_hint = Gtk.Label(
             label=(
-                "For Task Manager / admin UI when the agent is not elevated: run "
-                "agent/windows/input-provider (Highest scheduled task once) and "
-                "set agent.json input_provider kind=pipe to "
-                "\\\\.\\pipe\\hogwarts-input — or enter an exec path here. "
-                "Leave empty for built-in inject. Do not self-elevate on each "
-                "Session start (that re-triggers UAC)."
+                "For Task Manager / admin UI when the agent is not elevated: "
+                "install agent/windows/input-provider once (Highest task), start "
+                "it silently, then enable Use provider. Empty path defaults to "
+                "\\\\.\\pipe\\hogwarts-input (pipe). Or set an exec path. "
+                "Do not self-elevate on each Session start (UAC every time)."
             ),
             xalign=0,
             wrap=True,
@@ -732,21 +731,29 @@ class RemoteDesktopViewer(Gtk.Window):
         ip_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.input_provider_enable = Gtk.CheckButton(label="Use provider")
         self.input_provider_enable.set_tooltip_text(
-            "When checked and a path is set, session_start sends input_provider "
-            "to the agent. Unchecked = local inject only."
+            "When checked, session_start sends input_provider. Empty path → "
+            "default Windows pipe hogwarts-input. Unchecked = local inject only "
+            "(agent.json can still enable a provider)."
         )
         ip_row.append(self.input_provider_enable)
         self.input_provider_entry = Gtk.Entry()
         self.input_provider_entry.set_hexpand(True)
         self.input_provider_entry.set_placeholder_text(
-            r"e.g. C:\tools\my-input-helper.exe  or  /usr/local/bin/my-helper"
+            r"empty = \\.\pipe\hogwarts-input   or  C:\tools\helper.exe"
         )
         self.input_provider_entry.set_tooltip_text(
-            "Executable path. Helper protocol: stdin lines — "
-            "HELLO hogwarts-input/1 <session_id> <psk>, then JSON "
-            '{"events":[...]} batches, then BYE. Reply HELLO_OK optional.'
+            "Empty + Use provider → kind=pipe hogwarts-input. "
+            "\\\\.\\pipe\\… → pipe. Else → kind=exec spawn. "
+            "Protocol: HELLO hogwarts-input/1, JSON events, BYE."
         )
         ip_row.append(self.input_provider_entry)
+        btn_pipe = Gtk.Button(label="Default pipe")
+        btn_pipe.add_css_class("flat")
+        btn_pipe.set_tooltip_text(
+            "Fill Windows default named pipe and enable Use provider"
+        )
+        btn_pipe.connect("clicked", lambda *_: self._fill_default_input_pipe())
+        ip_row.append(btn_pipe)
         ip_box.append(ip_row)
         session.append(ip_box)
         self._load_input_provider_prefs()
@@ -1724,6 +1731,18 @@ class RemoteDesktopViewer(Gtk.Window):
         except Exception:
             pass
 
+    def _fill_default_input_pipe(self) -> None:
+        """One-click Windows pipe default for lab input provider."""
+        if hasattr(self, "input_provider_entry"):
+            self.input_provider_entry.set_text(r"\\.\pipe\hogwarts-input")
+        if hasattr(self, "input_provider_enable"):
+            self.input_provider_enable.set_active(True)
+        self._save_input_provider_prefs()
+        self._set_status(
+            "Input provider: \\\\.\\pipe\\hogwarts-input (enable + Start Keepstream)",
+            ok=True,
+        )
+
     def session_start_options(self) -> dict[str, Any]:
         """Extra session_start payload fields (optional input_provider plug-in)."""
         self._save_input_provider_prefs()
@@ -1734,19 +1753,37 @@ class RemoteDesktopViewer(Gtk.Window):
         en = bool(self.input_provider_enable.get_active()) if hasattr(
             self, "input_provider_enable"
         ) else False
-        if en and cmd:
+        if not en:
+            # Unchecked: do not send override (agent.json can still enable)
+            return opts
+        # Enabled: empty path → default Windows named-pipe helper
+        if not cmd or cmd in ("pipe", "default", "hogwarts-input"):
+            opts["input_provider"] = {
+                "enabled": True,
+                "kind": "pipe",
+                "pipe": r"\\.\pipe\hogwarts-input",
+            }
+        elif cmd.startswith("\\\\.\\pipe\\") or cmd.startswith("//./pipe/"):
+            pipe = cmd.replace("/", "\\")
+            opts["input_provider"] = {
+                "enabled": True,
+                "kind": "pipe",
+                "pipe": pipe,
+            }
+        elif cmd.startswith("pipe:"):
+            leaf = cmd.split(":", 1)[1].strip() or "hogwarts-input"
+            opts["input_provider"] = {
+                "enabled": True,
+                "kind": "pipe",
+                "pipe": rf"\\.\pipe\{leaf.lstrip(chr(92))}",
+            }
+        else:
             opts["input_provider"] = {
                 "enabled": True,
                 "kind": "exec",
                 "command": cmd,
                 "spawn": True,
             }
-        elif en and not cmd:
-            # Explicit empty: do not force; agent.json may still apply
-            pass
-        else:
-            # Unchecked: do not send override (agent.json can still enable)
-            pass
         return opts
 
     def _do_session(self, action: str) -> None:
@@ -1764,8 +1801,11 @@ class RemoteDesktopViewer(Gtk.Window):
         if action == "start":
             ip = opts.get("input_provider") if isinstance(opts, dict) else None
             extra = ""
-            if isinstance(ip, dict) and ip.get("command"):
-                extra = f"\ninput_provider: {ip.get('command')}"
+            if isinstance(ip, dict):
+                if ip.get("kind") == "pipe":
+                    extra = f"\ninput_provider pipe: {ip.get('pipe') or '?'}"
+                elif ip.get("command"):
+                    extra = f"\ninput_provider exec: {ip.get('command')}"
             self.session_lab.set_text(
                 "Starting Keepstream on agent…" + extra
             )
