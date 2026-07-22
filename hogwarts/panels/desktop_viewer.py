@@ -1,12 +1,12 @@
-"""Remote desktop / control viewer.
+"""Remote desktop viewer — simple two-mode UX.
 
-Ladder:
-  1. View   — screenshot + Live poll (no input)
-  2. Control — Live frame + click/key via desktop_input
-  3. Session — desktop_start (+ optional VNC) / SOCKS tunnel hints
+  Watch   — look only (screenshots, Live stills, or Stream). No input to host.
+  Control — mouse/keyboard go to the host (best with Stream; else Live stills).
+
+Primary action: Stream (Keepstream live video). Capture / Live stills are
+fallbacks. Advanced (collapsed) holds SOCKS + elevated input provider.
 
 Also: ShareX-style archive under ~/Pictures/Hogwarts/<agent>/.
-Keepstream Session (Spike 1): continuous JPEG over TCP when Session is started.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self._on_socks_start = on_socks_start
         self._on_live_interval = on_live_interval
         self._on_closed = on_closed
-        self._mode = "view"  # view | control | session
+        self._mode = "view"  # view (Watch) | control
         self._control_on = False
         self._session_info: dict[str, Any] = {}
         self._capturing = False
@@ -139,10 +139,10 @@ class RemoteDesktopViewer(Gtk.Window):
         self._last_move_flush = 0.0
         self._last_sent_frac: tuple[float, float] | None = None
         self._live_interval_sec = 1.0  # float seconds; Control drops to 0.5
-        self._keepstream: Any = None  # KeepstreamClient when Session connected
+        self._keepstream: Any = None  # KeepstreamClient when stream is connected
         self._last_motion_xy: tuple[float, float] | None = None
         self._cursor_frac: tuple[float, float] | None = None  # 0..1 on remote frame
-        self._rel_mouse = False  # Parsec-class relative mouse (gaming Session)
+        self._rel_mouse = False  # relative mouse (gaming / stream)
         self._overlay_cursor_on = False  # drawn pointer (system cursor is unreliable)
         self._cursor_repaint_src: int | None = None
 
@@ -225,41 +225,34 @@ class RemoteDesktopViewer(Gtk.Window):
         root.append(title_bar)
         self._title_bar = title_bar
 
-        # ── Mode: View | Control | Session (remote desktop ladder) ───
+        # ── Simple modes: Watch | Control ─────────────────────────────
         mode_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         mode_row.add_css_class("rdv-mode-row")
-        self._mode_view = Gtk.ToggleButton(label="1 · View")
+        self._mode_view = Gtk.ToggleButton(label="Watch")
         self._mode_view.add_css_class("rdv-mode-btn")
         self._mode_view.set_active(True)
-        self._mode_view.set_tooltip_text("Screenshots + Live (no remote input)")
-        self._mode_control = Gtk.ToggleButton(label="2 · Control")
+        self._mode_view.set_tooltip_text(
+            "Look only — screenshots, Live, or stream. No mouse/keyboard to host."
+        )
+        self._mode_control = Gtk.ToggleButton(label="Control")
         self._mode_control.add_css_class("rdv-mode-btn")
         self._mode_control.set_group(self._mode_view)
-        self._mode_session = Gtk.ToggleButton(label="3 · Session")
-        self._mode_session.add_css_class("rdv-mode-btn")
-        self._mode_session.set_group(self._mode_view)
-        self._mode_session.set_tooltip_text(
-            "Keepstream Session: start/stop stream (view-only). "
-            "Use 2 · Control for mouse/keyboard while streaming."
-        )
         self._mode_control.set_tooltip_text(
-            "Interactive control: inject mouse/keys. "
-            "If Keepstream is up, input rides the Session stream; else Live poll."
+            "Mouse and keyboard go to the remote host. "
+            "Use with Stream when possible (smooth); else Live poll."
         )
+        # Compat alias; Session is no longer a mode
+        self._mode_session = self._mode_view
         self._mode_view.connect(
             "toggled", lambda b: b.get_active() and self._set_mode("view")
         )
         self._mode_control.connect(
             "toggled", lambda b: b.get_active() and self._set_mode("control")
         )
-        self._mode_session.connect(
-            "toggled", lambda b: b.get_active() and self._set_mode("session")
-        )
         mode_row.append(self._mode_view)
         mode_row.append(self._mode_control)
-        mode_row.append(self._mode_session)
         self.mode_hint = Gtk.Label(
-            label="Ladder: View → Control (poll) → Session (Keepstream stream)",
+            label="Watch = look · Control = use mouse/keys · Stream = live video",
             xalign=0,
         )
         self.mode_hint.add_css_class("rdv-mode-hint")
@@ -272,41 +265,19 @@ class RemoteDesktopViewer(Gtk.Window):
         root.append(mode_row)
         self._mode_row = mode_row
 
-        # ── Capture ribbon ───────────────────────────────────────────
+        # ── Primary: Stream · secondary: Capture / Live stills ───────
         ribbon = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         ribbon.add_css_class("rdv-ribbon")
 
-        self.btn_shot = Gtk.Button()
-        shot_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        shot_box.append(_img("camera-photo", 16))
-        shot_box.append(Gtk.Label(label="Capture"))
-        self.btn_shot.set_child(shot_box)
-        self.btn_shot.add_css_class("rdv-primary")
-        self.btn_shot.set_tooltip_text("Capture remote screenshot (R)")
-        self.btn_shot.connect("clicked", lambda *_: self._do_shot())
-        ribbon.append(self.btn_shot)
-
-        self.btn_live = Gtk.ToggleButton()
-        live_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        live_box.append(_img("media-playback-start", 16))
-        live_box.append(Gtk.Label(label="Live"))
-        self.btn_live.set_child(live_box)
-        self.btn_live.add_css_class("rdv-tool-btn")
-        self.btn_live.set_active(live_on)
-        self.btn_live.set_tooltip_text("Poll screenshots continuously")
-        self.btn_live.connect("toggled", lambda *_: self._do_live())
-        ribbon.append(self.btn_live)
-
-        # Single Start/Stop for Keepstream (no duplicate on Session panel)
+        # Stream first — the main path for remote desktop
         self.btn_sess_on = Gtk.Button()
         sb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         sb.append(_img("video-display", 16))
-        sb.append(Gtk.Label(label="Start stream"))
+        sb.append(Gtk.Label(label="Stream"))
         self.btn_sess_on.set_child(sb)
-        self.btn_sess_on.add_css_class("flat")
-        self.btn_sess_on.add_css_class("rdv-tool-btn")
+        self.btn_sess_on.add_css_class("rdv-primary")
         self.btn_sess_on.set_tooltip_text(
-            "Start Keepstream (continuous stream). Watch-only until Control."
+            "Start live video. Stays in Watch until you click Control."
         )
         self.btn_sess_on.connect("clicked", lambda *_: self._do_session("start"))
         ribbon.append(self.btn_sess_on)
@@ -314,11 +285,11 @@ class RemoteDesktopViewer(Gtk.Window):
         self.btn_sess_off = Gtk.Button()
         se = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         se.append(_img("media-playback-stop", 16))
-        se.append(Gtk.Label(label="Stop stream"))
+        se.append(Gtk.Label(label="Stop"))
         self.btn_sess_off.set_child(se)
         self.btn_sess_off.add_css_class("flat")
         self.btn_sess_off.add_css_class("rdv-tool-btn")
-        self.btn_sess_off.set_tooltip_text("Stop Keepstream session")
+        self.btn_sess_off.set_tooltip_text("Stop live stream")
         self.btn_sess_off.connect("clicked", lambda *_: self._do_session("stop"))
         ribbon.append(self.btn_sess_off)
 
@@ -326,6 +297,35 @@ class RemoteDesktopViewer(Gtk.Window):
         sep.set_margin_start(4)
         sep.set_margin_end(4)
         ribbon.append(sep)
+
+        self.btn_shot = Gtk.Button()
+        shot_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        shot_box.append(_img("camera-photo", 16))
+        shot_box.append(Gtk.Label(label="Capture"))
+        self.btn_shot.set_child(shot_box)
+        self.btn_shot.add_css_class("flat")
+        self.btn_shot.add_css_class("rdv-tool-btn")
+        self.btn_shot.set_tooltip_text("One screenshot (not the live stream)")
+        self.btn_shot.connect("clicked", lambda *_: self._do_shot())
+        ribbon.append(self.btn_shot)
+
+        self.btn_live = Gtk.ToggleButton()
+        live_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        live_box.append(_img("media-playback-start", 16))
+        live_box.append(Gtk.Label(label="Live stills"))
+        self.btn_live.set_child(live_box)
+        self.btn_live.add_css_class("rdv-tool-btn")
+        self.btn_live.set_active(live_on)
+        self.btn_live.set_tooltip_text(
+            "Slow screenshot poll. Prefer Stream for smooth video."
+        )
+        self.btn_live.connect("toggled", lambda *_: self._do_live())
+        ribbon.append(self.btn_live)
+
+        sep2 = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        sep2.set_margin_start(4)
+        sep2.set_margin_end(4)
+        ribbon.append(sep2)
 
         qlab = Gtk.Label(label="Res", xalign=0)
         qlab.add_css_class("rdv-field")
@@ -387,7 +387,7 @@ class RemoteDesktopViewer(Gtk.Window):
             pass
         self.btn_focus.set_tooltip_text(
             "Focus mode: hide UI chrome · stream only (not OS fullscreen). "
-            "While Session is live, typing goes to Windows — use Show UI or "
+            "In Control, typing goes to the host — use Show UI or "
             "Ctrl+F9 to restore chrome (plain F9/Esc do not)."
         )
         self.btn_focus.connect("clicked", lambda *_: self._set_focus_mode(True))
@@ -588,7 +588,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self.picture.set_vexpand(True)
         self.picture.add_css_class("rdv-picture")
 
-        # View mode: click toggles zoom / double-click fullscreen
+        # Watch: click toggles zoom / double-click fullscreen
         click = Gtk.GestureClick()
         click.set_button(1)
 
@@ -602,7 +602,7 @@ class RemoteDesktopViewer(Gtk.Window):
                 except Exception:
                     pass
                 return  # drag gesture owns left button when controlling
-            # Session/View: stream is watch-only; optional zoom on click
+            # Watch: stream is look-only; optional zoom on click
             if n_press == 1 and self._pixbuf is not None:
                 self._set_zoom(1.0 if self._zoom_mode is None else None)
             elif n_press >= 2:
@@ -791,7 +791,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self._overlay_cursor_on = False
 
         self.empty_lab = Gtk.Label(
-            label="Capture or enable Live to see the remote desktop",
+            label="Click Stream for live video\nor Capture for a screenshot",
             xalign=0.5,
         )
         self.empty_lab.add_css_class("rdv-empty-overlay")
@@ -817,33 +817,28 @@ class RemoteDesktopViewer(Gtk.Window):
         self._scroll.add_css_class("rdv-scroll")
         main.append(self._scroll)
 
-        # Session mode panel — settings only (Start/Stop live on the ribbon)
-        session = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        session.add_css_class("rdv-session")
-        session.set_margin_top(12)
-        session.set_margin_start(16)
-        session.set_margin_end(16)
-        stitle = Gtk.Label(label="Keepstream Session", xalign=0)
-        stitle.add_css_class("rdv-title")
-        session.append(stitle)
-        sdesc = Gtk.Label(
-            label=(
-                "Use ribbon Start stream / Stop stream. "
-                "Single Default mode: ≤1600–1920 @ 60 MJPEG · pure UDP. "
-                "Watch-only until 2 · Control. Optional SOCKS / elevated input below."
-            ),
-            xalign=0,
-            wrap=True,
-        )
-        sdesc.add_css_class("rdv-mode-hint")
-        session.append(sdesc)
+        # Main content is always the picture (no separate setup page)
+        self._main_stack = Gtk.Stack()
+        self._main_stack.set_hexpand(True)
+        self._main_stack.set_vexpand(True)
+        self._main_stack.add_named(main, "view")
+        body.append(self._main_stack)
+        root.append(body)
+
+        # Advanced (collapsed) — SOCKS / elevated input; not required for normal use
+        adv = Gtk.Expander(label="Advanced")
+        adv.add_css_class("rdv-session")
+        adv.set_margin_start(8)
+        adv.set_margin_end(8)
+        adv.set_margin_bottom(4)
+        adv_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        adv_box.set_margin_top(6)
+        adv_box.set_margin_bottom(6)
         srow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.btn_socks = Gtk.Button(label="SOCKS start (tunnel)")
+        self.btn_socks = Gtk.Button(label="SOCKS tunnel")
         self.btn_socks.add_css_class("flat")
         self.btn_socks.add_css_class("rdv-tool-btn")
-        self.btn_socks.set_tooltip_text(
-            "Queue socks_start if you need to tunnel to agent loopback"
-        )
+        self.btn_socks.set_tooltip_text("socks_start — tunnel to agent loopback")
         self.btn_socks.connect("clicked", lambda *_: self._do_socks())
         srow.append(self.btn_socks)
         self.btn_copy_vnc = Gtk.Button(label="Copy connect hint")
@@ -851,78 +846,43 @@ class RemoteDesktopViewer(Gtk.Window):
         self.btn_copy_vnc.add_css_class("rdv-tool-btn")
         self.btn_copy_vnc.connect("clicked", lambda *_: self._copy_vnc_hint())
         srow.append(self.btn_copy_vnc)
-        session.append(srow)
-
-        # Optional plug-in: High-IL inject helper (lab: agent/windows/input-provider)
-        ip_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        ip_box.set_margin_top(10)
-        ip_title = Gtk.Label(label="Custom input provider (optional)", xalign=0)
-        ip_title.add_css_class("rdv-title")
-        ip_box.append(ip_title)
-        ip_hint = Gtk.Label(
-            label=(
-                "For Task Manager / admin UI when the agent is not elevated: "
-                "install agent/windows/input-provider once (Highest task), start "
-                "it silently, then enable Use provider. Empty path defaults to "
-                "\\\\.\\pipe\\hogwarts-input (pipe). Or set an exec path. "
-                "Do not self-elevate on each Session start (UAC every time)."
-            ),
-            xalign=0,
-            wrap=True,
-        )
-        ip_hint.add_css_class("rdv-mode-hint")
-        ip_box.append(ip_hint)
+        adv_box.append(srow)
         ip_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.input_provider_enable = Gtk.CheckButton(label="Use provider")
+        self.input_provider_enable = Gtk.CheckButton(label="Elevated input provider")
         self.input_provider_enable.set_tooltip_text(
-            "When checked, session_start sends input_provider. Empty path → "
-            "default Windows pipe hogwarts-input. Unchecked = local inject only "
-            "(agent.json can still enable a provider)."
+            "For admin UI when agent is not elevated. Empty path = hogwarts-input pipe."
         )
         ip_row.append(self.input_provider_enable)
         self.input_provider_entry = Gtk.Entry()
         self.input_provider_entry.set_hexpand(True)
         self.input_provider_entry.set_placeholder_text(
-            r"empty = \\.\pipe\hogwarts-input   or  C:\tools\helper.exe"
-        )
-        self.input_provider_entry.set_tooltip_text(
-            "Empty + Use provider → kind=pipe hogwarts-input. "
-            "\\\\.\\pipe\\… → pipe. Else → kind=exec spawn. "
-            "Protocol: HELLO hogwarts-input/1, JSON events, BYE."
+            r"\\.\pipe\hogwarts-input  or  helper.exe"
         )
         ip_row.append(self.input_provider_entry)
         btn_pipe = Gtk.Button(label="Default pipe")
         btn_pipe.add_css_class("flat")
-        btn_pipe.set_tooltip_text(
-            "Fill Windows default named pipe and enable Use provider"
-        )
         btn_pipe.connect("clicked", lambda *_: self._fill_default_input_pipe())
         ip_row.append(btn_pipe)
-        ip_box.append(ip_row)
-        session.append(ip_box)
-        self._load_input_provider_prefs()
-
+        adv_box.append(ip_row)
         self.session_lab = Gtk.Label(
-            label="No Keepstream session — click Start Keepstream.",
+            label="Stream off — click Stream to connect.",
             xalign=0,
             wrap=True,
             selectable=True,
         )
         self.session_lab.add_css_class("rdv-session-info")
-        session.append(self.session_lab)
-
-        self._main_stack = Gtk.Stack()
-        self._main_stack.set_hexpand(True)
-        self._main_stack.set_vexpand(True)
-        self._main_stack.add_named(main, "view")
-        self._main_stack.add_named(session, "session")
-        body.append(self._main_stack)
-        root.append(body)
+        adv_box.append(self.session_lab)
+        adv.set_child(adv_box)
+        root.append(adv)
+        self._adv_expander = adv
+        self._load_input_provider_prefs()
 
         # Status
         status_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         status_bar.add_css_class("rdv-statusbar")
-        self.status = Gtk.Label(label="Ready — Capture or pick from archive", xalign=0)
+        self.status = Gtk.Label(
+            label="Ready — Stream for live video, or Capture a still", xalign=0
+        )
         self.status.add_css_class("rdv-status")
         self.status.set_hexpand(True)
         self.status.set_ellipsize(Pango.EllipsizeMode.END)
@@ -937,7 +897,7 @@ class RemoteDesktopViewer(Gtk.Window):
         key = Gtk.EventControllerKey()
 
         def _remote_keys_active() -> bool:
-            # Only Control injects keys — Session stream is view-only
+            # Only Control injects keys — Watch never sends input
             try:
                 return bool(self._accepts_remote_input())
             except Exception:
@@ -1055,12 +1015,12 @@ class RemoteDesktopViewer(Gtk.Window):
                     self._nudge_zoom(-1)
                     return True
 
-            # Session / Control: ALL keys go to host (incl. Esc, F, 1, Space).
+            # Control: ALL keys go to host (incl. Esc, F, 1, Space).
             # This stops focus mode exit + fit/1:1 zoom "screen spreads out".
             if remote:
                 return _forward_key_to_remote(keyval, state)
 
-            # Local-only shortcuts (View mode / no Keepstream)
+            # Local-only shortcuts (Watch mode)
             if keyval == Gdk.KEY_Escape:
                 if self._focus_mode:
                     self._set_focus_mode(False)
@@ -1215,7 +1175,7 @@ class RemoteDesktopViewer(Gtk.Window):
         )
 
         if is_stream and not self._archive_live:
-            # ── Fast path (Session / Live) — minimize GTK work per frame ──
+            # ── Fast path (Stream / Live) — minimize GTK work per frame ──
             try:
                 self.empty_lab.set_visible(False)
             except Exception:
@@ -1275,15 +1235,15 @@ class RemoteDesktopViewer(Gtk.Window):
 
     def set_status(self, msg: str, *, ok: bool | None = None) -> None:
         self._set_status(msg, ok=ok)
-        # Surface session notes into Session panel
-        if self._mode == "session" or "VNC" in msg or "session" in msg.lower():
+        # Surface connect notes into Advanced panel when relevant
+        if "VNC" in msg or "stream" in msg.lower() or "session" in msg.lower():
             try:
                 self.session_lab.set_text(msg)
             except Exception:
                 pass
 
     def set_session_info(self, info: dict[str, Any]) -> None:
-        """Update Session panel from desktop_start/stop results."""
+        """Update Advanced panel from stream start/stop results."""
         self._session_info = dict(info or {})
         lines = []
         mode = info.get("mode") or info.get("started")
@@ -1329,8 +1289,8 @@ class RemoteDesktopViewer(Gtk.Window):
         elif vnc.get("error"):
             lines.append(f"VNC: {vnc.get('error')} — {vnc.get('hint') or ''}")
         if info.get("stopped"):
-            lines.append("Session stopped.")
-        self.session_lab.set_text("\n".join(lines) if lines else "Session updated.")
+            lines.append("Stream stopped.")
+        self.session_lab.set_text("\n".join(lines) if lines else "Stream updated.")
 
     def _wants_local_cursor(self) -> bool:
         """True when host omits pointer in capture — desk MUST show a pointer."""
@@ -1355,7 +1315,7 @@ class RemoteDesktopViewer(Gtk.Window):
         return False
 
     def _stream_cursor_widgets(self) -> list[Any]:
-        """Only the video surface — never the window chrome (Session/ribbon)."""
+        """Only the video surface — never the window chrome (ribbon/archive)."""
         out: list[Any] = [
             self.picture,
             getattr(self, "_stream_overlay", None),
@@ -1401,37 +1361,29 @@ class RemoteDesktopViewer(Gtk.Window):
             self._set_default_pointer(w)
 
     def on_keepstream_up(self) -> None:
-        """HELLO_OK: stream is live; stay view-only unless user already chose Control."""
+        """HELLO_OK: stream is live; stay in Watch unless user already chose Control."""
         try:
             self.empty_lab.set_visible(False)
         except Exception:
             pass
         self._main_stack.set_visible_child_name("view")
         self._apply_session_cursor()
-        # Never auto-enter Control — only report status
         if self._mode == "control":
-            self._set_status(
-                "Keepstream up — Control active (mouse/keys → host)",
-                ok=True,
-            )
+            self._set_status("Streaming + Control — mouse/keys go to host", ok=True)
+            self.mode_hint.set_text("Control on · stream live")
         else:
+            # Ensure Watch (not Control)
+            self._mode = "view"
+            try:
+                if not self._mode_view.get_active():
+                    self._mode_view.set_active(True)
+            except Exception:
+                pass
             self._set_status(
-                "Keepstream up — watching only · press 2 · Control to inject",
+                "Streaming (Watch) · click Control to use mouse & keyboard",
                 ok=True,
             )
-        try:
-            # Refresh hints without changing mode (do not set_active here)
-            if self._mode == "session":
-                self.mode_hint.set_text(
-                    "Session (Keepstream): watching only · "
-                    "press 2 · Control for mouse/keyboard"
-                )
-            elif self._mode == "view":
-                self.mode_hint.set_text(
-                    "View + Keepstream: watching · 2 · Control to inject"
-                )
-        except Exception:
-            pass
+            self.mode_hint.set_text("Watching stream · Control to interact")
 
     def prepare_keepstream_connect(self) -> None:
         """Call when Start stream is pressed — blank the surface before live frames."""
@@ -1463,12 +1415,12 @@ class RemoteDesktopViewer(Gtk.Window):
             pass
         # Cover the whole stream area (overlay on picture, not below it)
         try:
-            self.empty_lab.set_label("Connecting Keepstream…\n(last screenshot cleared)")
+            self.empty_lab.set_label("Connecting stream…\n(last screenshot cleared)")
             self.empty_lab.set_visible(True)
             self.empty_lab.set_opacity(1.0)
         except Exception:
             pass
-        # Show stream stack immediately (not the settings form alone)
+        # Show stream surface immediately
         try:
             self._main_stack.set_visible_child_name("view")
         except Exception:
@@ -1481,9 +1433,9 @@ class RemoteDesktopViewer(Gtk.Window):
                 self._on_live(False)
             except Exception:
                 pass
-        self.live_badge.set_text("SESSION…")
+        self.live_badge.set_text("STREAM…")
         self.live_badge.add_css_class("rdv-badge-live")
-        self._set_status("Connecting Keepstream — waiting for live frames…", ok=None)
+        self._set_status("Connecting stream — waiting for live frames…", ok=None)
 
     def attach_keepstream(self, client: Any) -> None:
         """Attach Keepstream for frames only — never force Control mode."""
@@ -1500,18 +1452,16 @@ class RemoteDesktopViewer(Gtk.Window):
                     pass
         except Exception:
             self._session_local_cursor = True
-        self.live_badge.set_text("SESSION")
+        self.live_badge.set_text("STREAM")
         self.live_badge.add_css_class("rdv-badge-live")
-        # Force Session (view-only) — deactivates Control via radio group
-        self._mode = "session"
-        if not self._mode_session.get_active():
-            self._mode_session.set_active(True)
+        # Stay in Watch (never force Control)
+        self._mode = "view"
+        if not self._mode_view.get_active():
+            self._mode_view.set_active(True)
         else:
-            self._set_mode("session")
-        # Stream surface (setup form hidden; empty until first Keepstream frame)
+            self._set_mode("view")
         self._main_stack.set_visible_child_name("view")
         self._apply_session_cursor()
-        # Hard-stop Live poll again (race if started during connect)
         if self.btn_live.get_active() and self._on_live:
             self.btn_live.set_active(False)
         elif self._on_live:
@@ -1521,27 +1471,36 @@ class RemoteDesktopViewer(Gtk.Window):
                 pass
         if self._pixbuf is None:
             try:
-                self.empty_lab.set_label("Keepstream connected — waiting for video…")
+                self.empty_lab.set_label("Stream connected — waiting for video…")
                 self.empty_lab.set_visible(True)
             except Exception:
                 pass
         self._set_status(
-            "Keepstream watching only · press 2 · Control to use mouse/keys",
+            "Streaming (Watch) · switch to Control to use mouse & keyboard",
             ok=True,
         )
+        try:
+            self.session_lab.set_text("Stream connected.")
+        except Exception:
+            pass
 
     def clear_keepstream(self) -> None:
-        """Session stop — allow Capture/Live frames again."""
+        """Stream stop — allow Capture/Live frames again."""
         self._keepstream = None
         if self._frame_source == "keepstream":
             self._frame_source = None
+        try:
+            if not self.btn_live.get_active():
+                self.live_badge.set_text("")
+                self.live_badge.remove_css_class("rdv-badge-live")
+        except Exception:
+            pass
 
     def _accepts_remote_input(self) -> bool:
-        """Only Control mode injects input (Session is stream-only).
+        """Only Control mode injects input (Watch never sends mouse/keys).
 
-        Ladder: View = watch · Control = inject · Session = start/stop Keepstream.
-        With Keepstream up, Control rides the Session TCP/UDP path; without it,
-        Control uses Live poll + desktop_input.
+        With Stream up, Control rides the Keepstream path; without it,
+        Control uses Live stills + desktop_input.
         """
         return self._mode == "control"
 
@@ -1571,69 +1530,51 @@ class RemoteDesktopViewer(Gtk.Window):
     # ── Modes / control ──────────────────────────────────────────────
 
     def _set_mode(self, mode: str) -> None:
+        # Only Watch | Control (legacy "session" → Watch)
+        if mode == "session":
+            mode = "view"
         self._mode = mode
         self._control_on = mode == "control"
         ks_up = bool(
             self._keepstream is not None
             and getattr(self._keepstream, "connected", False)
         )
-        if mode == "session" and not ks_up:
-            # Setup panel until Keepstream is connected
-            self._main_stack.set_visible_child_name("session")
-            self.mode_hint.set_text(
-                "Session: Start Keepstream for continuous stream (view-only). "
-                "Then click 2 · Control to inject mouse/keys."
-            )
-        else:
-            # Stream frames live in the picture view
-            self._main_stack.set_visible_child_name("view")
-            if mode == "session" and ks_up:
-                self.mode_hint.set_text(
-                    "Session (Keepstream): watching stream only · "
-                    "click 2 · Control for mouse/keyboard"
-                )
-                self._main_stack.set_visible_child_name("view")
+        self._main_stack.set_visible_child_name("view")
+        if mode == "control":
+            if ks_up:
+                self.mode_hint.set_text("Control on · stream live · keys go to host")
                 self._apply_session_cursor()
-            elif mode == "control":
-                if ks_up:
-                    self.mode_hint.set_text(
-                        "Control + Keepstream: mouse/keys → host · stream live"
-                    )
-                    self._apply_session_cursor()
-                    try:
-                        self.picture.grab_focus()
-                    except Exception:
-                        pass
-                else:
-                    self.mode_hint.set_text(
-                        "Control: inject via Live poll · "
-                        "Start Keepstream (Session) for smooth stream + control"
-                    )
-                    # Snappier Live while controlling without Keepstream
-                    self._set_live_interval(0.3)
-                    if not self.btn_live.get_active() and self._on_live:
-                        self.btn_live.set_active(True)
-                    try:
-                        self.picture.set_cursor_from_name("default")
-                    except Exception:
-                        pass
+                try:
+                    self.picture.grab_focus()
+                except Exception:
+                    pass
             else:
-                if ks_up:
-                    self.mode_hint.set_text(
-                        "View + Keepstream: watching stream · "
-                        "2 · Control to inject · 3 · Session to stop"
-                    )
-                else:
-                    self.mode_hint.set_text(
-                        "View: Capture / Live / archive"
-                    )
-                if not ks_up:
-                    self._set_live_interval(0.8)
-                    try:
-                        self.picture.set_cursor_from_name("default")
-                    except Exception:
-                        pass
-                self._flush_input(force=True)
+                self.mode_hint.set_text(
+                    "Control on · no stream — using Live stills (or click Stream)"
+                )
+                self._set_live_interval(0.3)
+                if not self.btn_live.get_active() and self._on_live:
+                    self.btn_live.set_active(True)
+                try:
+                    self.picture.set_cursor_from_name("default")
+                except Exception:
+                    pass
+        else:
+            if ks_up:
+                self.mode_hint.set_text(
+                    "Watching stream · click Control to use mouse & keyboard"
+                )
+            else:
+                self.mode_hint.set_text(
+                    "Watch · Capture / Live stills · or Stream for live video"
+                )
+            if not ks_up:
+                self._set_live_interval(0.8)
+                try:
+                    self.picture.set_cursor_from_name("default")
+                except Exception:
+                    pass
+            self._flush_input(force=True)
 
     def _set_live_interval(self, sec: float) -> None:
         sec = max(0.25, min(float(sec), 10.0))
@@ -1688,7 +1629,7 @@ class RemoteDesktopViewer(Gtk.Window):
         """Batch input events; flush on a short timer (lower task spam, snappier feel)."""
         if not event:
             return
-        # Keepstream Session: send hover/move immediately (Windows UI needs
+        # Stream path: send hover/move immediately (Windows UI needs
         # continuous absolute positions — GLib coalesce kills tooltips).
         ks = self._keepstream
         ks_up = bool(ks is not None and getattr(ks, "connected", False))
@@ -1709,7 +1650,7 @@ class RemoteDesktopViewer(Gtk.Window):
         if len(self._input_queue) > 40:
             self._input_queue = self._input_queue[-40:]
         if self._input_flush_src is None:
-            # Session: next idle tick. Control/Live: 8ms.
+            # Stream: next idle tick. Control/Live: 8ms.
             delay_ms = 0 if ks_up else 8
             self._input_flush_src = GLib.timeout_add(delay_ms, self._flush_input_timer)
 
@@ -1767,7 +1708,7 @@ class RemoteDesktopViewer(Gtk.Window):
         self._input_queue.clear()
         if not batch:
             return
-        # Prefer Keepstream Session (no plane RTT)
+        # Prefer Keepstream stream (no plane RTT)
         ks = self._keepstream
         if ks is not None and getattr(ks, "connected", False):
             try:
@@ -2339,7 +2280,7 @@ class RemoteDesktopViewer(Gtk.Window):
             self.input_provider_enable.set_active(True)
         self._save_input_provider_prefs()
         self._set_status(
-            "Input provider: \\\\.\\pipe\\hogwarts-input (enable + Start Keepstream)",
+            "Input provider: \\\\.\\pipe\\hogwarts-input (enable + click Stream)",
             ok=True,
         )
 
@@ -2421,7 +2362,7 @@ class RemoteDesktopViewer(Gtk.Window):
                 # Older callback: action only
                 self._on_session(action)
         self._set_status(
-            "Starting Keepstream…" if action == "start" else "Stopping Session…",
+            "Starting stream…" if action == "start" else "Stopping stream…",
             ok=None,
         )
         if action == "start":
@@ -2432,16 +2373,22 @@ class RemoteDesktopViewer(Gtk.Window):
                     extra = f"\ninput_provider pipe: {ip.get('pipe') or '?'}"
                 elif ip.get("command"):
                     extra = f"\ninput_provider exec: {ip.get('command')}"
-            self.session_lab.set_text(
-                "Starting Keepstream on agent…" + extra
-            )
-            if not self._mode_session.get_active():
-                self._mode_session.set_active(True)
+            self.session_lab.set_text("Starting stream…" + extra)
+            # Stay in Watch while connecting
+            try:
+                if not self._mode_view.get_active():
+                    self._mode_view.set_active(True)
+            except Exception:
+                self._mode = "view"
         elif action == "stop":
             try:
                 self.clear_keepstream()
             except Exception:
                 self._keepstream = None
+            try:
+                self.session_lab.set_text("Stream off.")
+            except Exception:
+                pass
 
     # ── Zoom / display ───────────────────────────────────────────────
 
@@ -2569,6 +2516,7 @@ class RemoteDesktopViewer(Gtk.Window):
             getattr(self, "_archive_side", None),
             getattr(self, "_body_vdiv", None),
             getattr(self, "_status_bar", None),
+            getattr(self, "_adv_expander", None),
         ]
         for w in chrome:
             if w is None:
@@ -2582,7 +2530,7 @@ class RemoteDesktopViewer(Gtk.Window):
         except Exception:
             pass
         if on:
-            # Prefer stream surface over Session setup form
+            # Prefer stream surface
             try:
                 self._main_stack.set_visible_child_name("view")
             except Exception:

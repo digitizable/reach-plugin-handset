@@ -611,7 +611,7 @@ class AgentsPanel(Gtk.Box):
         desk_text.append(desk_title)
         desk_blurb = Gtk.Label(
             label=(
-                "Capture · Live · Control · Session live in the work window. "
+                "Stream · Watch / Control live in the work window. "
                 "Selecting this tab opens (or focuses) it."
             ),
             xalign=0,
@@ -1678,7 +1678,7 @@ class AgentsPanel(Gtk.Box):
     def _desktop_session(self, action: str, options: dict | None = None) -> None:
         if not self._selected or not self._on_desktop_session:
             return
-        if not self._require_desktop_viewer("Session"):
+        if not self._require_desktop_viewer("Stream"):
             return
         try:
             self._on_desktop_session(self._selected.id, action, options or {})
@@ -1711,7 +1711,7 @@ class AgentsPanel(Gtk.Box):
     def _open_desktop_viewer(self, *, auto_shot: bool = False) -> None:
         """Open (or focus) the large remote desktop viewer window.
 
-        Capture / Live / Session primary controls live inside this window.
+        Stream / Watch / Control primary controls live inside this window.
         ``auto_shot=True`` queues a screenshot after the window is up (density).
         """
         if not self._selected:
@@ -1744,7 +1744,7 @@ class AgentsPanel(Gtk.Box):
         def on_input(events: list) -> None:
             if self._desktop_viewer is None:
                 return
-            # Prefer Keepstream Session path (no plane lag)
+            # Prefer Keepstream stream path (no plane lag)
             ks = self._keepstream
             if ks is not None and getattr(ks, "connected", False):
                 try:
@@ -1825,12 +1825,12 @@ class AgentsPanel(Gtk.Box):
         # maximize and stay stacked under the main window on some WMs.
         self._desktop_viewer = win
         self.desktop_status.set_text(
-            "Remote Viewer open — use Capture / Live / Session in that window."
+            "Remote Viewer open — Stream for live video, Control to interact."
         )
         self.desktop_status.remove_css_class("hogwarts-fail")
         self.desktop_status.add_css_class("hogwarts-ok")
         win.present()
-        # Offer a maximized canvas by default (Session is the main use case)
+        # Offer a maximized canvas by default (stream is the main use case)
         def _max_once() -> bool:
             try:
                 win.maximize()

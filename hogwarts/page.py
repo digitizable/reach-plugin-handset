@@ -2208,13 +2208,13 @@ class HogwartsPage(Gtk.Box):
     def _desktop_session(
         self, agent_id: str, action: str, options: dict | None = None
     ) -> None:
-        """Session: Keepstream (default) or legacy desktop_start/stop."""
+        """Stream start/stop: Keepstream (default) or legacy desktop_start/stop."""
         if not self._plane.is_configured:
             self._agents.set_desktop_note("Plane not configured", ok=False)
             return
         if not self._agents.desktop_viewer_open():
             self._agents.set_desktop_note(
-                "Open Remote Viewer for Session — not available on the agent page.",
+                "Open Remote Viewer for Stream — not available on the agent page.",
                 ok=False,
             )
             return
@@ -2254,7 +2254,7 @@ class HogwartsPage(Gtk.Box):
                     if err:
                         self._agents.set_desktop_note(err, ok=False)
                     else:
-                        note = "Session stopped"
+                        note = "Stream stopped"
                         if res:
                             note += f" · {res.get('session_id') or ''}"
                         self._agents.set_desktop_note(note, ok=True)
@@ -2477,7 +2477,7 @@ class HogwartsPage(Gtk.Box):
                         "h264" if meta.get("codec") == 2 else "jpeg"
                     )
                     note = (
-                        f"SESSION {meta.get('width')}×{meta.get('height')} · "
+                        f"STREAM {meta.get('width')}×{meta.get('height')} · "
                         f"{cname} · #{meta.get('frame_id')} · "
                         f"{meta.get('bytes')} B"
                         f"{rtt_s}{drop_s}"
@@ -2608,7 +2608,7 @@ class HogwartsPage(Gtk.Box):
         threading.Thread(
             target=work_start, name="hogwarts-session-start", daemon=True
         ).start()
-        self._agents.set_desktop_note("Starting Keepstream Session…")
+        self._agents.set_desktop_note("Starting stream…")
 
     def _refresh_tasks(self, agent_id: str) -> None:
         if not self._plane.is_configured or not agent_id:
@@ -2857,7 +2857,7 @@ Optional one-file binary (PyInstaller on *same* OS — no Linux→PE cross):
   # Windows: pwsh -File agent/windows/build-windows.ps1 (repo)
   # CI: GitHub Actions workflow windows-agent.yml
 
-Keepstream 60fps (Session): install ffmpeg on PATH
+Keepstream 60fps (Stream): install ffmpeg on PATH
   Windows: winget install Gyan.FFmpeg   → gdigrab MJPEG
   Linux:   apt install ffmpeg           → x11grab MJPEG
   Without ffmpeg the agent uses slow PIL fallback.

@@ -1001,16 +1001,17 @@ HOGWARTS_CSS = """
 }
 .rdv-session {
   background-color: #1e1e1e;
-  min-height: 200px;
+  /* Advanced expander — no forced height (was session full-page) */
+  min-height: 0;
 }
 .rdv-session-info {
   font-family: monospace;
-  font-size: 0.82rem;
+  font-size: 0.78rem;
   color: #d4d4d4;
   background-color: #252526;
   border: 1px solid #3e3e42;
   border-radius: 6px;
-  padding: 12px;
+  padding: 8px 10px;
 }
 .rdv-empty-overlay {
   font-size: 0.95rem;
