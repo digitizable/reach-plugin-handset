@@ -2284,15 +2284,17 @@ class HogwartsPage(Gtk.Box):
             else:
                 max_side = int(self._agents.shot_max_side())
             profile = str(start_opts.get("profile") or "balanced").lower()
-            if profile in ("gaming", "gaming-lan"):
-                # v0.5: 1280 playable quality (was 960 — soft for games)
+            if profile == "gaming-lan":
+                # Lab LAN: allow sharper capture
+                max_side = max(960, min(max_side, 1600))
+            elif profile == "gaming":
                 max_side = max(640, min(max_side, 1280))
             else:
                 max_side = max(960, min(max_side, 1280))
         except Exception:
             max_side = (
-                1280
-                if str(start_opts.get("profile") or "") in ("gaming", "gaming-lan")
+                1600
+                if str(start_opts.get("profile") or "") == "gaming-lan"
                 else 1280
             )
         # Stash for paint/input tuning while Session is up
@@ -2373,12 +2375,17 @@ class HogwartsPage(Gtk.Box):
                     payload["local_cursor"] = bool(start_opts.get("local_cursor"))
                 elif profile in ("gaming", "gaming-lan"):
                     payload["local_cursor"] = True
-                # Host draw_mouse: off for gaming (desk composite arrow only).
-                # draw_mouse=1 left a lagging "real" cursor stuck after click.
+                # Host draw_mouse: off for gaming (OS cursor on desk only).
                 if "draw_mouse" in start_opts:
                     payload["draw_mouse"] = bool(start_opts.get("draw_mouse"))
                 elif profile in ("gaming", "gaming-lan"):
                     payload["draw_mouse"] = False
+                if "transport" in start_opts:
+                    tr = str(start_opts.get("transport") or "").strip().lower()
+                    if tr in ("tcp", "udp"):
+                        payload["transport"] = tr
+                elif profile in ("gaming", "gaming-lan"):
+                    payload["transport"] = "udp"
                 ip = start_opts.get("input_provider")
                 if isinstance(ip, dict) and (
                     ip.get("command") or ip.get("pipe") or ip.get("kind")

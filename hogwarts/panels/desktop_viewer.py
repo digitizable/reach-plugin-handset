@@ -43,8 +43,8 @@ _QUALITY: list[tuple[str, int]] = [
 
 # Session latency profiles (sent as session_start.profile + fps/max_side)
 _SESSION_PROFILES: list[tuple[str, str]] = [
-    ("Gaming LAN", "gaming-lan"),  # ≤1280 @ 60 MJPEG + local cursor + UDP
-    ("Gaming", "gaming"),  # ≤1280 @ 60 H.264/NVENC + local cursor + UDP
+    ("Gaming LAN", "gaming-lan"),  # ≤1600 @ 60 sharp MJPEG + pure UDP
+    ("Gaming", "gaming"),  # ≤1280 @ 60 H.264/NVENC + UDP
     ("Balanced", "balanced"),  # 1280 @ 45 H.264 — smooth UI animations
     ("Quality", "quality"),  # sharper / slower
 ]
@@ -2174,12 +2174,12 @@ class RemoteDesktopViewer(Gtk.Window):
                 pass
             if prof == "gaming-lan":
                 self._set_status(
-                    "Session: Gaming LAN (≤1280 @ 60 MJPEG · UDP · local cursor)",
+                    "Session: Gaming LAN (≤1600 @ 60 sharp MJPEG · pure UDP)",
                     ok=None,
                 )
             else:
                 self._set_status(
-                    "Session: Gaming (≤1280 @ 60 H.264/NVENC · UDP · local cursor)",
+                    "Session: Gaming (≤1280 @ 60 H.264/NVENC · UDP)",
                     ok=None,
                 )
         elif prof == "quality":
@@ -2195,13 +2195,14 @@ class RemoteDesktopViewer(Gtk.Window):
         opts["profile"] = prof
         side = self.current_max_side()
         if prof == "gaming-lan":
-            opts["max_side"] = min(int(side), 1280)
+            # Premium lab LAN session — quality + latency first
+            opts["max_side"] = min(max(int(side), 1280), 1600)
             opts["fps"] = 60
-            opts["quality"] = 78  # sharper UI chrome on LAN
-            opts["codec"] = "jpeg"  # MJPEG — snappiest on LAN
+            opts["quality"] = 88  # q:v ~3 — crisp UI / desktop
+            opts["codec"] = "jpeg"  # MJPEG — lowest glass-to-glass on LAN
             opts["local_cursor"] = True
-            # Desk paints composite arrow — host cursor off (no stuck dual pointer)
             opts["draw_mouse"] = False
+            opts["transport"] = "udp"
         elif prof == "gaming":
             opts["max_side"] = min(int(side), 1280)
             opts["fps"] = 60
@@ -2209,6 +2210,7 @@ class RemoteDesktopViewer(Gtk.Window):
             opts["codec"] = "h264"
             opts["local_cursor"] = True
             opts["draw_mouse"] = False
+            opts["transport"] = "udp"
         elif prof == "quality":
             opts["max_side"] = max(int(side), 1280)
             opts["fps"] = 45  # smoother than 30 for window animations
