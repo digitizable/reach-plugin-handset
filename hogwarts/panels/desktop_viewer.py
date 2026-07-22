@@ -2309,7 +2309,7 @@ class RemoteDesktopViewer(Gtk.Window):
                 pass
             if prof == "gaming-lan":
                 self._set_status(
-                    "Session: Gaming LAN (≤1440 @ 60 · NVENC/MJPEG · pure UDP · smooth)",
+                    "Session: Gaming LAN (≤1280 @ 60 MJPEG · pure UDP · no film)",
                     ok=None,
                 )
             else:
