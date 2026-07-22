@@ -314,10 +314,10 @@ class RemoteDesktopViewer(Gtk.Window):
         )
         self.session_profile_dd.set_selected(0)  # Gaming LAN default
         self.session_profile_dd.set_tooltip_text(
-            "Gaming LAN: ≤960 @ 60fps MJPEG — lowest felt lag on lab LAN.\n"
-            "Gaming: ≤960 @ 60fps H.264/NVENC — better when path/bandwidth matters.\n"
-            "Balanced: 1280 @ 30 H.264.\n"
-            "Quality: sharper / higher lag."
+            "Gaming LAN: ≤960 @ 60 MJPEG over UDP (lowest lag on LAN).\n"
+            "Gaming: ≤960 @ 60 H.264/NVENC+DXGI over UDP (Parsec-class path).\n"
+            "Balanced: 1280 @ 30 H.264 TCP.\n"
+            "Quality: sharper / higher lag TCP."
         )
         self.session_profile_dd.connect(
             "notify::selected", lambda *_: self._on_session_profile_changed()
