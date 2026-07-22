@@ -137,6 +137,8 @@ class RemoteDesktopViewer(Gtk.Window):
         self._last_move_flush = 0.0
         self._live_interval_sec = 1.0  # float seconds; Control drops to 0.5
         self._keepstream: Any = None  # KeepstreamClient when Session connected
+        self._last_motion_xy: tuple[float, float] | None = None
+        self._rel_mouse = False  # Parsec-class relative mouse (gaming Session)
 
         safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in agent_id)[:48]
         if archive_dir:
@@ -618,7 +620,7 @@ class RemoteDesktopViewer(Gtk.Window):
         rclick.connect("pressed", on_right)
         self.picture.add_controller(rclick)
 
-        # Hover move while Control/Session — gaming reports ~120 Hz (Parsec-class)
+        # Hover move while Control/Session — gaming: relative + ~250 Hz
         motion = Gtk.EventControllerMotion()
 
         def on_motion(_c: Gtk.EventControllerMotion, x: float, y: float) -> None:
@@ -631,28 +633,53 @@ class RemoteDesktopViewer(Gtk.Window):
             import time as _time
 
             now = _time.monotonic()
-            # Gaming Session: 8ms (~125 Hz). Balanced/Control: 40ms.
             ks = self._keepstream
             ks_up = bool(ks is not None and getattr(ks, "connected", False))
-            min_dt = 0.04
+            gaming = False
             if ks_up:
                 try:
-                    if self.current_session_profile() in ("gaming", "gaming-lan"):
-                        min_dt = 0.008
-                    else:
-                        min_dt = 0.016
+                    gaming = self.current_session_profile() in (
+                        "gaming",
+                        "gaming-lan",
+                    )
                 except Exception:
-                    min_dt = 0.008
+                    gaming = bool(getattr(ks, "local_cursor", False))
+            self._rel_mouse = bool(gaming and ks_up)
+            # Gaming: 4ms (~250 Hz). Balanced: 16ms. Control poll: 40ms.
+            min_dt = 0.004 if self._rel_mouse else (0.016 if ks_up else 0.04)
             if now - self._last_move_flush < min_dt:
                 return
+            self._last_move_flush = now
+
+            if self._rel_mouse:
+                # Relative mouse in host pixels (Parsec-class aim)
+                prev = self._last_motion_xy
+                self._last_motion_xy = (x, y)
+                if prev is None:
+                    return
+                ddx = x - prev[0]
+                ddy = y - prev[1]
+                if abs(ddx) < 0.25 and abs(ddy) < 0.25:
+                    return
+                dx_h, dy_h = self._widget_delta_to_host(ddx, ddy)
+                if dx_h == 0 and dy_h == 0:
+                    return
+                self._queue_input({"type": "rmove", "dx": dx_h, "dy": dy_h})
+                return
+
             frac = self._widget_xy_to_frac(self.picture, x, y)
             if frac is None:
+                self._last_motion_xy = (x, y)
                 return
-            self._last_move_flush = now
+            self._last_motion_xy = (x, y)
             fx, fy = frac
             self._queue_input({"type": "move", "fx": fx, "fy": fy})
 
+        def on_leave(_c: Gtk.EventControllerMotion) -> None:
+            self._last_motion_xy = None
+
         motion.connect("motion", on_motion)
+        motion.connect("leave", on_leave)
         self.picture.add_controller(motion)
 
         scroll_c = Gtk.EventControllerScroll()
@@ -661,8 +688,12 @@ class RemoteDesktopViewer(Gtk.Window):
         def on_scroll(
             _c: Gtk.EventControllerScroll, _dx: float, dy: float
         ) -> bool:
-            if self._mode == "control":
-                # Don't zoom while controlling — ignore or map later
+            if self._accepts_remote_input():
+                # Forward wheel to host (games zoom / menus)
+                delta = 1 if dy < 0 else (-1 if dy > 0 else 0)
+                if delta:
+                    self._queue_input({"type": "wheel", "delta": delta})
+                    self._flush_input(force=True)
                 return True
             if dy < 0:
                 self._nudge_zoom(1)
@@ -1136,7 +1167,7 @@ class RemoteDesktopViewer(Gtk.Window):
         local = bool(getattr(client, "local_cursor", False))
         if local:
             self._set_status(
-                "Keepstream Session — local cursor (Parsec-class) · input over TCP",
+                "Keepstream Session — local cursor + relative mouse · input over TCP",
                 ok=True,
             )
         else:
@@ -1207,8 +1238,8 @@ class RemoteDesktopViewer(Gtk.Window):
                         local = False
                 if local:
                     self.mode_hint.set_text(
-                        "Session (Keepstream): local cursor · "
-                        "host pointer off in capture · click/drag over TCP"
+                        "Session (Keepstream): local cursor · relative mouse · "
+                        "host pointer off · click/drag/wheel over TCP"
                     )
                 else:
                     self.mode_hint.set_text(
@@ -1279,17 +1310,50 @@ class RemoteDesktopViewer(Gtk.Window):
         fy = (y - oy) / dh
         return max(0.0, min(1.0, fx)), max(0.0, min(1.0, fy))
 
+    def _widget_delta_to_host(self, ddx: float, ddy: float) -> tuple[int, int]:
+        """Map widget-pixel delta → host primary-screen pixels (relative mouse)."""
+        if self._pixbuf is None:
+            return 0, 0
+        ww = max(1, self.picture.get_width())
+        wh = max(1, self.picture.get_height())
+        iw = max(1, self._pixbuf.get_width())
+        ih = max(1, self._pixbuf.get_height())
+        scale = min(ww / iw, wh / ih)
+        dw, dh = max(1.0, iw * scale), max(1.0, ih * scale)
+        ks = self._keepstream
+        # Prefer full host screen from HELLO; fall back to stream size
+        sw = int(getattr(ks, "screen_w", 0) or 0) if ks is not None else 0
+        sh = int(getattr(ks, "screen_h", 0) or 0) if ks is not None else 0
+        if sw <= 0:
+            sw = int(getattr(ks, "remote_w", 0) or iw) if ks is not None else iw
+        if sh <= 0:
+            sh = int(getattr(ks, "remote_h", 0) or ih) if ks is not None else ih
+        dx = int(round(ddx / dw * sw))
+        dy = int(round(ddy / dh * sh))
+        return dx, dy
+
     def _queue_input(self, event: dict[str, Any]) -> None:
         """Batch input events; flush on a short timer (lower task spam, snappier feel)."""
         if not event:
             return
+        # Gaming relative moves: send immediately (no GLib coalesce)
+        ks = self._keepstream
+        ks_up = bool(ks is not None and getattr(ks, "connected", False))
+        if (
+            ks_up
+            and str(event.get("type") or "") == "rmove"
+            and self._rel_mouse
+        ):
+            try:
+                ks.send_input([event])
+                return
+            except Exception:
+                pass
         self._input_queue.append(event)
         # Cap queue so a stuck flush can't grow forever
         if len(self._input_queue) > 40:
             self._input_queue = self._input_queue[-40:]
         if self._input_flush_src is None:
-            ks = self._keepstream
-            ks_up = bool(ks is not None and getattr(ks, "connected", False))
             # Gaming Session: flush next main-loop tick (0ms). Balanced: 4ms.
             if ks_up:
                 try:
@@ -1312,19 +1376,49 @@ class RemoteDesktopViewer(Gtk.Window):
     def _flush_input(self, *, force: bool = False) -> None:
         if not self._input_queue:
             return
-        # Coalesce consecutive moves — keep last move only, preserve click/key order
+        # Coalesce consecutive moves/rmoves — keep last only, preserve click/key order
         batch: list[dict[str, Any]] = []
         pending_move: dict[str, Any] | None = None
+        pending_rmove_dx = 0
+        pending_rmove_dy = 0
+        have_rmove = False
         for ev in self._input_queue:
-            if str(ev.get("type") or "") == "move":
+            t = str(ev.get("type") or "")
+            if t == "move":
+                if have_rmove:
+                    batch.append(
+                        {"type": "rmove", "dx": pending_rmove_dx, "dy": pending_rmove_dy}
+                    )
+                    pending_rmove_dx = pending_rmove_dy = 0
+                    have_rmove = False
                 pending_move = ev
+            elif t == "rmove":
+                if pending_move is not None:
+                    batch.append(pending_move)
+                    pending_move = None
+                try:
+                    pending_rmove_dx += int(ev.get("dx") or 0)
+                    pending_rmove_dy += int(ev.get("dy") or 0)
+                except (TypeError, ValueError):
+                    pass
+                have_rmove = True
             else:
                 if pending_move is not None:
                     batch.append(pending_move)
                     pending_move = None
+                if have_rmove:
+                    batch.append(
+                        {"type": "rmove", "dx": pending_rmove_dx, "dy": pending_rmove_dy}
+                    )
+                    pending_rmove_dx = pending_rmove_dy = 0
+                    have_rmove = False
                 batch.append(ev)
         if pending_move is not None:
             batch.append(pending_move)
+        if have_rmove:
+            batch.append(
+                {"type": "rmove", "dx": pending_rmove_dx, "dy": pending_rmove_dy}
+            )
         self._input_queue.clear()
         if not batch:
             return

@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     from keepstream.server import session_stop as _ks_session_stop
 
 
-VERSION = "0.5.46-lab"
+VERSION = "0.5.47-lab"
 # Keepstream VIDEO codec byte (matches research keepstream-v0)
 _KS_CODEC_JPEG = 1
 _KS_CODEC_H264 = 2
@@ -2139,8 +2139,9 @@ def _process_elevated() -> bool | None:
 def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
     """Inject mouse/keyboard for Remote Viewer Control mode.
 
-    Event types: move | click | dblclick | down | up | key | type
+    Event types: move | rmove | click | dblclick | down | up | key | type | wheel
     Position: fx/fy in [0,1] of primary screen, or absolute x/y pixels.
+    Relative: rmove with dx/dy host pixels (Parsec-class gaming).
 
     If a user ``input_provider`` plug-in is active, events are forwarded to it
     (operator-supplied elevated helper). Otherwise local SendInput/xdotool.
@@ -2258,12 +2259,49 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                 inp.ii.mi = MOUSEINPUT(0, 0, 0, flags, 0, None)
             user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
+        def send_mouse_rel(dx: int, dy: int) -> None:
+            """Relative move (Parsec-class) — no ABSOLUTE flag."""
+            if dx == 0 and dy == 0:
+                return
+            inp = INPUT()
+            inp.type = INPUT_MOUSE
+            inp.ii.mi = MOUSEINPUT(int(dx), int(dy), 0, MOUSEEVENTF_MOVE, 0, None)
+            user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+        def send_wheel(delta: int) -> None:
+            # WHEEL_DELTA = 120
+            MOUSEEVENTF_WHEEL = 0x0800
+            inp = INPUT()
+            inp.type = INPUT_MOUSE
+            d = int(delta) * 120
+            inp.ii.mi = MOUSEINPUT(0, 0, d & 0xFFFFFFFF, MOUSEEVENTF_WHEEL, 0, None)
+            user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
         def send_key(vk: int, up: bool = False) -> None:
             inp = INPUT()
             inp.type = INPUT_KEYBOARD
             inp.ii.ki = KEYBDINPUT(vk & 0xFF, 0, KEYEVENTF_KEYUP if up else 0, 0, None)
             user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
+        if typ in ("rmove", "rel", "relative"):
+            try:
+                dx = int(ev.get("dx") or 0)
+                dy = int(ev.get("dy") or 0)
+            except (TypeError, ValueError):
+                return
+            # Clamp single packet to avoid runaway
+            dx = max(-400, min(400, dx))
+            dy = max(-400, min(400, dy))
+            send_mouse_rel(dx, dy)
+            return
+        if typ == "wheel":
+            try:
+                delta = int(ev.get("delta") or ev.get("dy") or 0)
+            except (TypeError, ValueError):
+                delta = 0
+            if delta:
+                send_wheel(1 if delta > 0 else -1)
+            return
         if typ in ("move", "click", "dblclick", "down", "up") and xy:
             # Absolute SendInput + SetCursorPos — belt and suspenders for gdigrab
             send_mouse(0, xy[0], xy[1])
@@ -2335,6 +2373,29 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("xdotool_not_found")
         typ = str(ev.get("type") or "click").lower()
         xy = resolve_xy(ev)
+        if typ in ("rmove", "rel", "relative"):
+            try:
+                dx = int(ev.get("dx") or 0)
+                dy = int(ev.get("dy") or 0)
+            except (TypeError, ValueError):
+                return
+            dx = max(-400, min(400, dx))
+            dy = max(-400, min(400, dy))
+            if dx or dy:
+                subprocess.check_call(
+                    ["xdotool", "mousemove_relative", "--", str(dx), str(dy)],
+                    timeout=2,
+                )
+            return
+        if typ == "wheel":
+            try:
+                delta = int(ev.get("delta") or ev.get("dy") or 0)
+            except (TypeError, ValueError):
+                delta = 0
+            if delta:
+                btn = "4" if delta > 0 else "5"
+                subprocess.check_call(["xdotool", "click", btn], timeout=2)
+            return
         if typ == "move" and xy:
             # No --sync: under load it can block the Keepstream INPUT reader
             # for seconds and freeze remote cursor.

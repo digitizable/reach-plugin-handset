@@ -2476,10 +2476,12 @@ class HogwartsPage(Gtk.Box):
                     # Schedule at most one paint (~40fps cap); drop intermediates
                     if getattr(self, "_ks_paint_src", None) is not None:
                         return
-                    # Gaming: 4ms paint coalesce; balanced: 8ms
+                    # Gaming: paint next idle (0ms). Balanced: 6ms coalesce.
                     prof = str(getattr(self, "_ks_profile", "") or "").lower()
-                    paint_ms = 2 if prof in ("gaming", "gaming-lan") else 6
-                    self._ks_paint_src = GLib.timeout_add(paint_ms, _ks_paint_tick)
+                    if prof in ("gaming", "gaming-lan"):
+                        self._ks_paint_src = GLib.idle_add(_ks_paint_tick)
+                    else:
+                        self._ks_paint_src = GLib.timeout_add(6, _ks_paint_tick)
 
                 def on_status(msg: str, ok: bool | None) -> None:
                     def ui() -> bool:
