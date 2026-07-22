@@ -718,9 +718,6 @@ class RemoteDesktopViewer(Gtk.Window):
                 if frac is not None:
                     self._cursor_frac = frac
                 self._last_motion_xy = (x, y)
-                # Lightweight overlay only — do NOT re-render the full frame
-                # (full-frame cursor composite killed FPS and drew a box).
-                self._move_overlay_cursor(x, y)
 
             if (
                 not self._accepts_remote_input()
@@ -749,14 +746,12 @@ class RemoteDesktopViewer(Gtk.Window):
 
         def on_leave(_c: Gtk.EventControllerMotion) -> None:
             self._last_motion_xy = None
-            # Keep last overlay position (don't vanish mid-game)
 
         def on_enter(_c: Gtk.EventControllerMotion, x: float, y: float) -> None:
             self._last_motion_xy = (x, y)
             frac = self._widget_xy_to_frac(self.picture, x, y)
             if frac is not None:
                 self._cursor_frac = frac
-            self._move_overlay_cursor(x, y)
 
         motion.connect("motion", on_motion)
         motion.connect("leave", on_leave)
@@ -785,31 +780,16 @@ class RemoteDesktopViewer(Gtk.Window):
         scroll_c.connect("scroll", on_scroll)
         self.picture.add_controller(scroll_c)
 
-        # Parsec-class: draw our own pointer over the stream. Relying on
-        # set_cursor_from_name("default") failed on this desk (still invisible
-        # while host draw_mouse=0). Overlay is always painted in-widget.
+        # Stream surface only — use the normal OS cursor (no custom stamp/DA).
+        # Custom texture + DrawingArea produced a white/black box artifact.
         self._stream_overlay = Gtk.Overlay()
         self._stream_overlay.set_hexpand(True)
         self._stream_overlay.set_vexpand(True)
         self._stream_overlay.set_child(self.picture)
-        # Prefer a real Gdk.Cursor from a small texture (no DA box, no frame
-        # composite). DrawingArea is fallback only if texture cursor fails.
-        self._cursor_da = Gtk.DrawingArea()
-        self._cursor_da.set_content_width(18)
-        self._cursor_da.set_content_height(22)
-        self._cursor_da.set_halign(Gtk.Align.START)
-        self._cursor_da.set_valign(Gtk.Align.START)
-        self._cursor_da.set_can_target(False)
-        self._cursor_da.set_draw_func(self._on_draw_overlay_cursor, None)
-        self._cursor_da.set_visible(False)
-        self._cursor_da.add_css_class("rdv-overlay-cursor")
-        try:
-            self._cursor_da.set_opacity(1.0)
-        except Exception:
-            pass
-        self._stream_overlay.add_overlay(self._cursor_da)
-        self._texture_cursor: Any = None  # Gdk.Cursor from arrow texture
+        self._cursor_da = None
+        self._texture_cursor = None
         self._use_texture_cursor = False
+        self._overlay_cursor_on = False
 
         frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         frame.add_css_class("rdv-frame")
@@ -1264,221 +1244,60 @@ class RemoteDesktopViewer(Gtk.Window):
             return True
         return False
 
-    def _build_arrow_texture_cursor(self) -> Any | None:
-        """Build a Gdk.Cursor from a tiny RGBA arrow (hotspot at tip)."""
-        try:
-            w, h = 16, 20
-            rowstride = w * 4
-            buf = bytearray(h * rowstride)
-            poly = [
-                (1, 1),
-                (1, 17),
-                (5, 13),
-                (8, 19),
-                (10, 18),
-                (7, 12),
-                (13, 12),
-            ]
-
-            def _inside(px: int, py: int) -> bool:
-                inside = False
-                n = len(poly)
-                for i in range(n):
-                    x1, y1 = poly[i]
-                    x2, y2 = poly[(i + 1) % n]
-                    if ((y1 > py) != (y2 > py)) and (
-                        px < (x2 - x1) * (py - y1) / max(1e-9, (y2 - y1)) + x1
-                    ):
-                        inside = not inside
-                return inside
-
-            for y in range(h):
-                for x in range(w):
-                    i = y * rowstride + x * 4
-                    if _inside(x, y):
-                        buf[i : i + 4] = bytes((255, 255, 255, 255))
-                    elif any(
-                        _inside(x + ox, y + oy)
-                        for ox, oy in ((-1, 0), (1, 0), (0, -1), (0, 1))
-                    ):
-                        buf[i : i + 4] = bytes((20, 20, 20, 255))
-            gbytes = GLib.Bytes.new(bytes(buf))
-            pb = GdkPixbuf.Pixbuf.new_from_bytes(
-                gbytes, GdkPixbuf.Colorspace.RGB, True, 8, w, h, rowstride
-            )
-            tex = Gdk.Texture.new_for_pixbuf(pb)
-            # GTK4: Cursor.new_from_texture(texture, hotspot_x, hotspot_y)
-            try:
-                cur = Gdk.Cursor.new_from_texture(tex, 1, 1)
-            except TypeError:
-                cur = Gdk.Cursor.new_from_texture(tex, 1, 1, None)
-            self._cursor_stamp_bytes = gbytes
-            self._cursor_stamp_pb = pb
-            self._cursor_stamp_tex = tex
-            return cur
-        except Exception:
-            return None
-
-    def _on_draw_overlay_cursor(
-        self,
-        _da: Gtk.DrawingArea,
-        cr: Any,
-        w: int,
-        h: int,
-        _data: Any,
-    ) -> None:
-        """Fallback arrow — fully transparent DA (no opaque box)."""
-        try:
-            import cairo  # type: ignore
-
-            cr.set_operator(cairo.Operator.CLEAR)
-            cr.rectangle(0, 0, max(1, w), max(1, h))
-            cr.fill()
-            cr.set_operator(cairo.Operator.OVER)
-        except Exception:
-            try:
-                cr.set_source_rgba(0, 0, 0, 0)
-                cr.paint()
-            except Exception:
-                pass
-        cr.set_line_width(1.25)
-        cr.move_to(1, 1)
-        cr.line_to(1, 17)
-        cr.line_to(5, 13)
-        cr.line_to(8, 19)
-        cr.line_to(10, 18)
-        cr.line_to(7, 12)
-        cr.line_to(13, 12)
-        cr.close_path()
-        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0)
-        cr.fill_preserve()
-        cr.set_source_rgba(0.05, 0.05, 0.05, 1.0)
-        cr.stroke()
-
-    def _move_overlay_cursor(self, x: float, y: float) -> None:
-        """Position fallback DrawingArea pointer (texture cursor needs no move)."""
-        if not self._overlay_cursor_on or self._use_texture_cursor:
-            return
-        da = getattr(self, "_cursor_da", None)
-        if da is None:
-            return
-        try:
-            mx = max(0, int(x) - 1)
-            my = max(0, int(y) - 1)
-            if getattr(self, "_cursor_margin", None) != (mx, my):
-                self._cursor_margin = (mx, my)
-                da.set_margin_start(mx)
-                da.set_margin_top(my)
-            if not da.get_visible():
-                da.set_visible(True)
-        except Exception:
-            pass
-
     def _stream_cursor_widgets(self) -> list[Any]:
         """Only the video surface — never the window chrome (Session/ribbon)."""
         out: list[Any] = [
             self.picture,
             getattr(self, "_stream_overlay", None),
         ]
-        # Scroll child is the frame; include scroll so letterbox area still has cursor
         sc = getattr(self, "_scroll", None)
         if sc is not None:
             out.append(sc)
         return out
 
-    def _chrome_cursor_default(self) -> None:
-        """Ensure toolbar / mode / window use the normal OS pointer."""
-        # Critical: never leave set_cursor(none) on the Gtk.Window — that made
-        # Session / ribbon unreachable (cursor vanished outside the viewport).
-        for w in (self,):
+    def _set_default_pointer(self, widget: Any) -> None:
+        """Normal OS arrow — never custom stamps (those rendered as a box)."""
+        if widget is None:
+            return
+        try:
+            widget.set_cursor(None)
+        except Exception:
+            pass
+        for name in ("default", "left_ptr", "arrow", "pointer"):
             try:
-                w.set_cursor(None)  # inherit / default
+                widget.set_cursor_from_name(name)
+                return
             except Exception:
-                try:
-                    w.set_cursor_from_name("default")
-                except Exception:
-                    pass
+                continue
+        try:
+            cur = Gdk.Cursor.new_from_name("default")
+            if cur is not None:
+                widget.set_cursor(cur)
+        except Exception:
+            pass
 
     def _apply_session_cursor(self) -> None:
-        """Local pointer over the stream only; normal cursor on all UI chrome.
+        """Use the normal system pointer on stream + chrome.
 
-        Never full-frame composite (FPS killer + white/black box artifact).
-        Never hide the cursor on the whole window (blocks Session button etc.).
+        Custom texture / DrawingArea arrows looked like a white box with a
+        black fragment. Host draw_mouse is off; OS cursor is enough.
+        Never set cursor to \"none\" on the window (chrome became unusable).
         """
-        local = self._wants_local_cursor()
-        self._overlay_cursor_on = bool(local)
-        da = getattr(self, "_cursor_da", None)
-        stream = self._stream_cursor_widgets()
-
-        # Always restore default on the window itself first
-        self._chrome_cursor_default()
-
-        # Build custom arrow cursor once
-        if local and self._texture_cursor is None:
-            self._texture_cursor = self._build_arrow_texture_cursor()
-            self._use_texture_cursor = self._texture_cursor is not None
-
-        if local and self._use_texture_cursor and self._texture_cursor is not None:
-            if da is not None:
-                try:
-                    da.set_visible(False)
-                except Exception:
-                    pass
-            for w in stream:
-                if w is None:
-                    continue
-                try:
-                    w.set_cursor(self._texture_cursor)
-                except Exception:
-                    pass
-            return
-
-        # Fallback: transparent DrawingArea arrow over stream only
-        if da is not None:
-            try:
-                da.set_visible(bool(local))
-            except Exception:
-                pass
-        if local:
-            for w in stream:
-                if w is None:
-                    continue
-                try:
-                    w.set_cursor_from_name("none")
-                except Exception:
-                    pass
-            if self._last_motion_xy is not None:
-                self._move_overlay_cursor(*self._last_motion_xy)
-            else:
-                try:
-                    ww = max(40, self.picture.get_width() or 400)
-                    wh = max(40, self.picture.get_height() or 300)
-                    self._move_overlay_cursor(ww * 0.5, wh * 0.5)
-                except Exception:
-                    self._move_overlay_cursor(40, 40)
-        else:
-            if da is not None:
-                try:
-                    da.set_visible(False)
-                except Exception:
-                    pass
-            for w in stream:
-                if w is None:
-                    continue
-                try:
-                    w.set_cursor(None)
-                except Exception:
-                    pass
+        self._overlay_cursor_on = False
+        # Window chrome
+        self._set_default_pointer(self)
+        # Stream surface (and letterbox scroll area)
+        for w in self._stream_cursor_widgets():
+            self._set_default_pointer(w)
 
     def on_keepstream_up(self) -> None:
         """Called when HELLO_OK lands (local_cursor flag now reliable)."""
         self._main_stack.set_visible_child_name("view")
         self._apply_session_cursor()
-        if self._wants_local_cursor():
-            self._set_status(
-                "Keepstream up — drawn cursor overlay · relative mouse on gaming",
-                ok=True,
-            )
+        self._set_status(
+            "Keepstream up — system cursor · absolute hover for Windows UI",
+            ok=True,
+        )
 
     def attach_keepstream(self, client: Any) -> None:
         """Attach a live KeepstreamClient; frames already applied via page callbacks."""
