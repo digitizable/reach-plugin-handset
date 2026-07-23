@@ -180,6 +180,8 @@ class RemoteDesktopViewer(Gtk.Window):
         self._archive_live = False
         self._keys_held: set[str] = set()  # remote key names currently down
         self._typed_keys: set[str] = set()  # printables sent as type= (search boxes)
+        self._last_stream_side = 0  # last SIZE request to host
+        self._stream_size_src: int | None = None
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         root.add_css_class("rdv")
@@ -436,6 +438,16 @@ class RemoteDesktopViewer(Gtk.Window):
         ribbon.append(self.btn_fs)
         root.append(ribbon)
         self._ribbon = ribbon
+
+        # When the window is maximized / resized, re-request encode SIZE so the
+        # host stream matches the viewer (not soft letterbox scale of a small encode).
+        try:
+            self.connect("notify::maximized", lambda *_: self._schedule_stream_size())
+            self.connect("notify::fullscreened", lambda *_: self._schedule_stream_size())
+            self.connect("notify::default-width", lambda *_: self._schedule_stream_size())
+            self.connect("notify::default-height", lambda *_: self._schedule_stream_size())
+        except Exception:
+            pass
 
         # ── Zoom + after-capture actions (ShareX-like) ───────────────
         tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
@@ -1754,6 +1766,8 @@ class RemoteDesktopViewer(Gtk.Window):
                 ok=True,
             )
             self.mode_hint.set_text("Watching stream · Control to interact")
+        # HELLO carried screen size — align encode to viewer (esp. if already maximized)
+        self._schedule_stream_size(500)
 
     def prepare_keepstream_connect(self) -> None:
         """Call when Start stream is pressed — blank the surface before live frames."""
@@ -1807,6 +1821,92 @@ class RemoteDesktopViewer(Gtk.Window):
         self.live_badge.add_css_class("rdv-badge-live")
         self._set_status("Connecting stream — waiting for live frames…", ok=None)
 
+    def _schedule_stream_size(self, delay_ms: int = 250) -> None:
+        """Debounced: ask host to re-encode for current viewer size."""
+        try:
+            if self._stream_size_src is not None:
+                GLib.source_remove(self._stream_size_src)
+        except Exception:
+            pass
+        self._stream_size_src = None
+
+        def _fire() -> bool:
+            self._stream_size_src = None
+            self._apply_stream_size_for_view()
+            return False
+
+        try:
+            self._stream_size_src = GLib.timeout_add(max(50, int(delay_ms)), _fire)
+        except Exception:
+            self._apply_stream_size_for_view()
+
+    def _viewer_surface_size(self) -> tuple[int, int]:
+        """Allocated size of the stream surface (pixels)."""
+        try:
+            w = int(self.picture.get_width() or 0)
+            h = int(self.picture.get_height() or 0)
+        except Exception:
+            w = h = 0
+        if w < 64 or h < 64:
+            try:
+                w = max(w, int(self.get_width() or 0) - 80)
+                h = max(h, int(self.get_height() or 0) - 160)
+            except Exception:
+                pass
+        return max(320, w), max(240, h)
+
+    def _desired_stream_max_side(self) -> int:
+        """Long-side encode size: match viewer, never exceed host native."""
+        vw, vh = self._viewer_surface_size()
+        view_long = max(vw, vh)
+        ks = self._keepstream
+        host_w = int(getattr(ks, "screen_w", 0) or 0) if ks else 0
+        host_h = int(getattr(ks, "screen_h", 0) or 0) if ks else 0
+        if host_w <= 0 or host_h <= 0:
+            host_w = int(getattr(ks, "remote_w", 0) or 0) if ks else 0
+            host_h = int(getattr(ks, "remote_h", 0) or 0) if ks else 0
+        host_long = max(host_w, host_h) if (host_w and host_h) else 1920
+        # Prefer encode ≈ viewer so maximize goes 1:1 when monitors match.
+        # Slight headroom so letterboxed UI doesn't force soft upscale.
+        target = int(view_long * 1.02)
+        # Maximize / fullscreen: push toward host native
+        try:
+            if self.is_maximized() or self.is_fullscreen():
+                target = max(target, host_long)
+        except Exception:
+            pass
+        side = min(host_long, max(640, target))
+        # Snap to common tiers (less restart thrash)
+        for tier in (1280, 1440, 1600, 1920, 2560, 3840):
+            if side <= tier + 40:
+                side = min(tier, host_long)
+                break
+        return max(640, min(int(side), 3840))
+
+    def _apply_stream_size_for_view(self) -> None:
+        ks = self._keepstream
+        if ks is None or not getattr(ks, "connected", False):
+            return
+        if self._frame_source != "keepstream":
+            return
+        side = self._desired_stream_max_side()
+        if abs(side - int(self._last_stream_side or 0)) < 48:
+            return
+        self._last_stream_side = side
+        try:
+            if hasattr(ks, "request_size"):
+                ks.request_size(side)
+            elif hasattr(ks, "_send_ctrl"):
+                ks._send_ctrl(f"SIZE {side}")  # noqa: SLF001
+            else:
+                return
+            self._set_status(
+                f"Stream size → max_side={side} (viewer match)",
+                ok=True,
+            )
+        except Exception as exc:
+            self._set_status(f"SIZE request failed: {exc}", ok=False)
+
     def attach_keepstream(self, client: Any) -> None:
         """Attach Keepstream for frames only — never force Control mode."""
         self._keepstream = client
@@ -1851,6 +1951,18 @@ class RemoteDesktopViewer(Gtk.Window):
         )
         try:
             self.session_lab.set_text("Stream connected.")
+        except Exception:
+            pass
+        # Match encode size to current (or maximized) viewer surface
+        self._last_stream_side = 0
+        self._schedule_stream_size(400)
+        try:
+            self.picture.connect(
+                "notify::width", lambda *_: self._schedule_stream_size(300)
+            )
+            self.picture.connect(
+                "notify::height", lambda *_: self._schedule_stream_size(300)
+            )
         except Exception:
             pass
 
@@ -3086,9 +3198,14 @@ class RemoteDesktopViewer(Gtk.Window):
             else:
                 self.maximize()
                 self._maximized = True
-                self._set_status("Window maximized — drag edges or F10 to restore", ok=True)
+                self._set_status(
+                    "Window maximized — stream resolution follows viewer",
+                    ok=True,
+                )
         except Exception as exc:
             self._set_status(f"Maximize failed: {exc}", ok=False)
+        # Host re-encodes to match the new surface size
+        self._schedule_stream_size(350)
 
     def _toggle_fullscreen(self) -> None:
         self._fullscreen = not self._fullscreen
@@ -3102,6 +3219,7 @@ class RemoteDesktopViewer(Gtk.Window):
             self.fullscreen()
         else:
             self.unfullscreen()
+        self._schedule_stream_size(350)
 
     def _on_close(self, *_a) -> bool:
         try:
