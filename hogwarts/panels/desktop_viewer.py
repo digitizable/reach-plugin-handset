@@ -1212,6 +1212,9 @@ class RemoteDesktopViewer(Gtk.Window):
             ):
                 ch = chr(uni)
                 self._typed_keys.add(kn)
+                # ONLY type= — do NOT also key_down (that double-inserts:
+                # "test" → "tteesstt"). Games that need WASD holds still use
+                # key_down when Control+key or specials are used.
                 self._send_input(
                     [
                         {
@@ -1221,10 +1224,6 @@ class RemoteDesktopViewer(Gtk.Window):
                             "char": ch,
                         }
                     ]
-                )
-                # Also key_down so games (GetAsyncKeyState) still see holds
-                self._send_input(
-                    [{"type": "key_down", "key": kn, "char": ch, "text_ok": True}]
                 )
                 return True
             payload: dict[str, Any] = {"type": "key_down", "key": kn}
@@ -1241,10 +1240,11 @@ class RemoteDesktopViewer(Gtk.Window):
                 pass
             else:
                 self._keys_held.discard(kn)
-            # Printable was typed via unicode; still send key_up for game state
-            self._send_input([{"type": "key_up", "key": kn}])
+            # Printable used type= only — no matching key_down, skip key_up
             if kn in self._typed_keys:
                 self._typed_keys.discard(kn)
+                return True
+            self._send_input([{"type": "key_up", "key": kn}])
             return True
 
         def on_key(
@@ -2800,17 +2800,18 @@ class RemoteDesktopViewer(Gtk.Window):
         profile = self.current_session_profile()
         opts["profile"] = profile
         if profile == "lan60":
-            # Direct LAN / lab — pure UDP MJPEG, sustained ~60
-            opts["max_side"] = 1440
+            # Direct LAN — native-ish encode + high JPEG q (taskbar icons need it)
+            opts["max_side"] = 1920
             opts["fps"] = 60
-            opts["quality"] = 80
+            opts["quality"] = 92
             opts["codec"] = "jpeg"
             opts["transport"] = "udp"
+            opts["chroma"] = "444"
         else:
             # Path / SOCKS / C2 — TCP video (UDP cannot traverse path SOCKS)
             opts["max_side"] = 1280
             opts["fps"] = 45
-            opts["quality"] = 72
+            opts["quality"] = 78
             opts["codec"] = "jpeg"
             opts["transport"] = "tcp"
         opts["local_cursor"] = True

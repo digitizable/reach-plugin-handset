@@ -2377,7 +2377,7 @@ class HogwartsPage(Gtk.Box):
                 # Profile-aware defaults when viewer omitted knobs
                 # lan60: monitor-class crisp (q90); path: leaner
                 if profile == "lan60":
-                    def_fps, def_q, def_tr = 60.0, 90, "udp"
+                    def_fps, def_q, def_tr = 60.0, 92, "udp"
                 else:
                     def_fps, def_q, def_tr = 45.0, 78, "tcp"
                 try:

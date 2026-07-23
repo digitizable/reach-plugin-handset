@@ -2864,26 +2864,21 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
             text_ok = bool(ev.get("text_ok"))
             code = resolve_vk(key_s)
             up = typ in ("key_up", "keyup")
-            # Printable with no prior type=: inject unicode first (search boxes)
-            if (
-                not text_ok
-                and not up
-                and ch
-                and len(ch) >= 1
-                and ord(ch[0]) >= 32
-                and ch[0].isprintable()
-            ):
-                send_unicode(ch[0], up=False)
-                send_unicode(ch[0], up=True)
-            elif (
-                not text_ok
-                and not up
-                and len(key_s) == 1
-                and ord(key_s) >= 32
-                and key_s.isprintable()
-            ):
-                send_unicode(key_s, up=False)
-                send_unicode(key_s, up=True)
+            # type= already inserted the char — skip key_down/up entirely
+            if text_ok:
+                return
+            glyph = ""
+            if ch and len(ch) >= 1 and ord(ch[0]) >= 32 and ch[0].isprintable():
+                glyph = ch[0]
+            elif len(key_s) == 1 and ord(key_s) >= 32 and key_s.isprintable():
+                glyph = key_s
+            # Printable: unicode ONLY (do not also send_key → "tteesstt")
+            if glyph and not up:
+                send_unicode(glyph, up=False)
+                send_unicode(glyph, up=True)
+                return
+            if glyph and up:
+                return
             if code:
                 send_key(code, up=up)
             return
