@@ -1866,15 +1866,21 @@ class RemoteDesktopViewer(Gtk.Window):
             host_w = int(getattr(ks, "remote_w", 0) or 0) if ks else 0
             host_h = int(getattr(ks, "remote_h", 0) or 0) if ks else 0
         host_long = max(host_w, host_h) if (host_w and host_h) else 1920
-        # Prefer encode ≈ viewer so maximize goes 1:1 when monitors match.
+        # Prefer encode ≈ viewer so maximize/focus goes 1:1 when monitors match.
         # Slight headroom so letterboxed UI doesn't force soft upscale.
         target = int(view_long * 1.02)
-        # Maximize / fullscreen: push toward host native
+        # Maximize / fullscreen / focus: push toward host native (chrome gone
+        # or full window — stream surface is effectively the whole desk area).
         try:
-            if self.is_maximized() or self.is_fullscreen():
+            if (
+                self.is_maximized()
+                or self.is_fullscreen()
+                or bool(getattr(self, "_focus_mode", False))
+            ):
                 target = max(target, host_long)
         except Exception:
-            pass
+            if bool(getattr(self, "_focus_mode", False)):
+                target = max(target, host_long)
         side = min(host_long, max(640, target))
         # Snap to common tiers (less restart thrash)
         for tier in (1280, 1440, 1600, 1920, 2560, 3840):
@@ -3115,7 +3121,8 @@ class RemoteDesktopViewer(Gtk.Window):
 
         Hides title, modes, ribbon, tools, archive, status. Leaves a thin top
         bar with **Show UI** to restore everything. Window stays maximized if
-        the user already maximized it.
+        the user already maximized it. Re-requests host SIZE so encode matches
+        the expanded stream surface (same as maximize).
         """
         on = bool(on)
         if bool(getattr(self, "_focus_mode", False)) == on:
@@ -3125,6 +3132,8 @@ class RemoteDesktopViewer(Gtk.Window):
                     self._main_stack.set_visible_child_name("view")
                 except Exception:
                     pass
+                # Layout may have settled after chrome hide — re-SIZE once
+                self._schedule_stream_size(400)
             return
         self._focus_mode = on
         # Chrome to hide (everything except stream + focus bar)
@@ -3162,8 +3171,8 @@ class RemoteDesktopViewer(Gtk.Window):
             except Exception:
                 pass
             self._set_status(
-                "Focus mode — stream only · Show UI or Ctrl+F9 "
-                "(typing stays on remote)",
+                "Focus mode — stream only · resolution follows view · "
+                "Show UI or Ctrl+F9 (typing stays on remote)",
                 ok=True,
             )
             # Focus the stream so keyboard goes to host, not archive widgets
@@ -3180,7 +3189,16 @@ class RemoteDesktopViewer(Gtk.Window):
                 self.remove_css_class("rdv-focus")
             except Exception:
                 pass
-            self._set_status("UI restored", ok=None)
+            self._set_status("UI restored — stream size may reduce", ok=None)
+        # After chrome show/hide, surface size changes — re-encode on host.
+        # Longer delay so GTK allocates the full focus surface first.
+        self._last_stream_side = 0  # force SIZE even if tier unchanged earlier
+        self._schedule_stream_size(450)
+        # Second pass after layout fully settles (archive pane gone, etc.)
+        try:
+            GLib.timeout_add(900, lambda: (self._schedule_stream_size(50), False)[1])
+        except Exception:
+            pass
 
     def _toggle_maximize(self) -> None:
         """Maximize / unmaximize via GTK (WM title-bar maximize also works)."""
