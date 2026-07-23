@@ -99,6 +99,14 @@ _KEEPSTREAM: dict[str, Any] = {
     "frame_id": 0,
 }
 
+# Keepstream Ultra process-boundary host (optional; proprietary ultra-host binary)
+# Research: notes/keepstream-ultra/research/agent-spawn.txt
+_ULTRA_HOST: dict[str, Any] = {
+    "proc": None,  # subprocess.Popen | None
+    "psk_path": None,  # temp file path for --psk-file
+    "mode": None,  # "process" while running
+}
+
 # Local path index (WizFile-class MVP: background walk; MFT/Everything later on Windows)
 # entries: list of dicts {path, name, name_l, type, size, mtime}
 _FS_INDEX: dict[str, Any] = {
@@ -1521,16 +1529,332 @@ def _desktop_stop() -> dict[str, Any]:
 
 
 
+def _ultra_host_default_cmd() -> list[str]:
+    """Locate proprietary ultra-host stub next to workspace or HOGWARTS_ULTRA_HOST."""
+    env = (os.environ.get("HOGWARTS_ULTRA_HOST") or "").strip()
+    if env:
+        return env.split() if " " in env else [env]
+    # programs/keepstream-ultra/cmd/ultra_host.py relative to hogwarts repo
+    root = Path(__file__).resolve().parents[1]  # …/hogwarts
+    candidates = [
+        root.parent / "keepstream-ultra" / "cmd" / "ultra_host.py",
+        root / ".." / "keepstream-ultra" / "cmd" / "ultra_host.py",
+    ]
+    for c in candidates:
+        try:
+            p = c.resolve()
+            if p.is_file():
+                return [sys.executable, str(p), "serve"]
+        except OSError:
+            continue
+    return []
+
+
+def _resolve_ultra_host_spec(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """session_start / agent.json ultra_host block. mode=process → spawn binary."""
+    raw = payload.get("ultra_host") if isinstance(payload, dict) else None
+    if raw is None:
+        cfg = _RUNTIME.get("cfg") or _RUNTIME.get("config") or {}
+        if isinstance(cfg, dict):
+            raw = cfg.get("ultra_host")
+    if not isinstance(raw, dict):
+        return None
+    mode = str(raw.get("mode") or "").strip().lower()
+    if mode not in ("process", "proc", "external"):
+        return None
+    out = dict(raw)
+    out["mode"] = "process"
+    return out
+
+
+def _ultra_host_stop() -> None:
+    """Tear down spawned ultra-host process and temp PSK file."""
+    proc = _ULTRA_HOST.get("proc")
+    _ULTRA_HOST["proc"] = None
+    _ULTRA_HOST["mode"] = None
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    psk_path = _ULTRA_HOST.get("psk_path")
+    _ULTRA_HOST["psk_path"] = None
+    if psk_path:
+        try:
+            Path(str(psk_path)).unlink(missing_ok=True)  # type: ignore[call-arg]
+        except TypeError:
+            try:
+                p = Path(str(psk_path))
+                if p.is_file():
+                    p.unlink()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+def _ultra_host_start(payload: dict[str, Any], *, agent_id: str) -> dict[str, Any]:
+    """Spawn proprietary ultra-host; parse READY line. No in-process keepstream."""
+    import re
+    import secrets
+    import tempfile
+
+    _ultra_host_stop()
+    # Also stop in-process media if any
+    try:
+        _ks_session_stop({})
+    except Exception:
+        pass
+
+    spec = _resolve_ultra_host_spec(payload) or {}
+    cmd = spec.get("command") or spec.get("cmd")
+    if isinstance(cmd, str) and cmd.strip():
+        argv = cmd.strip().split()
+    elif isinstance(cmd, list) and cmd:
+        argv = [str(x) for x in cmd]
+    else:
+        argv = _ultra_host_default_cmd()
+    if not argv:
+        return {
+            "started": False,
+            "error": "ultra_host_missing",
+            "note": "ultra_host mode=process but no binary "
+            "(set HOGWARTS_ULTRA_HOST or install keepstream-ultra).",
+        }
+
+    session_id = "ks_" + secrets.token_hex(8)
+    psk = secrets.token_urlsafe(24)
+    profile = str(
+        spec.get("profile") or payload.get("profile") or "lan60"
+    ).strip().lower()
+    if profile in ("lan", "lan60", "gaming", "ultra"):
+        profile = "lan60"
+    else:
+        profile = "path" if profile in ("path", "default", "") else profile
+    transport = str(
+        spec.get("transport") or payload.get("transport") or "udp"
+    ).strip().lower()
+    if transport not in ("udp", "tcp"):
+        transport = "udp" if profile == "lan60" else "tcp"
+    try:
+        max_side = int(spec.get("max_side") or payload.get("max_side") or 1440)
+    except (TypeError, ValueError):
+        max_side = 1440
+    try:
+        fps = float(spec.get("fps") or payload.get("fps") or 60)
+    except (TypeError, ValueError):
+        fps = 60.0
+    try:
+        quality = int(spec.get("quality") or payload.get("quality") or 80)
+    except (TypeError, ValueError):
+        quality = 80
+    bind = str(spec.get("bind") or payload.get("bind") or "0.0.0.0").strip()
+    face = str(payload.get("face") or "reverse").strip().lower()
+    if face in ("loopback", "path"):
+        bind = "127.0.0.1"
+
+    # PSK via temp file (not argv)
+    try:
+        fd, psk_path = tempfile.mkstemp(prefix="ks-ultra-", suffix=".psk")
+        os.close(fd)
+        Path(psk_path).write_text(psk, encoding="utf-8")
+        try:
+            os.chmod(psk_path, 0o600)
+        except OSError:
+            pass
+    except Exception as exc:
+        return {"started": False, "error": "ultra_host_psk_file", "note": str(exc)}
+
+    _ULTRA_HOST["psk_path"] = psk_path
+    full_cmd = list(argv)
+    # Ensure subcommand serve present
+    if "serve" not in full_cmd:
+        full_cmd.append("serve")
+    full_cmd.extend(
+        [
+            "--bind",
+            bind,
+            "--session",
+            session_id,
+            "--psk-file",
+            psk_path,
+            "--profile",
+            profile if profile in ("lan60", "path") else "lan60",
+            "--transport",
+            transport,
+            "--max-side",
+            str(max_side),
+            "--fps",
+            str(fps),
+            "--quality",
+            str(quality),
+            "--hold",
+        ]
+    )
+
+    try:
+        proc = subprocess.Popen(
+            full_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except Exception as exc:
+        _ultra_host_stop()
+        return {
+            "started": False,
+            "error": "ultra_host_spawn_failed",
+            "note": str(exc),
+            "command": full_cmd[:2],
+        }
+
+    _ULTRA_HOST["proc"] = proc
+    _ULTRA_HOST["mode"] = "process"
+
+    # Read READY (stub exits without --hold; we pass --hold)
+    ready_line = ""
+    deadline = time.time() + 8.0
+    try:
+        while time.time() < deadline:
+            if proc.stdout is None:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+                continue
+            if line.startswith("READY"):
+                ready_line = line.strip()
+                break
+    except Exception as exc:
+        _ultra_host_stop()
+        return {"started": False, "error": "ultra_host_ready_read", "note": str(exc)}
+
+    if not ready_line:
+        err = ""
+        try:
+            if proc.stderr:
+                err = (proc.stderr.read() or "")[:400]
+        except Exception:
+            pass
+        _ultra_host_stop()
+        return {
+            "started": False,
+            "error": "ultra_host_timeout",
+            "note": err or "no READY line",
+        }
+
+    # READY port=N udp=M capture=… codec=… profile=… transport=…
+    bits = {
+        m.group(1): m.group(2)
+        for m in re.finditer(r"(\w+)=([^\s]+)", ready_line)
+    }
+    try:
+        port = int(bits.get("port") or 0)
+    except ValueError:
+        port = 0
+    try:
+        udp_port = int(bits.get("udp") or bits.get("udp_port") or 0)
+    except ValueError:
+        udp_port = 0
+    if port <= 0:
+        _ultra_host_stop()
+        return {
+            "started": False,
+            "error": "ultra_host_bad_ready",
+            "note": ready_line,
+        }
+
+    connect_host = "127.0.0.1" if bind in ("127.0.0.1", "::1") else ""
+    if not connect_host:
+        try:
+            connect_host = socket.gethostbyname(socket.gethostname())
+        except Exception:
+            connect_host = "0.0.0.0"
+
+    capture = bits.get("capture") or "ultra-host"
+    codec = bits.get("codec") or "jpeg"
+    note = (
+        f"Keepstream Ultra process host capture={capture} codec={codec} "
+        f"transport={bits.get('transport') or transport}"
+        + (f" udp={udp_port}" if udp_port else "")
+        + f" profile={bits.get('profile') or profile} · READY ok"
+    )
+    if "stub" in capture or capture == "stub-not-implemented":
+        note += " · STUB (no media yet — plumbing only)"
+
+    return {
+        "started": True,
+        "mode": "keepstream",
+        "ultra_host": "process",
+        "face": face,
+        "session_id": session_id,
+        "psk": psk,
+        "bind": bind,
+        "port": port,
+        "host": connect_host,
+        "connect_host": connect_host,
+        "codec": codec,
+        "profile": bits.get("profile") or profile,
+        "max_side": max_side,
+        "fps": fps,
+        "quality": quality,
+        "capture": capture,
+        "agent_version": VERSION,
+        "keepstream_version": "ultra-host-stub",
+        "transport": bits.get("transport") or transport,
+        "udp_port": udp_port,
+        "local_cursor": True,
+        "draw_mouse": False,
+        "note": note,
+        "prewarm": False,
+        "agent_id": agent_id,
+    }
+
+
 def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
-    """Keepstream Session — implemented in keepstream.server (third_party)."""
-    # input_provider is Hogwarts-agent specific
-    ip_spec = _resolve_input_provider_spec(payload)
-    if ip_spec is not None:
-        ip_spec = dict(ip_spec)
-        sid = None  # filled after start? need session before provider
+    """Keepstream / Keepstream Ultra Session.
+
+    Default: in-process keepstream.server (third_party, GPL ancestry).
+    Optional: payload/agent.json ultra_host.mode=process → proprietary ultra-host.
+    """
     elev = _process_elevated()
     agent_id = str(payload.get("agent_id") or _RUNTIME.get("agent_id") or "")
 
+    # Keepstream Ultra process boundary (research agent-spawn)
+    if _resolve_ultra_host_spec(payload or {}):
+        res = _ultra_host_start(payload or {}, agent_id=agent_id)
+        if not res.get("started"):
+            return res
+        sid = str(res.get("session_id") or "")
+        psk = str(res.get("psk") or "")
+        ip_spec = _resolve_input_provider_spec(payload)
+        if ip_spec is not None:
+            ip_spec = dict(ip_spec)
+            ip_spec["session_id"] = sid
+            ip_spec["psk"] = psk
+        ip_status = _input_provider_start(ip_spec, session_id=sid, psk=psk)
+        res["input_provider"] = ip_status
+        res["agent_version"] = VERSION
+        if elev is not None:
+            res["elevated"] = elev
+        note = str(res.get("note") or "")
+        if ip_status.get("active"):
+            kind = str(ip_status.get("kind") or "provider")
+            note += f" input_provider active ({kind})."
+            res["note"] = note
+        return res
+
+    # input_provider is Hogwarts-agent specific
     def _shot(side: int, quality: int) -> dict[str, Any]:
         try:
             return _capture_screenshot(
@@ -1588,7 +1912,16 @@ def _session_start(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _session_stop(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     _input_provider_stop()
-    return _ks_session_stop(payload)
+    uh_mode = _ULTRA_HOST.get("mode")
+    _ultra_host_stop()
+    ks = _ks_session_stop(payload)
+    if uh_mode == "process":
+        return {
+            "stopped": True,
+            "ultra_host": "process",
+            "keepstream": ks,
+        }
+    return ks
 
 
 def _screen_size() -> tuple[int, int]:
