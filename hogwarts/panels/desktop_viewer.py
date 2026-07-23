@@ -1208,39 +1208,19 @@ class RemoteDesktopViewer(Gtk.Window):
                     or 0
                 )
             )
-            # Printable → type (KEYEVENTF_UNICODE on host). Search boxes / WinUI
-            # ignore scancode-only inject; unicode is the reliable path.
+            # Always key_down holds (WASD / Roblox Studio / games need held
+            # keys). Host inject uses VK holds — not unicode taps — so text
+            # fields get one char via TranslateMessage and games see holds.
             try:
                 uni = int(Gdk.keyval_to_unicode(keyval) or 0)
             except Exception:
                 uni = 0
-            if (
-                not _is_special_remote_key(kn)
-                and not ctrl
-                and not alt
-                and not super_m
-                and 32 <= uni < 0x10000
-                and chr(uni).isprintable()
-            ):
-                ch = chr(uni)
-                self._typed_keys.add(kn)
-                # ONLY type= — do NOT also key_down (that double-inserts:
-                # "test" → "tteesstt"). Games that need WASD holds still use
-                # key_down when Control+key or specials are used.
-                self._send_input(
-                    [
-                        {
-                            "type": "type",
-                            "text": ch,
-                            "key": kn,
-                            "char": ch,
-                        }
-                    ]
-                )
-                return True
             payload: dict[str, Any] = {"type": "key_down", "key": kn}
             if 32 <= uni < 0x10000 and chr(uni).isprintable():
                 payload["char"] = chr(uni)
+            # Mark letters/digits as game-capable holds (host: VK only, no type)
+            if len(kn) == 1 and kn.isalnum():
+                payload["hold"] = True
             self._send_input([payload])
             return True
 
@@ -1252,11 +1232,10 @@ class RemoteDesktopViewer(Gtk.Window):
                 pass
             else:
                 self._keys_held.discard(kn)
-            # Printable used type= only — no matching key_down, skip key_up
-            if kn in self._typed_keys:
-                self._typed_keys.discard(kn)
-                return True
-            self._send_input([{"type": "key_up", "key": kn}])
+            payload: dict[str, Any] = {"type": "key_up", "key": kn}
+            if len(kn) == 1 and kn.isalnum():
+                payload["hold"] = True
+            self._send_input([payload])
             return True
 
         def on_key(

@@ -2858,27 +2858,10 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                     send_key(0x10, up=True)
             return
         if typ in ("key_down", "keydown", "key_up", "keyup"):
-            # Game holds (WASD): down on press, up on release — no auto-tap
+            # Game holds (WASD): down on press, up on release — never unicode taps
             key_s = str(ev.get("key") or "")
-            ch = str(ev.get("char") or "")
-            text_ok = bool(ev.get("text_ok"))
             code = resolve_vk(key_s)
             up = typ in ("key_up", "keyup")
-            # type= already inserted the char — skip key_down/up entirely
-            if text_ok:
-                return
-            glyph = ""
-            if ch and len(ch) >= 1 and ord(ch[0]) >= 32 and ch[0].isprintable():
-                glyph = ch[0]
-            elif len(key_s) == 1 and ord(key_s) >= 32 and key_s.isprintable():
-                glyph = key_s
-            # Printable: unicode ONLY (do not also send_key → "tteesstt")
-            if glyph and not up:
-                send_unicode(glyph, up=False)
-                send_unicode(glyph, up=True)
-                return
-            if glyph and up:
-                return
             if code:
                 send_key(code, up=up)
             return
