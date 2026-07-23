@@ -772,6 +772,36 @@ class RemoteDesktopViewer(Gtk.Window):
         mclick.connect("released", on_middle_released)
         self.picture.add_controller(mclick)
 
+        # Side buttons — browser/mouse "back" (X1) and "forward" (X2).
+        # GDK: button 8 = back, button 9 = forward on most Linux mice.
+        for gd_btn, name in ((8, "back"), (9, "forward")):
+            sclick = Gtk.GestureClick()
+            sclick.set_button(gd_btn)
+
+            def _side_pressed(
+                _g: Gtk.GestureClick,
+                _n: int,
+                x: float,
+                y: float,
+                b: str = name,
+            ) -> None:
+                if self._accepts_remote_input():
+                    _remote_button_down(b, x, y)
+
+            def _side_released(
+                _g: Gtk.GestureClick,
+                _n: int,
+                x: float,
+                y: float,
+                b: str = name,
+            ) -> None:
+                if self._accepts_remote_input() or b in self._buttons_held:
+                    _remote_button_up(b, x, y)
+
+            sclick.connect("pressed", _side_pressed)
+            sclick.connect("released", _side_released)
+            self.picture.add_controller(sclick)
+
         # Hover: absolute. RMB/MMB hold: relative rmove (Studio camera, no trails).
         motion = Gtk.EventControllerMotion()
 

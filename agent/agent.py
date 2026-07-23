@@ -2592,11 +2592,22 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
         MOUSEEVENTF_RIGHTUP = 0x0010
         MOUSEEVENTF_MIDDLEDOWN = 0x0020
         MOUSEEVENTF_MIDDLEUP = 0x0040
+        MOUSEEVENTF_XDOWN = 0x0080
+        MOUSEEVENTF_XUP = 0x0100
+        XBUTTON1 = 0x0001  # typically browser Back
+        XBUTTON2 = 0x0002  # typically browser Forward
         KEYEVENTF_KEYUP = 0x0002
 
-        def send_mouse(flags: int, x: int | None = None, y: int | None = None) -> None:
+        def send_mouse(
+            flags: int,
+            x: int | None = None,
+            y: int | None = None,
+            *,
+            data: int = 0,
+        ) -> None:
             inp = INPUT()
             inp.type = INPUT_MOUSE
+            md = int(data) & 0xFFFFFFFF
             if x is not None and y is not None:
                 # Absolute coords: 0..65535 mapped to primary virtual screen
                 sx = max(1, sw - 1)
@@ -2604,10 +2615,10 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                 ax = int(max(0, min(sx, x)) * 65535 / sx)
                 ay = int(max(0, min(sy, y)) * 65535 / sy)
                 inp.ii.mi = MOUSEINPUT(
-                    ax, ay, 0, flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0, None
+                    ax, ay, md, flags | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0, None
                 )
             else:
-                inp.ii.mi = MOUSEINPUT(0, 0, 0, flags, 0, None)
+                inp.ii.mi = MOUSEINPUT(0, 0, md, flags, 0, None)
             user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
         def send_mouse_rel(dx: int, dy: int) -> None:
@@ -2820,23 +2831,30 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
         if typ in ("click", "dblclick", "down", "up"):
             place_cursor()
             btn = str(ev.get("button") or "left").lower()
+            xdata = 0
             if btn == "right":
                 down_flag, up_flag = MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP
             elif btn == "middle":
                 down_flag, up_flag = MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP
+            elif btn in ("back", "x1", "button8", "btn_back"):
+                down_flag, up_flag = MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP
+                xdata = XBUTTON1
+            elif btn in ("forward", "x2", "button9", "btn_forward"):
+                down_flag, up_flag = MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP
+                xdata = XBUTTON2
             else:
                 down_flag, up_flag = MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP
             if typ == "down":
-                send_mouse(down_flag)
+                send_mouse(down_flag, data=xdata)
             elif typ == "up":
-                send_mouse(up_flag)
+                send_mouse(up_flag, data=xdata)
             elif typ == "dblclick":
                 for _ in range(2):
-                    send_mouse(down_flag)
-                    send_mouse(up_flag)
+                    send_mouse(down_flag, data=xdata)
+                    send_mouse(up_flag, data=xdata)
             else:
-                send_mouse(down_flag)
-                send_mouse(up_flag)
+                send_mouse(down_flag, data=xdata)
+                send_mouse(up_flag, data=xdata)
             return
         if typ == "type":
             text = str(ev.get("text") or "")
@@ -2940,7 +2958,17 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
             return
         if typ in ("click", "dblclick", "down", "up"):
             btn = str(ev.get("button") or "left").lower()
-            bmap = {"left": "1", "middle": "2", "right": "3"}
+            bmap = {
+                "left": "1",
+                "middle": "2",
+                "right": "3",
+                "back": "8",
+                "x1": "8",
+                "button8": "8",
+                "forward": "9",
+                "x2": "9",
+                "button9": "9",
+            }
             b = bmap.get(btn, "1")
             if xy:
                 subprocess.check_call(
