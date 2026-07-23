@@ -179,6 +179,7 @@ class RemoteDesktopViewer(Gtk.Window):
         # OFF by default — never write Capture/Stream frames to disk unless user opts in
         self._archive_live = False
         self._keys_held: set[str] = set()  # remote key names currently down
+        self._typed_keys: set[str] = set()  # printables sent as type= (search boxes)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         root.add_css_class("rdv")
@@ -1150,15 +1151,86 @@ class RemoteDesktopViewer(Gtk.Window):
             except Exception:
                 pass
 
-        def _remote_key_down(keyval: int) -> bool:
-            """key_down once per physical hold — critical for WASD / Roblox."""
+        def _is_special_remote_key(kn: str) -> bool:
+            if kn in (
+                "return",
+                "escape",
+                "backspace",
+                "tab",
+                "space",
+                "shift",
+                "ctrl",
+                "alt",
+                "super",
+                "up",
+                "down",
+                "left",
+                "right",
+                "home",
+                "end",
+                "page_up",
+                "page_down",
+                "insert",
+                "delete",
+            ):
+                return True
+            if kn.startswith("f") and kn[1:].isdigit():
+                return True
+            return False
+
+        def _remote_key_down(keyval: int, state: Gdk.ModifierType) -> bool:
+            """key_down holds for specials/games; unicode type for search boxes."""
             kn = _keyval_to_remote_name(keyval)
             if not kn:
                 return True  # consume unknown so it doesn't hit local UI
             if kn in self._keys_held:
                 return True  # auto-repeat — do not re-fire down
             self._keys_held.add(kn)
-            self._send_input([{"type": "key_down", "key": kn}])
+            ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+            alt = bool(state & Gdk.ModifierType.ALT_MASK)
+            super_m = bool(
+                state
+                & (
+                    getattr(Gdk.ModifierType, "SUPER_MASK", 0)
+                    or getattr(Gdk.ModifierType, "META_MASK", 0)
+                    or 0
+                )
+            )
+            # Printable → type (KEYEVENTF_UNICODE on host). Search boxes / WinUI
+            # ignore scancode-only inject; unicode is the reliable path.
+            try:
+                uni = int(Gdk.keyval_to_unicode(keyval) or 0)
+            except Exception:
+                uni = 0
+            if (
+                not _is_special_remote_key(kn)
+                and not ctrl
+                and not alt
+                and not super_m
+                and 32 <= uni < 0x10000
+                and chr(uni).isprintable()
+            ):
+                ch = chr(uni)
+                self._typed_keys.add(kn)
+                self._send_input(
+                    [
+                        {
+                            "type": "type",
+                            "text": ch,
+                            "key": kn,
+                            "char": ch,
+                        }
+                    ]
+                )
+                # Also key_down so games (GetAsyncKeyState) still see holds
+                self._send_input(
+                    [{"type": "key_down", "key": kn, "char": ch, "text_ok": True}]
+                )
+                return True
+            payload: dict[str, Any] = {"type": "key_down", "key": kn}
+            if 32 <= uni < 0x10000 and chr(uni).isprintable():
+                payload["char"] = chr(uni)
+            self._send_input([payload])
             return True
 
         def _remote_key_up(keyval: int) -> bool:
@@ -1166,11 +1238,13 @@ class RemoteDesktopViewer(Gtk.Window):
             if not kn:
                 return True
             if kn not in self._keys_held:
-                # Still send up (host may have state from earlier session)
                 pass
             else:
                 self._keys_held.discard(kn)
+            # Printable was typed via unicode; still send key_up for game state
             self._send_input([{"type": "key_up", "key": kn}])
+            if kn in self._typed_keys:
+                self._typed_keys.discard(kn)
             return True
 
         def on_key(
@@ -1219,7 +1293,7 @@ class RemoteDesktopViewer(Gtk.Window):
 
             # Control: real key_down (games: WASD hold, Roblox, Studio)
             if remote:
-                return _remote_key_down(keyval)
+                return _remote_key_down(keyval, state)
 
             # Local-only shortcuts (Watch mode)
             if keyval == Gdk.KEY_Escape:

@@ -1643,18 +1643,28 @@ def _ultra_host_start(payload: dict[str, Any], *, agent_id: str) -> dict[str, An
     ).strip().lower()
     if transport not in ("udp", "tcp"):
         transport = "udp" if profile == "lan60" else "tcp"
+    # Defaults match ultra-host lan60 crisp path (444 / near-native / high-q)
+    _def_side = 1920 if profile == "lan60" else 1280
+    _def_fps = 60.0 if profile == "lan60" else 45.0
+    _def_q = 90 if profile == "lan60" else 78
+    _def_chroma = "444" if profile == "lan60" else "422"
     try:
-        max_side = int(spec.get("max_side") or payload.get("max_side") or 1440)
+        max_side = int(spec.get("max_side") or payload.get("max_side") or _def_side)
     except (TypeError, ValueError):
-        max_side = 1440
+        max_side = _def_side
     try:
-        fps = float(spec.get("fps") or payload.get("fps") or 60)
+        fps = float(spec.get("fps") or payload.get("fps") or _def_fps)
     except (TypeError, ValueError):
-        fps = 60.0
+        fps = _def_fps
     try:
-        quality = int(spec.get("quality") or payload.get("quality") or 80)
+        quality = int(spec.get("quality") or payload.get("quality") or _def_q)
     except (TypeError, ValueError):
-        quality = 80
+        quality = _def_q
+    chroma = str(
+        spec.get("chroma") or payload.get("chroma") or _def_chroma
+    ).strip().lower()
+    if chroma not in ("444", "422", "420"):
+        chroma = _def_chroma
     bind = str(spec.get("bind") or payload.get("bind") or "0.0.0.0").strip()
     face = str(payload.get("face") or "reverse").strip().lower()
     if face in ("loopback", "path"):
@@ -1695,6 +1705,8 @@ def _ultra_host_start(payload: dict[str, Any], *, agent_id: str) -> dict[str, An
             str(fps),
             "--quality",
             str(quality),
+            "--chroma",
+            chroma,
             "--hold",
         ]
     )
@@ -2642,15 +2654,10 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
         )
 
         def send_key(vk: int, up: bool = False) -> None:
-            """Inject via scan code (games-friendly) + VK fallback.
-
-            Roblox / Unity / many engines read scancodes; pure VK taps fail for
-            held WASD. We send KEYEVENTF_SCANCODE with MapVirtualKey scan.
-            """
+            """VK + scan (wVk set). Scancode-only fails in search boxes / WinUI."""
             vk = int(vk) & 0xFF
             if vk == 0:
                 return
-            # MAPVK_VK_TO_VSC = 0
             try:
                 scan = int(user32.MapVirtualKeyW(vk, 0)) & 0xFF
             except Exception:
@@ -2662,13 +2669,36 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                 flags |= KEYEVENTF_EXTENDEDKEY
             inp = INPUT()
             inp.type = INPUT_KEYBOARD
-            if scan:
-                flags |= KEYEVENTF_SCANCODE
-                # wVk=0 when using scan codes (MS docs); some UIs still want VK
-                inp.ii.ki = KEYBDINPUT(0, scan, flags, 0, None)
-            else:
-                inp.ii.ki = KEYBDINPUT(vk, 0, flags & ~KEYEVENTF_SCANCODE, 0, None)
-            user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+            inp.ii.ki = KEYBDINPUT(vk, scan, flags, 0, None)
+            arr = (INPUT * 1)(inp)
+            n = int(user32.SendInput(1, arr, ctypes.sizeof(INPUT)))
+            if n != 1:
+                try:
+                    user32.keybd_event(vk, scan, flags, 0)
+                except Exception:
+                    pass
+
+        def send_unicode(ch: str, up: bool = False) -> None:
+            """KEYEVENTF_UNICODE — search boxes / WinUI text fields."""
+            if not ch:
+                return
+            code = ord(ch)
+            if code > 0xFFFF:
+                return
+            KEYEVENTF_UNICODE = 0x0004
+            flags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if up else 0)
+            inp = INPUT()
+            inp.type = INPUT_KEYBOARD
+            inp.ii.ki = KEYBDINPUT(0, code, flags, 0, None)
+            arr = (INPUT * 1)(inp)
+            n = int(user32.SendInput(1, arr, ctypes.sizeof(INPUT)))
+            if n != 1 and not up and code < 128:
+                try:
+                    hwnd = user32.GetForegroundWindow()
+                    if hwnd:
+                        user32.PostMessageW(hwnd, 0x0102, code, 0)  # WM_CHAR
+                except Exception:
+                    pass
 
         def resolve_vk(key: str) -> int | None:
             key = str(key or "").lower().replace("-", "_")
@@ -2810,7 +2840,11 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
             return
         if typ == "type":
             text = str(ev.get("text") or "")
-            for ch in text[:200]:
+            for ch in text[:400]:
+                if ord(ch) >= 32:
+                    send_unicode(ch, up=False)
+                    send_unicode(ch, up=True)
+                    continue
                 vk = user32.VkKeyScanW(ord(ch))
                 if vk == -1:
                     continue
@@ -2825,9 +2859,33 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
             return
         if typ in ("key_down", "keydown", "key_up", "keyup"):
             # Game holds (WASD): down on press, up on release — no auto-tap
-            code = resolve_vk(str(ev.get("key") or ""))
+            key_s = str(ev.get("key") or "")
+            ch = str(ev.get("char") or "")
+            text_ok = bool(ev.get("text_ok"))
+            code = resolve_vk(key_s)
+            up = typ in ("key_up", "keyup")
+            # Printable with no prior type=: inject unicode first (search boxes)
+            if (
+                not text_ok
+                and not up
+                and ch
+                and len(ch) >= 1
+                and ord(ch[0]) >= 32
+                and ch[0].isprintable()
+            ):
+                send_unicode(ch[0], up=False)
+                send_unicode(ch[0], up=True)
+            elif (
+                not text_ok
+                and not up
+                and len(key_s) == 1
+                and ord(key_s) >= 32
+                and key_s.isprintable()
+            ):
+                send_unicode(key_s, up=False)
+                send_unicode(key_s, up=True)
             if code:
-                send_key(code, up=typ in ("key_up", "keyup"))
+                send_key(code, up=up)
             return
         if typ == "key":
             code = resolve_vk(str(ev.get("key") or ""))
@@ -2846,7 +2904,11 @@ def _desktop_input(payload: dict[str, Any]) -> dict[str, Any]:
                 if ev.get(flag):
                     mods.append(name)
             m_vks = mod_vks(mods)
-            if code:
+            ch = str(ev.get("char") or ev.get("key") or "")
+            if len(ch) == 1 and ord(ch) >= 32 and ch.isprintable() and not m_vks:
+                send_unicode(ch, up=False)
+                send_unicode(ch, up=True)
+            elif code:
                 for vk in m_vks:
                     send_key(vk, up=False)
                 send_key(code, up=False)

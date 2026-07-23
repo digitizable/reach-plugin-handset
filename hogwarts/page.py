@@ -2310,7 +2310,8 @@ class HogwartsPage(Gtk.Box):
                 max_side = int(self._agents.shot_max_side())
             profile = str(start_opts.get("profile") or "path").lower()
             # LAN 60 can go higher; Path stays lean for SOCKS/TCP
-            cap = 1600 if profile in ("lan60", "lan", "gaming", "gaming-lan") else 1440
+            # lan60: allow up to 2560 so host can stay near-native (text sharpness)
+            cap = 2560 if profile in ("lan60", "lan", "gaming", "gaming-lan") else 1440
             max_side = max(640, min(max_side, cap))
         except Exception:
             max_side = 1280
@@ -2374,10 +2375,11 @@ class HogwartsPage(Gtk.Box):
                 else:
                     profile = "path"
                 # Profile-aware defaults when viewer omitted knobs
+                # lan60: monitor-class crisp (q90); path: leaner
                 if profile == "lan60":
-                    def_fps, def_q, def_tr = 60.0, 80, "udp"
+                    def_fps, def_q, def_tr = 60.0, 90, "udp"
                 else:
-                    def_fps, def_q, def_tr = 45.0, 72, "tcp"
+                    def_fps, def_q, def_tr = 45.0, 78, "tcp"
                 try:
                     fps = float(
                         start_opts["fps"]
@@ -2404,11 +2406,13 @@ class HogwartsPage(Gtk.Box):
                     )
                 except (TypeError, ValueError):
                     quality = def_q
-                # lan60 capture pins use quality<=82 — clamp default path only
-                if profile == "lan60":
-                    quality = max(50, min(quality, 82))
-                else:
-                    quality = max(50, min(quality, 95))
+                # Full quality band — old q≤82 pin forced soft text
+                quality = max(50, min(quality, 95))
+                # Prefer near-native encode for lan60 when UI left max_side low
+                if profile == "lan60" and max_side < 1920 and start_opts.get(
+                    "max_side"
+                ) is None:
+                    max_side = 1920
                 payload: dict = {
                     "mode": "keepstream",
                     "face": face if face != "path" else "loopback",
@@ -2420,6 +2424,16 @@ class HogwartsPage(Gtk.Box):
                     "fps": max(30.0, min(fps, 60.0)),
                     "quality": quality,
                 }
+                # Ultra host chroma (full for text); product hosts ignore
+                if profile == "lan60":
+                    payload["chroma"] = str(
+                        start_opts.get("chroma") or "444"
+                    ).strip().lower()
+                    if payload["chroma"] not in ("444", "422", "420"):
+                        payload["chroma"] = "444"
+                else:
+                    ch = str(start_opts.get("chroma") or "422").strip().lower()
+                    payload["chroma"] = ch if ch in ("444", "422", "420") else "422"
                 # Local cursor (desk paints pointer)
                 if "local_cursor" in start_opts:
                     payload["local_cursor"] = bool(start_opts.get("local_cursor"))
